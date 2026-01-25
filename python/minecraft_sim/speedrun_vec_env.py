@@ -220,7 +220,8 @@ class SpeedrunVecEnv:
         """Reset all environments and return initial observations.
 
         Args:
-            seed: Optional seed for reproducibility.
+            seed: Optional seed for reproducibility. If None, generates a
+                deterministic seed from numpy's random state.
             options: Optional reset options (unused).
 
         Returns:
@@ -228,7 +229,18 @@ class SpeedrunVecEnv:
         """
         del options  # unused
 
-        self.sim.reset()
+        # Generate deterministic seed from numpy if not provided.
+        # This ensures np.random.seed() or SB3's set_random_seed() controls randomness.
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+        elif isinstance(seed, (list, tuple)):
+            seed = int(seed[0])  # Use first seed for all envs
+
+        try:
+            self.sim.reset(seed=seed)
+        except TypeError:
+            self.sim.reset()
+
         self._actions_buffer.fill(0)
         self.sim.step(self._actions_buffer)
 

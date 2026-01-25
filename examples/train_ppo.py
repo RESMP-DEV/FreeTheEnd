@@ -28,7 +28,9 @@ from minecraft_sim.backend import VulkanBackend
 class SimplePolicyNet:
     """Simple linear policy for smoke test."""
 
-    def __init__(self, obs_dim=32, act_dim=10):
+    def __init__(self, obs_dim: int = 48, act_dim: int = 10):
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
         self.weights = np.random.randn(obs_dim, act_dim).astype(np.float32) * 0.01
         self.bias = np.zeros(act_dim, dtype=np.float32)
 
@@ -59,7 +61,7 @@ class SimplePolicyNet:
         # Gradient of log prob
         grad = np.zeros_like(self.weights)
         for i, (o, a, adv) in enumerate(zip(obs, actions, advantages)):
-            one_hot = np.zeros(10)
+            one_hot = np.zeros(self.act_dim)
             one_hot[a] = 1
             grad += np.outer(o, (one_hot - probs[i])) * np.clip(adv, -10, 10)
 
@@ -69,7 +71,8 @@ class SimplePolicyNet:
 class SimpleValueNet:
     """Simple linear value function."""
 
-    def __init__(self, obs_dim=32):
+    def __init__(self, obs_dim: int = 48):
+        self.obs_dim = obs_dim
         self.weights = np.random.randn(obs_dim).astype(np.float32) * 0.01
         self.bias = 0.0
 
@@ -132,9 +135,10 @@ def main():
     print(f"Obs dim: {backend.obs_dim}")
     print()
 
-    # Create networks
-    policy = SimplePolicyNet(obs_dim=32, act_dim=10)
-    value = SimpleValueNet(obs_dim=32)
+    # Create networks (use backend's observation dimension)
+    obs_dim = backend.obs_dim
+    policy = SimplePolicyNet(obs_dim=obs_dim, act_dim=10)
+    value = SimpleValueNet(obs_dim=obs_dim)
 
     # Training loop
     obs = backend.reset()
@@ -196,7 +200,7 @@ def main():
         advantages, returns = compute_gae_batched(reward_batch, value_batch, done_batch)
 
         # Flatten for updates
-        obs_flat = obs_batch.reshape(-1, 32)
+        obs_flat = obs_batch.reshape(-1, obs_dim)
         action_flat = action_batch.reshape(-1)
         adv_flat = advantages.reshape(-1)
         ret_flat = returns.reshape(-1)

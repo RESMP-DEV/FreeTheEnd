@@ -100,13 +100,26 @@ class VecDragonFightEnv:
         self.sim = mc189_core.MC189Simulator(config)
         self._actions_buffer = np.zeros(num_envs, dtype=np.int32)
 
-    def reset(self) -> NDArray[np.float32]:
+    def reset(self, seed: int | None = None) -> NDArray[np.float32]:
         """Reset all environments and return initial observations.
+
+        Args:
+            seed: Optional seed for deterministic world generation. If None,
+                generates a seed from numpy's random state, ensuring that
+                np.random.seed() or SB3's set_random_seed() controls randomness.
 
         Returns:
             Observations array of shape (num_envs, observation_size).
         """
-        self.sim.reset()
+        # Generate deterministic seed from numpy if not provided.
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
+        try:
+            self.sim.reset(seed=seed)
+        except TypeError:
+            self.sim.reset()
+
         self._actions_buffer.fill(0)
         self.sim.step(self._actions_buffer)
         obs = self.sim.get_observations()
@@ -224,9 +237,20 @@ class SB3VecDragonFightEnv:
         self._episode_rewards = np.zeros(num_envs, dtype=np.float32)
         self._episode_lengths = np.zeros(num_envs, dtype=np.int32)
 
-    def reset(self) -> NDArray[np.float32]:
-        """Reset all environments."""
-        self.sim.reset()
+    def reset(self, seed: int | None = None) -> NDArray[np.float32]:
+        """Reset all environments.
+
+        Args:
+            seed: Optional seed for deterministic world generation.
+        """
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
+        try:
+            self.sim.reset(seed=seed)
+        except TypeError:
+            self.sim.reset()
+
         self._actions_buffer.fill(0)
         self.sim.step(self._actions_buffer)
         self._episode_rewards.fill(0)
@@ -365,13 +389,23 @@ class FreeTheEndEnv:
         self._step_count = 0
         self._max_steps = 36000  # 30 minutes at 20 tps
 
-    def reset(self) -> NDArray[np.float32]:
+    def reset(self, seed: int | None = None) -> NDArray[np.float32]:
         """Reset the environment and return initial observation.
+
+        Args:
+            seed: Optional seed for deterministic world generation.
 
         Returns:
             Observation array of shape (observation_size,).
         """
-        self.sim.reset()
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
+        try:
+            self.sim.reset(seed=seed)
+        except TypeError:
+            self.sim.reset()
+
         self.sim.step(np.array([0], dtype=np.int32))
         self._step_count = 0
         obs = self.sim.get_observations()
@@ -474,13 +508,26 @@ class VecFreeTheEndEnv:
         self.sim = mc189_core.MC189Simulator(config)
         self._actions_buffer = np.zeros(num_envs, dtype=np.int32)
 
-    def reset(self) -> NDArray[np.float32]:
+    def reset(self, seed: int | None = None) -> NDArray[np.float32]:
         """Reset all environments and return initial observations.
+
+        Args:
+            seed: Optional seed for deterministic world generation. If None,
+                generates a seed from numpy's random state, ensuring that
+                np.random.seed() or SB3's set_random_seed() controls randomness.
 
         Returns:
             Observations array of shape (num_envs, observation_size).
         """
-        self.sim.reset()
+        # Generate deterministic seed from numpy if not provided.
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
+        try:
+            self.sim.reset(seed=seed)
+        except TypeError:
+            self.sim.reset()
+
         self._actions_buffer.fill(0)
         self.sim.step(self._actions_buffer)
         obs = self.sim.get_observations()
@@ -631,13 +678,23 @@ class SB3VecFreeTheEndEnv:
         # Render mode (required for some SB3 wrappers)
         self.render_mode: str | None = None
 
-    def reset(self) -> NDArray[np.float32]:
+    def reset(self, seed: int | None = None) -> NDArray[np.float32]:
         """Reset all environments and return initial observations.
+
+        Args:
+            seed: Optional seed for deterministic world generation.
 
         Returns:
             Observations array of shape (num_envs, obs_size).
         """
-        self.sim.reset()
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
+        try:
+            self.sim.reset(seed=seed)
+        except TypeError:
+            self.sim.reset()
+
         # Execute no-op step to get initial observation
         self.sim.step(np.zeros(self.num_envs, dtype=np.int32))
 
