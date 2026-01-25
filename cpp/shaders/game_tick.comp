@@ -1,0 +1,1267 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Master game tick compute shader
+// Single dispatch executes one complete game tick with all subsystems
+// Uses indirect dispatch for variable mob counts and memory barriers between stages
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const uint MAX_MOBS = 65536;
+const uint MAX_LOADED_CHUNKS = 1024;
+const uint CHUNK_SIZE = 16;
+const uint CHUNK_HEIGHT = 384;
+const uint TICKS_PER_SECOND = 20;
+
+// Block types
+const uint BLOCK_AIR = 0;
+const uint BLOCK_STONE = 1;
+const uint BLOCK_DIRT = 2;
+const uint BLOCK_GRASS = 3;
+const uint BLOCK_SAND = 4;
+const uint BLOCK_GRAVEL = 5;
+const uint BLOCK_WATER = 6;
+const uint BLOCK_LAVA = 7;
+const uint BLOCK_BEDROCK = 8;
+const uint BLOCK_END_PORTAL = 200;
+const uint BLOCK_END_PORTAL_FRAME = 201;
+const uint BLOCK_DRAGON_EGG = 202;
+
+// Dimensions
+const uint DIM_OVERWORLD = 0;
+const uint DIM_NETHER = 1;
+const uint DIM_END = 2;
+
+// Mob types
+const uint MOB_ZOMBIE = 0;
+const uint MOB_SKELETON = 1;
+const uint MOB_CREEPER = 2;
+const uint MOB_SPIDER = 3;
+const uint MOB_ENDERMAN = 4;
+const uint MOB_BLAZE = 5;
+const uint MOB_GHAST = 6;
+const uint MOB_ENDER_DRAGON = 100;
+
+// Status effects
+const uint EFFECT_NONE = 0;
+const uint EFFECT_POISON = 1;
+const uint EFFECT_HUNGER = 2;
+const uint EFFECT_REGENERATION = 3;
+const uint EFFECT_STRENGTH = 4;
+const uint EFFECT_WEAKNESS = 5;
+const uint EFFECT_FIRE_RESISTANCE = 6;
+const uint EFFECT_SLOW_FALLING = 7;
+
+// Actions (must match action_decoder.comp output values)
+const uint ACTION_NONE = 0;
+const uint ACTION_ATTACK = 1;
+const uint ACTION_USE_ITEM = 2;
+const uint ACTION_DROP = 3;
+const uint ACTION_CRAFT = 4;
+const uint ACTION_SWAP_SLOT = 5;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint dimension;
+    uint gamemode;
+    uint activeSlot;
+    uint flags;  // Bit flags: onGround, sprinting, sneaking, flying, etc.
+    ivec3 targetBlock;
+    uint targetBlockFace;
+    vec4 statusEffects[8];  // x=type, y=duration, z=amplifier, w=reserved
+};
+
+struct InputState {
+    vec3 movement;      // WASD input normalized
+    float lookDeltaX;   // Mouse X delta
+    float lookDeltaY;   // Mouse Y delta
+    uint action;        // Current action type
+    uint actionData;    // Action-specific data (block type, item slot, etc.)
+    uint flags;         // Jump, sprint, sneak, etc.
+};
+
+struct Mob {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float maxHealth;
+    uint mobType;
+    uint state;         // AI state
+    uint targetEntity;  // Target player/mob ID
+    uint flags;
+    vec3 homePosition;
+    float aggroRange;
+    uint aiData[4];     // AI-specific data
+};
+
+struct BlockUpdate {
+    ivec3 position;
+    uint blockType;
+    uint priority;      // 0=immediate, 1=next tick, 2=random tick
+    uint sourceDir;
+    uint data;
+};
+
+struct CombatEvent {
+    uint attackerId;
+    uint defenderId;
+    float damage;
+    uint damageType;
+    vec3 knockback;
+    uint flags;
+};
+
+struct DragonFight {
+    uint phase;
+    uint health;
+    uint crystalsRemaining;
+    uint targetPillar;
+    vec3 circleCenter;
+    float circleRadius;
+    uint perchTimer;
+    uint breathTimer;
+};
+
+struct IndirectDispatch {
+    uint x;
+    uint y;
+    uint z;
+};
+
+// ============================================================================
+// BUFFER BINDINGS
+// ============================================================================
+
+// Set 0: Core game state
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player player;
+};
+
+layout(set = 0, binding = 1) buffer InputBuffer {
+    InputState player_in;
+};
+
+layout(set = 0, binding = 2) buffer MobBuffer {
+    uint mobCount;
+    uint activeMobCount;
+    uint padding[2];
+    Mob mobs[MAX_MOBS];
+};
+
+layout(set = 0, binding = 3) buffer ChunkBuffer {
+    uint loadedChunkCount;
+    ivec4 loadedChunks[MAX_LOADED_CHUNKS];  // xyz = chunk coords, w = dimension
+    uint blocks[];  // Flattened chunk block data
+};
+
+// Set 1: Update queues
+layout(set = 1, binding = 0) buffer BlockUpdateQueue {
+    uint blockUpdateCount;
+    uint blockUpdateHead;
+    uint blockUpdateTail;
+    uint padding1;
+    BlockUpdate blockUpdates[16384];
+};
+
+layout(set = 1, binding = 1) buffer CombatQueue {
+    uint combatEventCount;
+    uint combatPadding[3];
+    CombatEvent combatEvents[4096];
+};
+
+layout(set = 1, binding = 2) buffer DragonFightBuffer {
+    DragonFight dragonFight;
+};
+
+// Set 2: Indirect dispatch and output
+layout(set = 2, binding = 0) buffer IndirectBuffer {
+    IndirectDispatch mobDispatch;
+    IndirectDispatch blockUpdateDispatch;
+    IndirectDispatch combatDispatch;
+};
+
+layout(set = 2, binding = 1) buffer GameState {
+    uint tickNumber;
+    uint gameFlags;     // Win condition, etc.
+    uint randomSeed;
+    float deltaTime;
+    uint dimension;
+    uint reserved[3];
+};
+
+// Set 3: Inventory and items
+layout(set = 3, binding = 0) buffer InventoryBuffer {
+    uint inventory[36];     // Main inventory
+    uint armor[4];          // Armor slots
+    uint offhand;           // Offhand slot
+    uint padding3[3];
+};
+
+// Shared memory for workgroup-local operations
+shared uint sharedCounter;
+shared float sharedDamage;
+shared vec3 sharedKnockback;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float randomFloat(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+vec3 randomVec3(inout uint seed) {
+    return vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed));
+}
+
+uint getBlockAt(ivec3 worldPos) {
+    // Find chunk containing this position
+    ivec3 chunkPos = worldPos >> 4;  // Divide by 16
+
+    for (uint i = 0; i < loadedChunkCount; i++) {
+        if (loadedChunks[i].xyz == chunkPos && loadedChunks[i].w == int(player.dimension)) {
+            ivec3 localPos = worldPos & 15;  // Mod 16
+            uint idx = i * CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT +
+                       localPos.y * CHUNK_SIZE * CHUNK_SIZE +
+                       localPos.z * CHUNK_SIZE +
+                       localPos.x;
+            return blocks[idx];
+        }
+    }
+    return BLOCK_AIR;
+}
+
+void setBlockAt(ivec3 worldPos, uint blockType) {
+    ivec3 chunkPos = worldPos >> 4;
+
+    for (uint i = 0; i < loadedChunkCount; i++) {
+        if (loadedChunks[i].xyz == chunkPos && loadedChunks[i].w == int(player.dimension)) {
+            ivec3 localPos = worldPos & 15;
+            uint idx = i * CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT +
+                       localPos.y * CHUNK_SIZE * CHUNK_SIZE +
+                       localPos.z * CHUNK_SIZE +
+                       localPos.x;
+            blocks[idx] = blockType;
+            return;
+        }
+    }
+}
+
+bool isBlockSolid(uint blockType) {
+    return blockType != BLOCK_AIR &&
+           blockType != BLOCK_WATER &&
+           blockType != BLOCK_LAVA &&
+           blockType != BLOCK_END_PORTAL;
+}
+
+bool canBlockFall(uint blockType) {
+    return blockType == BLOCK_SAND || blockType == BLOCK_GRAVEL;
+}
+
+bool isFluid(uint blockType) {
+    return blockType == BLOCK_WATER || blockType == BLOCK_LAVA;
+}
+
+// ============================================================================
+// STAGE 1: PROCESS PLAYER INPUT
+// ============================================================================
+
+void processPlayerInput() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    // Update look direction
+    player.yaw += player_in.lookDeltaX * 0.1;
+    player.pitch = clamp(player.pitch + player_in.lookDeltaY * 0.1, -89.0, 89.0);
+
+    // Normalize yaw
+    player.yaw = mod(player.yaw, 360.0);
+
+    // Calculate movement vectors
+    float yawRad = radians(player.yaw);
+    vec3 forward = vec3(-sin(yawRad), 0.0, cos(yawRad));
+    vec3 right = vec3(cos(yawRad), 0.0, sin(yawRad));
+
+    // Apply movement input
+    vec3 moveDir = forward * player_in.movement.z + right * player_in.movement.x;
+
+    bool onGround = (player.flags & 1u) != 0;
+    bool sprinting = (player_in.flags & 2u) != 0;
+    bool sneaking = (player_in.flags & 4u) != 0;
+    bool flying = (player.flags & 8u) != 0;
+
+    float speed = 4.317;  // Base walking speed (blocks/sec)
+    if (sprinting) speed = 5.612;
+    if (sneaking) speed = 1.31;
+    if (flying) speed = 10.92;
+
+    // Convert to per-tick
+    speed *= deltaTime;
+
+    if (length(moveDir) > 0.0) {
+        moveDir = normalize(moveDir) * speed;
+    }
+
+    // Handle vertical movement
+    if ((player_in.flags & 1u) != 0 && onGround) {  // Jump
+        player.velocity.y = 7.95;  // Jump velocity (blocks/sec)
+        player.flags &= ~1u;  // No longer on ground
+    }
+
+    if (flying) {
+        if ((player_in.flags & 1u) != 0) moveDir.y = speed;
+        if (sneaking) moveDir.y = -speed;
+    }
+
+    player.velocity.x = moveDir.x;
+    player.velocity.z = moveDir.z;
+    if (flying) player.velocity.y = moveDir.y;
+
+    // Sprinting increases exhaustion
+    if (sprinting && length(player_in.movement) > 0.0) {
+        player.exhaustion += 0.1 * deltaTime;
+    }
+}
+
+// ============================================================================
+// STAGE 2: TICK HUNGER AND STATUS EFFECTS
+// ============================================================================
+
+void tickHungerAndEffects() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    // Process exhaustion -> hunger
+    if (player.exhaustion >= 4.0) {
+        player.exhaustion -= 4.0;
+        if (player.saturation > 0.0) {
+            player.saturation = max(0.0, player.saturation - 1.0);
+        } else {
+            player.hunger = max(0.0, player.hunger - 1.0);
+        }
+    }
+
+    // Natural regeneration (hunger >= 18)
+    if (player.hunger >= 18.0 && player.health < 20.0) {
+        player.health = min(20.0, player.health + 0.5 * deltaTime);
+        player.exhaustion += 6.0 * deltaTime;
+    }
+
+    // Starvation damage (hunger == 0)
+    if (player.hunger <= 0.0) {
+        if (tickNumber % 80 == 0) {  // Every 4 seconds
+            player.health = max(1.0, player.health - 1.0);  // Min 1 HP on normal
+        }
+    }
+
+    // Tick status effects
+    for (uint i = 0; i < 8; i++) {
+        if (player.statusEffects[i].x == EFFECT_NONE) continue;
+
+        // Decrease duration
+        player.statusEffects[i].y -= deltaTime;
+
+        uint effectType = uint(player.statusEffects[i].x);
+        float amplifier = player.statusEffects[i].z;
+
+        // Apply effect
+        switch (effectType) {
+            case EFFECT_POISON:
+                if (tickNumber % 25 == 0) {
+                    player.health = max(1.0, player.health - 1.0);
+                }
+                break;
+
+            case EFFECT_REGENERATION:
+                if (tickNumber % max(1u, 50u >> uint(amplifier)) == 0) {
+                    player.health = min(20.0, player.health + 1.0);
+                }
+                break;
+
+            case EFFECT_HUNGER:
+                player.exhaustion += 0.005 * (amplifier + 1.0) * deltaTime * 20.0;
+                break;
+        }
+
+        // Remove expired effects
+        if (player.statusEffects[i].y <= 0.0) {
+            player.statusEffects[i] = vec4(0.0);
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 3: EXECUTE PLAYER ACTION
+// ============================================================================
+
+// Forward declarations
+void executeMineAction();
+void executePlaceAction();
+void executeAttackAction();
+void executeUseItemAction();
+void queueBlockUpdate(ivec3 pos, uint priority);
+void tickHostileMob(uint mobIdx, inout uint seed);
+void tickCreeperMob(uint mobIdx, inout uint seed);
+void tickEndermanMob(uint mobIdx, inout uint seed);
+void tickDragonCircle(uint dragonIdx, inout uint seed);
+void tickDragonDive(uint dragonIdx, inout uint seed);
+void tickDragonPerch(uint dragonIdx, inout uint seed);
+void updateMobPhysics(uint mobIdx);
+
+void executePlayerAction() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    switch (player_in.action) {
+        case ACTION_ATTACK:
+            executeAttackAction();
+            break;
+        case ACTION_USE_ITEM:
+            executeUseItemAction();
+            break;
+    }
+}
+
+void executeMineAction() {
+    ivec3 target = player.targetBlock;
+    uint blockType = getBlockAt(target);
+
+    if (blockType == BLOCK_BEDROCK) return;  // Can't mine bedrock
+    if (blockType == BLOCK_AIR) return;
+
+    // For simplicity, instant break (proper implementation would track break progress)
+    setBlockAt(target, BLOCK_AIR);
+
+    // Queue block updates for neighbors
+    queueBlockUpdate(target + ivec3(1, 0, 0), 1);
+    queueBlockUpdate(target + ivec3(-1, 0, 0), 1);
+    queueBlockUpdate(target + ivec3(0, 1, 0), 1);
+    queueBlockUpdate(target + ivec3(0, -1, 0), 1);
+    queueBlockUpdate(target + ivec3(0, 0, 1), 1);
+    queueBlockUpdate(target + ivec3(0, 0, -1), 1);
+
+    player.exhaustion += 0.005;
+}
+
+void executePlaceAction() {
+    ivec3 target = player.targetBlock;
+    ivec3 placePos = target;
+
+    // Offset by face
+    switch (player.targetBlockFace) {
+        case 0: placePos.y -= 1; break;  // Bottom
+        case 1: placePos.y += 1; break;  // Top
+        case 2: placePos.z -= 1; break;  // North
+        case 3: placePos.z += 1; break;  // South
+        case 4: placePos.x -= 1; break;  // West
+        case 5: placePos.x += 1; break;  // East
+    }
+
+    if (getBlockAt(placePos) != BLOCK_AIR) return;
+
+    uint blockToPlace = player_in.actionData;
+    setBlockAt(placePos, blockToPlace);
+
+    // Queue updates
+    queueBlockUpdate(placePos + ivec3(1, 0, 0), 1);
+    queueBlockUpdate(placePos + ivec3(-1, 0, 0), 1);
+    queueBlockUpdate(placePos + ivec3(0, 1, 0), 1);
+    queueBlockUpdate(placePos + ivec3(0, -1, 0), 1);
+    queueBlockUpdate(placePos + ivec3(0, 0, 1), 1);
+    queueBlockUpdate(placePos + ivec3(0, 0, -1), 1);
+}
+
+void executeAttackAction() {
+    // Find nearest mob in range
+    float attackRange = 3.0;
+    vec3 lookDir = vec3(
+        -sin(radians(player.yaw)) * cos(radians(player.pitch)),
+        -sin(radians(player.pitch)),
+        cos(radians(player.yaw)) * cos(radians(player.pitch))
+    );
+
+    for (uint i = 0; i < mobCount; i++) {
+        if (mobs[i].health <= 0.0) continue;
+
+        vec3 toMob = mobs[i].position - player.position;
+        float dist = length(toMob);
+
+        if (dist > attackRange) continue;
+
+        // Check if looking at mob (simple cone check)
+        float dotProduct = dot(normalize(toMob), lookDir);
+        if (dotProduct < 0.8) continue;
+
+        // Queue combat event
+        uint idx = atomicAdd(combatEventCount, 1);
+        combatEvents[idx].attackerId = 0xFFFFFFFF;  // Player marker
+        combatEvents[idx].defenderId = i;
+        combatEvents[idx].damage = 1.0;  // Base hand damage
+        combatEvents[idx].damageType = 0;
+        combatEvents[idx].knockback = lookDir * 0.4;
+        combatEvents[idx].flags = 0;
+
+        player.exhaustion += 0.1;
+        break;  // Only hit one mob per swing
+    }
+}
+
+const uint ITEM_ENDER_PEARL = 368;
+const float PEARL_TELEPORT_DAMAGE = 5.0;
+
+void executeUseItemAction() {
+    uint itemSlot = player.activeSlot;
+    uint item = inventory[itemSlot];
+
+    // Ender pearl: teleport forward and apply 5 damage
+    if (item == ITEM_ENDER_PEARL) {
+        // Calculate throw direction from player look
+        float yawRad = radians(player.yaw);
+        float pitchRad = radians(player.pitch);
+        vec3 lookDir = vec3(
+            -sin(yawRad) * cos(pitchRad),
+            -sin(pitchRad),
+            cos(yawRad) * cos(pitchRad)
+        );
+
+        // Simplified teleport: move player ~15 blocks in look direction
+        // (full arc physics handled by ender_pearl.comp for detailed sim)
+        float teleportDist = 15.0;
+        vec3 teleportPos = player.position + lookDir * teleportDist;
+
+        // Clamp Y to valid range
+        teleportPos.y = clamp(teleportPos.y, 1.0, 254.0);
+
+        player.position = teleportPos;
+        player.velocity = vec3(0.0);
+
+        // Apply 5 fall damage regardless of height (MC 1.8.9 behavior)
+        player.health = max(0.0, player.health - PEARL_TELEPORT_DAMAGE);
+
+        // Consume one pearl
+        inventory[itemSlot] = 0;
+        return;
+    }
+
+    // Food consumption
+    if (item >= 1000 && item < 2000) {
+        float foodValue = float(item - 1000) / 10.0;
+        player.hunger = min(20.0, player.hunger + foodValue);
+        player.saturation = min(player.hunger, player.saturation + foodValue * 0.6);
+        inventory[itemSlot] = 0;
+    }
+}
+
+void queueBlockUpdate(ivec3 pos, uint priority) {
+    uint idx = atomicAdd(blockUpdateCount, 1);
+    if (idx >= 16384) {
+        atomicAdd(blockUpdateCount, 0xFFFFFFFF);  // Subtract 1 (unsigned wraparound)
+        return;
+    }
+
+    blockUpdates[idx].position = pos;
+    blockUpdates[idx].blockType = getBlockAt(pos);
+    blockUpdates[idx].priority = priority;
+    blockUpdates[idx].sourceDir = 0;
+    blockUpdates[idx].data = 0;
+}
+
+// ============================================================================
+// STAGE 4: UPDATE PLAYER PHYSICS
+// ============================================================================
+
+void updatePlayerPhysics() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    bool flying = (player.flags & 8u) != 0;
+
+    // Apply gravity
+    if (!flying) {
+        player.velocity.y -= 32.0 * deltaTime;  // Gravity
+        player.velocity.y = max(player.velocity.y, -78.4);  // Terminal velocity
+    }
+
+    // Apply drag
+    player.velocity.xz *= 0.91;
+    if (flying) player.velocity.y *= 0.91;
+
+    // Collision detection and resolution
+    vec3 newPos = player.position + player.velocity * deltaTime;
+
+    // Simple AABB collision with blocks
+    vec3 playerMin = newPos - vec3(0.3, 0.0, 0.3);
+    vec3 playerMax = newPos + vec3(0.3, 1.8, 0.3);
+
+    // Check horizontal collisions
+    for (int x = int(floor(playerMin.x)); x <= int(floor(playerMax.x)); x++) {
+        for (int z = int(floor(playerMin.z)); z <= int(floor(playerMax.z)); z++) {
+            for (int y = int(floor(playerMin.y)); y <= int(floor(playerMax.y)); y++) {
+                if (isBlockSolid(getBlockAt(ivec3(x, y, z)))) {
+                    // Push out of block
+                    if (player.velocity.x > 0.0 && x == int(floor(playerMax.x))) {
+                        newPos.x = float(x) - 0.3;
+                        player.velocity.x = 0.0;
+                    }
+                    if (player.velocity.x < 0.0 && x == int(floor(playerMin.x))) {
+                        newPos.x = float(x) + 1.3;
+                        player.velocity.x = 0.0;
+                    }
+                    if (player.velocity.z > 0.0 && z == int(floor(playerMax.z))) {
+                        newPos.z = float(z) - 0.3;
+                        player.velocity.z = 0.0;
+                    }
+                    if (player.velocity.z < 0.0 && z == int(floor(playerMin.z))) {
+                        newPos.z = float(z) + 1.3;
+                        player.velocity.z = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check ground collision
+    bool onGround = false;
+    int groundY = int(floor(newPos.y - 0.01));
+    for (int x = int(floor(newPos.x - 0.3)); x <= int(floor(newPos.x + 0.3)); x++) {
+        for (int z = int(floor(newPos.z - 0.3)); z <= int(floor(newPos.z + 0.3)); z++) {
+            if (isBlockSolid(getBlockAt(ivec3(x, groundY, z)))) {
+                if (player.velocity.y < 0.0) {
+                    newPos.y = float(groundY + 1);
+                    player.velocity.y = 0.0;
+                    onGround = true;
+                }
+            }
+        }
+    }
+
+    // Check ceiling collision
+    int ceilY = int(floor(newPos.y + 1.8));
+    for (int x = int(floor(newPos.x - 0.3)); x <= int(floor(newPos.x + 0.3)); x++) {
+        for (int z = int(floor(newPos.z - 0.3)); z <= int(floor(newPos.z + 0.3)); z++) {
+            if (isBlockSolid(getBlockAt(ivec3(x, ceilY, z)))) {
+                if (player.velocity.y > 0.0) {
+                    newPos.y = float(ceilY) - 1.8;
+                    player.velocity.y = 0.0;
+                }
+            }
+        }
+    }
+
+    // Update flags
+    if (onGround) {
+        player.flags |= 1u;
+    } else {
+        player.flags &= ~1u;
+    }
+
+    player.position = newPos;
+
+    // Void damage
+    if (player.position.y < -64.0) {
+        player.health = max(0.0, player.health - 4.0);
+    }
+
+    // Lava damage
+    uint blockAtPlayer = getBlockAt(ivec3(floor(player.position)));
+    if (blockAtPlayer == BLOCK_LAVA) {
+        bool fireRes = false;
+        for (uint i = 0; i < 8; i++) {
+            if (uint(player.statusEffects[i].x) == EFFECT_FIRE_RESISTANCE) {
+                fireRes = true;
+                break;
+            }
+        }
+        if (!fireRes) {
+            player.health = max(0.0, player.health - 4.0 * deltaTime);
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 5: TICK ALL MOBS
+// ============================================================================
+
+void tickMob(uint mobIdx) {
+    if (mobIdx >= mobCount) return;
+    if (mobs[mobIdx].health <= 0.0) return;
+
+    // Check if mob is in loaded chunk
+    ivec3 mobChunk = ivec3(floor(mobs[mobIdx].position)) >> 4;
+    bool inLoadedChunk = false;
+
+    for (uint i = 0; i < loadedChunkCount; i++) {
+        if (loadedChunks[i].xyz == mobChunk) {
+            inLoadedChunk = true;
+            break;
+        }
+    }
+
+    if (!inLoadedChunk) return;
+
+    uint seed = randomSeed ^ mobIdx ^ tickNumber;
+
+    // Basic mob AI
+    switch (mobs[mobIdx].mobType) {
+        case MOB_ZOMBIE:
+        case MOB_SKELETON:
+            tickHostileMob(mobIdx, seed);
+            break;
+        case MOB_CREEPER:
+            tickCreeperMob(mobIdx, seed);
+            break;
+        case MOB_ENDERMAN:
+            tickEndermanMob(mobIdx, seed);
+            break;
+        case MOB_ENDER_DRAGON:
+            // Dragon handled separately
+            break;
+        default:
+            tickHostileMob(mobIdx, seed);
+            break;
+    }
+
+    // Apply mob physics
+    updateMobPhysics(mobIdx);
+}
+
+void tickHostileMob(uint mobIdx, inout uint seed) {
+    vec3 toPlayer = player.position - mobs[mobIdx].position;
+    float distToPlayer = length(toPlayer);
+
+    // Aggro range check
+    if (distToPlayer < mobs[mobIdx].aggroRange) {
+        mobs[mobIdx].targetEntity = 0xFFFFFFFF;  // Target player
+        mobs[mobIdx].state = 1;  // Chasing
+
+        // Move toward player
+        if (distToPlayer > 1.5) {
+            vec3 moveDir = normalize(vec3(toPlayer.x, 0.0, toPlayer.z));
+            float speed = 4.0 * deltaTime;  // Blocks per tick
+            mobs[mobIdx].velocity.x = moveDir.x * speed;
+            mobs[mobIdx].velocity.z = moveDir.z * speed;
+
+            // Face player
+            mobs[mobIdx].yaw = degrees(atan(moveDir.x, moveDir.z));
+        }
+
+        // Attack if close enough
+        if (distToPlayer < 2.0 && mobs[mobIdx].aiData[0] == 0) {
+            uint idx = atomicAdd(combatEventCount, 1);
+            combatEvents[idx].attackerId = mobIdx;
+            combatEvents[idx].defenderId = 0xFFFFFFFF;  // Player
+            combatEvents[idx].damage = 3.0;  // Base mob damage
+            combatEvents[idx].damageType = 0;
+            combatEvents[idx].knockback = normalize(toPlayer) * 0.4;
+            combatEvents[idx].flags = 0;
+
+            mobs[mobIdx].aiData[0] = 20;  // Attack cooldown (ticks)
+        }
+    } else {
+        // Wander
+        mobs[mobIdx].state = 0;
+        if (randomFloat(seed) < 0.02) {
+            float angle = randomFloat(seed) * 6.28318;
+            mobs[mobIdx].velocity.x = cos(angle) * 2.0 * deltaTime;
+            mobs[mobIdx].velocity.z = sin(angle) * 2.0 * deltaTime;
+            mobs[mobIdx].yaw = degrees(angle);
+        }
+    }
+
+    // Decrease attack cooldown
+    if (mobs[mobIdx].aiData[0] > 0) {
+        mobs[mobIdx].aiData[0]--;
+    }
+}
+
+void tickCreeperMob(uint mobIdx, inout uint seed) {
+    vec3 toPlayer = player.position - mobs[mobIdx].position;
+    float distToPlayer = length(toPlayer);
+
+    // Fuse state in aiData[1]
+    if (distToPlayer < 3.0) {
+        mobs[mobIdx].aiData[1]++;  // Fuse timer
+
+        if (mobs[mobIdx].aiData[1] >= 30) {  // 1.5 seconds fuse
+            // EXPLODE
+            mobs[mobIdx].health = 0.0;
+
+            // Damage player
+            if (distToPlayer < 6.0) {
+                uint idx = atomicAdd(combatEventCount, 1);
+                combatEvents[idx].attackerId = mobIdx;
+                combatEvents[idx].defenderId = 0xFFFFFFFF;
+                combatEvents[idx].damage = 49.0 * (1.0 - distToPlayer / 6.0);
+                combatEvents[idx].damageType = 1;  // Explosion
+                combatEvents[idx].knockback = normalize(toPlayer) * 2.0;
+                combatEvents[idx].flags = 0;
+            }
+
+            // Destroy blocks
+            ivec3 center = ivec3(floor(mobs[mobIdx].position));
+            for (int x = -3; x <= 3; x++) {
+                for (int y = -3; y <= 3; y++) {
+                    for (int z = -3; z <= 3; z++) {
+                        ivec3 pos = center + ivec3(x, y, z);
+                        if (length(vec3(x, y, z)) < 3.5) {
+                            uint block = getBlockAt(pos);
+                            if (block != BLOCK_BEDROCK && block != BLOCK_AIR) {
+                                setBlockAt(pos, BLOCK_AIR);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        mobs[mobIdx].aiData[1] = max(0, int(mobs[mobIdx].aiData[1]) - 1);
+        tickHostileMob(mobIdx, seed);  // Normal chasing behavior
+    }
+}
+
+void tickEndermanMob(uint mobIdx, inout uint seed) {
+    vec3 toPlayer = player.position - mobs[mobIdx].position;
+    float distToPlayer = length(toPlayer);
+
+    // Check if player is looking at enderman
+    vec3 lookDir = vec3(
+        -sin(radians(player.yaw)) * cos(radians(player.pitch)),
+        -sin(radians(player.pitch)),
+        cos(radians(player.yaw)) * cos(radians(player.pitch))
+    );
+
+    float dotProduct = dot(normalize(-toPlayer), lookDir);
+    bool playerLooking = dotProduct > 0.95 && distToPlayer < 64.0;
+
+    if (playerLooking || mobs[mobIdx].state == 2) {
+        mobs[mobIdx].state = 2;  // Aggro state
+
+        // Teleport behind player occasionally
+        if (randomFloat(seed) < 0.05) {
+            float angle = radians(player.yaw) + 3.14159;
+            vec3 newPos = player.position + vec3(sin(angle) * 5.0, 0.0, -cos(angle) * 5.0);
+            mobs[mobIdx].position = newPos;
+        }
+
+        tickHostileMob(mobIdx, seed);
+    } else {
+        // Passive wandering
+        if (randomFloat(seed) < 0.01) {
+            float angle = randomFloat(seed) * 6.28318;
+            mobs[mobIdx].velocity.x = cos(angle) * 1.0 * deltaTime;
+            mobs[mobIdx].velocity.z = sin(angle) * 1.0 * deltaTime;
+        }
+    }
+
+    // Random teleport when taking damage (handled in combat)
+}
+
+void updateMobPhysics(uint mobIdx) {
+    // Gravity
+    mobs[mobIdx].velocity.y -= 32.0 * deltaTime;
+    mobs[mobIdx].velocity.y = max(mobs[mobIdx].velocity.y, -78.4);
+
+    // Apply velocity
+    vec3 newPos = mobs[mobIdx].position + mobs[mobIdx].velocity * deltaTime;
+
+    // Simple ground collision
+    int groundY = int(floor(newPos.y - 0.01));
+    if (isBlockSolid(getBlockAt(ivec3(floor(newPos.x), groundY, floor(newPos.z))))) {
+        newPos.y = float(groundY + 1);
+        mobs[mobIdx].velocity.y = 0.0;
+
+        // Jump if blocked and chasing
+        if (mobs[mobIdx].state == 1) {
+            int blockAhead = int(floor(newPos.y));
+            vec3 moveDir = vec3(mobs[mobIdx].velocity.x, 0.0, mobs[mobIdx].velocity.z);
+            if (length(moveDir) > 0.01) {
+                moveDir = normalize(moveDir);
+                if (isBlockSolid(getBlockAt(ivec3(floor(newPos.x + moveDir.x), blockAhead, floor(newPos.z + moveDir.z))))) {
+                    mobs[mobIdx].velocity.y = 8.0;  // Jump
+                }
+            }
+        }
+    }
+
+    // Drag
+    mobs[mobIdx].velocity.xz *= 0.91;
+
+    mobs[mobIdx].position = newPos;
+}
+
+// ============================================================================
+// STAGE 6: PROCESS COMBAT
+// ============================================================================
+
+void processCombat(uint eventIdx) {
+    if (eventIdx >= combatEventCount) return;
+
+    CombatEvent evt = combatEvents[eventIdx];
+
+    // Player is defender
+    if (evt.defenderId == 0xFFFFFFFF) {
+        // Apply damage to player
+        player.health = max(0.0, player.health - evt.damage);
+
+        // Apply knockback
+        player.velocity += evt.knockback * 10.0;
+
+        // Armor reduction would go here
+    }
+    // Mob is defender
+    else if (evt.defenderId < mobCount) {
+        mobs[evt.defenderId].health = max(0.0, mobs[evt.defenderId].health - evt.damage);
+        mobs[evt.defenderId].velocity += evt.knockback * 10.0;
+
+        // Enderman teleport on damage
+        if (mobs[evt.defenderId].mobType == MOB_ENDERMAN) {
+            uint seed = randomSeed ^ evt.defenderId ^ tickNumber;
+            vec3 teleportOffset = (randomVec3(seed) - 0.5) * 32.0;
+            mobs[evt.defenderId].position += teleportOffset;
+        }
+
+        // Death handling
+        if (mobs[evt.defenderId].health <= 0.0) {
+            // Drop loot, XP, etc would go here
+            mobs[evt.defenderId].flags |= 0x80000000u;  // Dead flag
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 7: TICK BLOCK UPDATES
+// ============================================================================
+
+void tickBlockUpdate(uint updateIdx) {
+    if (updateIdx >= blockUpdateCount) return;
+
+    BlockUpdate update = blockUpdates[updateIdx];
+    uint blockType = getBlockAt(update.position);
+
+    // Falling blocks
+    if (canBlockFall(blockType)) {
+        ivec3 below = update.position + ivec3(0, -1, 0);
+        if (!isBlockSolid(getBlockAt(below))) {
+            setBlockAt(update.position, BLOCK_AIR);
+            setBlockAt(below, blockType);
+            queueBlockUpdate(below + ivec3(0, -1, 0), 1);
+        }
+    }
+
+    // Fluid spread
+    if (isFluid(blockType)) {
+        // Simplified fluid - just spread to adjacent air
+        ivec3 neighbors[4] = {
+            update.position + ivec3(1, 0, 0),
+            update.position + ivec3(-1, 0, 0),
+            update.position + ivec3(0, 0, 1),
+            update.position + ivec3(0, 0, -1)
+        };
+
+        for (int i = 0; i < 4; i++) {
+            if (getBlockAt(neighbors[i]) == BLOCK_AIR) {
+                setBlockAt(neighbors[i], blockType);
+                queueBlockUpdate(neighbors[i], 2);
+            }
+        }
+
+        // Flow down
+        ivec3 below = update.position + ivec3(0, -1, 0);
+        if (getBlockAt(below) == BLOCK_AIR) {
+            setBlockAt(below, blockType);
+            queueBlockUpdate(below, 1);
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 8: PROCESS DIMENSION TRANSITIONS
+// ============================================================================
+
+void processDimensionTransitions() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    uint blockAtFeet = getBlockAt(ivec3(floor(player.position)));
+
+    // End portal entry
+    if (blockAtFeet == BLOCK_END_PORTAL && player.dimension != DIM_END) {
+        player.dimension = DIM_END;
+        player.position = vec3(0.0, 64.0, 0.0);  // End spawn platform
+        player.velocity = vec3(0.0);
+
+        // Initialize dragon fight if first entry
+        if (dragonFight.phase == 0 && dragonFight.health == 0) {
+            dragonFight.phase = 1;
+            dragonFight.health = 200;
+            dragonFight.crystalsRemaining = 10;
+            dragonFight.circleCenter = vec3(0.0, 70.0, 0.0);
+            dragonFight.circleRadius = 150.0;
+        }
+    }
+
+    // Exit portal (after dragon death)
+    if (blockAtFeet == BLOCK_END_PORTAL && player.dimension == DIM_END && dragonFight.health == 0) {
+        // Win condition check - set flag
+        gameFlags |= 1u;  // WIN flag
+    }
+}
+
+// ============================================================================
+// STAGE 9: TICK DRAGON FIGHT
+// ============================================================================
+
+void tickDragonFight() {
+    if (gl_GlobalInvocationID.x != 0) return;
+    if (player.dimension != DIM_END) return;
+    if (dragonFight.health == 0) return;
+
+    // Find dragon mob
+    uint dragonIdx = 0xFFFFFFFF;
+    for (uint i = 0; i < mobCount; i++) {
+        if (mobs[i].mobType == MOB_ENDER_DRAGON && mobs[i].health > 0.0) {
+            dragonIdx = i;
+            break;
+        }
+    }
+
+    if (dragonIdx == 0xFFFFFFFF) return;
+
+    uint seed = randomSeed ^ tickNumber;
+
+    switch (dragonFight.phase) {
+        case 1:  // Circling phase
+            tickDragonCircle(dragonIdx, seed);
+            break;
+        case 2:  // Dive attack
+            tickDragonDive(dragonIdx, seed);
+            break;
+        case 3:  // Perching (breath attack)
+            tickDragonPerch(dragonIdx, seed);
+            break;
+    }
+
+    // Sync dragon health with fight state
+    mobs[dragonIdx].health = float(dragonFight.health);
+}
+
+void tickDragonCircle(uint dragonIdx, inout uint seed) {
+    // Circle around the center
+    float angle = float(tickNumber) * 0.02;
+    vec3 targetPos = dragonFight.circleCenter + vec3(
+        cos(angle) * dragonFight.circleRadius,
+        20.0 + sin(angle * 2.0) * 10.0,
+        sin(angle) * dragonFight.circleRadius
+    );
+
+    vec3 toTarget = targetPos - mobs[dragonIdx].position;
+    mobs[dragonIdx].velocity = normalize(toTarget) * 20.0 * deltaTime;
+    mobs[dragonIdx].yaw = degrees(atan(toTarget.x, toTarget.z));
+    mobs[dragonIdx].position += mobs[dragonIdx].velocity;
+
+    // Transition to dive occasionally
+    if (randomFloat(seed) < 0.005) {
+        dragonFight.phase = 2;
+    }
+
+    // Transition to perch occasionally
+    if (dragonFight.crystalsRemaining == 0 && randomFloat(seed) < 0.01) {
+        dragonFight.phase = 3;
+        dragonFight.perchTimer = 200;  // 10 seconds
+    }
+}
+
+void tickDragonDive(uint dragonIdx, inout uint seed) {
+    // Dive toward player
+    vec3 toPlayer = player.position - mobs[dragonIdx].position;
+    float dist = length(toPlayer);
+
+    if (dist > 5.0) {
+        mobs[dragonIdx].velocity = normalize(toPlayer) * 40.0 * deltaTime;
+        mobs[dragonIdx].position += mobs[dragonIdx].velocity;
+    } else {
+        // Damage player on contact
+        uint idx = atomicAdd(combatEventCount, 1);
+        combatEvents[idx].attackerId = dragonIdx;
+        combatEvents[idx].defenderId = 0xFFFFFFFF;
+        combatEvents[idx].damage = 10.0;
+        combatEvents[idx].damageType = 0;
+        combatEvents[idx].knockback = normalize(toPlayer) * 2.0;
+        combatEvents[idx].flags = 0;
+
+        // Return to circling
+        dragonFight.phase = 1;
+    }
+}
+
+void tickDragonPerch(uint dragonIdx, inout uint seed) {
+    // Move to perch position
+    vec3 perchPos = vec3(0.0, 70.0, 0.0);
+    vec3 toPerch = perchPos - mobs[dragonIdx].position;
+
+    if (length(toPerch) > 2.0) {
+        mobs[dragonIdx].velocity = normalize(toPerch) * 15.0 * deltaTime;
+        mobs[dragonIdx].position += mobs[dragonIdx].velocity;
+    } else {
+        // Breath attack
+        dragonFight.breathTimer++;
+
+        if (dragonFight.breathTimer % 10 == 0) {
+            // Damage player in front cone
+            vec3 toPlayer = player.position - mobs[dragonIdx].position;
+            float dist = length(toPlayer);
+            if (dist < 20.0) {
+                vec3 dragonForward = vec3(
+                    -sin(radians(mobs[dragonIdx].yaw)),
+                    0.0,
+                    cos(radians(mobs[dragonIdx].yaw))
+                );
+                if (dot(normalize(toPlayer), dragonForward) > 0.5) {
+                    uint idx = atomicAdd(combatEventCount, 1);
+                    combatEvents[idx].attackerId = dragonIdx;
+                    combatEvents[idx].defenderId = 0xFFFFFFFF;
+                    combatEvents[idx].damage = 6.0;
+                    combatEvents[idx].damageType = 2;  // Dragon breath
+                    combatEvents[idx].knockback = vec3(0.0);
+                    combatEvents[idx].flags = 0;
+                }
+            }
+        }
+    }
+
+    dragonFight.perchTimer--;
+    if (dragonFight.perchTimer == 0) {
+        dragonFight.phase = 1;
+        dragonFight.breathTimer = 0;
+    }
+}
+
+// ============================================================================
+// STAGE 10: CHECK WIN CONDITION
+// ============================================================================
+
+void checkWinCondition() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    // Win is set in processDimensionTransitions when entering exit portal
+    // Additional win conditions could be checked here
+
+    // Dragon death creates exit portal
+    if (player.dimension == DIM_END && dragonFight.health == 0 && (gameFlags & 2u) == 0) {
+        // Spawn exit portal at 0,0
+        setBlockAt(ivec3(0, 64, 0), BLOCK_END_PORTAL);
+        setBlockAt(ivec3(1, 64, 0), BLOCK_END_PORTAL);
+        setBlockAt(ivec3(-1, 64, 0), BLOCK_END_PORTAL);
+        setBlockAt(ivec3(0, 64, 1), BLOCK_END_PORTAL);
+        setBlockAt(ivec3(0, 64, -1), BLOCK_END_PORTAL);
+
+        // Spawn dragon egg
+        setBlockAt(ivec3(0, 65, 0), BLOCK_DRAGON_EGG);
+
+        gameFlags |= 2u;  // Portal spawned flag
+    }
+}
+
+// ============================================================================
+// INDIRECT DISPATCH SETUP
+// ============================================================================
+
+void setupIndirectDispatches() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    // Mob dispatch: ceil(mobCount / 256)
+    mobDispatch.x = (mobCount + 255) / 256;
+    mobDispatch.y = 1;
+    mobDispatch.z = 1;
+
+    // Block update dispatch: ceil(blockUpdateCount / 256)
+    blockUpdateDispatch.x = (blockUpdateCount + 255) / 256;
+    blockUpdateDispatch.y = 1;
+    blockUpdateDispatch.z = 1;
+
+    // Combat dispatch: ceil(combatEventCount / 256)
+    combatDispatch.x = (combatEventCount + 255) / 256;
+    combatDispatch.y = 1;
+    combatDispatch.z = 1;
+}
+
+// ============================================================================
+// MAIN ENTRY POINTS (Selected by push constant or specialization constant)
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    uint stage;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0:
+            // Setup: update indirect dispatch counts
+            setupIndirectDispatches();
+            break;
+
+        case 1:
+            // Stage 1-4: Single-threaded player processing
+            processPlayerInput();
+            memoryBarrierBuffer();
+            barrier();
+            tickHungerAndEffects();
+            memoryBarrierBuffer();
+            barrier();
+            executePlayerAction();
+            memoryBarrierBuffer();
+            barrier();
+            updatePlayerPhysics();
+            break;
+
+        case 2:
+            // Stage 5: Tick mobs (variable count, indirect dispatch)
+            tickMob(gid);
+            break;
+
+        case 3:
+            // Stage 6: Process combat (variable count, indirect dispatch)
+            processCombat(gid);
+            break;
+
+        case 4:
+            // Stage 7: Tick block updates (variable count, indirect dispatch)
+            tickBlockUpdate(gid);
+            break;
+
+        case 5:
+            // Stage 8-10: Single-threaded world updates
+            processDimensionTransitions();
+            memoryBarrierBuffer();
+            barrier();
+            tickDragonFight();
+            memoryBarrierBuffer();
+            barrier();
+            checkWinCondition();
+            break;
+    }
+}

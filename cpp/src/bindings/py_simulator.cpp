@@ -1,0 +1,93 @@
+// Python bindings for MC189Simulator
+// Exposes the GPU-accelerated simulator to Python
+
+#include "mc189/simulator.h"
+
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+namespace py = pybind11;
+using namespace mc189;
+
+void init_simulator(py::module_ &m) {
+  py::class_<MC189Simulator::Config>(m, "SimulatorConfig")
+      .def(py::init<>())
+      .def_readwrite("num_envs", &MC189Simulator::Config::num_envs)
+      .def_readwrite("enable_validation",
+                     &MC189Simulator::Config::enable_validation)
+      .def_readwrite("shader_dir", &MC189Simulator::Config::shader_dir)
+      .def_readwrite("shader_set", &MC189Simulator::Config::shader_set)
+      .def_readwrite("use_cpu", &MC189Simulator::Config::use_cpu,
+                     "Force CPU backend (no GPU required)");
+
+  py::class_<MC189Simulator>(m, "MC189Simulator")
+      .def(py::init<const MC189Simulator::Config &>(), py::arg("config"))
+      .def(
+          "step",
+          [](MC189Simulator &self, py::array_t<int32_t> actions) {
+            py::buffer_info buf = actions.request();
+            if (buf.ndim != 1) {
+              throw std::runtime_error("Actions must be 1D array");
+            }
+            self.step(static_cast<const int32_t *>(buf.ptr),
+                      static_cast<size_t>(buf.shape[0]));
+          },
+          py::arg("actions"),
+          "Execute one simulation step with the given actions")
+      .def(
+          "reset",
+          [](MC189Simulator &self, py::object env_id, py::object seed) {
+            uint64_t seed_value = 0;
+            if (!seed.is_none()) {
+              seed_value = py::cast<uint64_t>(seed);
+            }
+            if (env_id.is_none()) {
+              self.reset(0xFFFFFFFF, seed_value); // Reset all
+            } else {
+              self.reset(py::cast<uint32_t>(env_id), seed_value);
+            }
+          },
+          py::arg("env_id") = py::none(), py::arg("seed") = py::none(),
+          "Reset environment(s). Pass None to reset all, or env index. "
+          "Optional seed enables deterministic resets.")
+      .def(
+          "get_observations",
+          [](const MC189Simulator &self) {
+            const size_t n = self.num_envs();
+            const size_t obs_dim = MC189Simulator::obs_dim();
+            py::array_t<float> arr({n, obs_dim});
+            std::memcpy(arr.mutable_data(), self.get_observations(),
+                        n * obs_dim * sizeof(float));
+            return arr;
+          },
+          "Get observations as numpy array (num_envs, obs_dim)")
+      .def(
+          "get_rewards",
+          [](const MC189Simulator &self) {
+            const size_t n = self.num_envs();
+            py::array_t<float> arr(n);
+            std::memcpy(arr.mutable_data(), self.get_rewards(),
+                        n * sizeof(float));
+            return arr;
+          },
+          "Get rewards as numpy array (num_envs,)")
+      .def(
+          "get_dones",
+          [](const MC189Simulator &self) {
+            const size_t n = self.num_envs();
+            py::array_t<bool> arr(n);
+            const uint8_t *src = self.get_dones();
+            bool *dst = arr.mutable_data();
+            for (size_t i = 0; i < n; ++i) {
+              dst[i] = src[i] != 0;
+            }
+            return arr;
+          },
+          "Get done flags as numpy array (num_envs,)")
+      .def_property_readonly("num_envs", &MC189Simulator::num_envs)
+      .def_property_readonly_static(
+          "obs_dim", [](py::object) { return MC189Simulator::obs_dim(); })
+      .def("is_cpu_backend", &MC189Simulator::is_cpu_backend,
+           "Returns True if using CPU backend (no GPU)");
+}

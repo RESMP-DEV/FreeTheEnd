@@ -1,0 +1,120 @@
+id: 4
+name: Enderman Hunting
+description: >-
+  Master safe enderman combat techniques. Learn to engage endermen without
+  taking damage using environmental advantages. Collect enough ender pearls to
+  craft eyes of ender.
+objectives:
+  - Kill 12 endermen
+  - Collect 12 ender pearls
+  - Take minimal damage from endermen
+  - Use safe hunting techniques
+spawn:
+  biome: warped_forest
+  time_of_day: 0
+  weather: clear
+  random_position: true
+  position: null
+  inventory:
+    iron_sword: 1
+    diamond_sword: 1
+    iron_helmet: 1
+    iron_chestplate: 1
+    iron_leggings: 1
+    iron_boots: 1
+    shield: 1
+    cobblestone: 64
+    water_bucket: 2
+    carved_pumpkin: 1
+    cooked_beef: 32
+    golden_apple: 4
+    blaze_rod: 7
+  health: 20.0
+  hunger: 20.0
+rewards:
+  sparse_reward: 20.0
+  dense_rewards:
+    enderman_damaged: 0.1
+    enderman_killed: 1.5
+    ender_pearl_obtained: 2.0
+    water_trap_built: 0.5
+    low_ceiling_trap_built: 0.5
+    pumpkin_equipped: 0.3
+    safe_engagement: 0.3
+    pearls_per_minute: 0.5
+    consecutive_kills: 0.2
+    enderman_teleport_tracked: 0.1
+    aggro_managed: 0.2
+  penalty_per_death: -2.5
+  penalty_per_tick: -0.0001
+  exploration_bonus: 0.01
+termination:
+  max_ticks: 48000
+  max_deaths: 5
+  success_conditions:
+    - inventory:ender_pearl >= 12
+  failure_conditions:
+    - deaths >= max_deaths
+    - ticks >= max_ticks
+prerequisites:
+  - 3
+difficulty: 4
+expected_episodes: 1500
+action_space:
+  - move_forward
+  - move_backward
+  - move_left
+  - move_right
+  - jump
+  - sprint
+  - sneak
+  - camera_pitch
+  - camera_yaw
+  - look_at_enderman
+  - look_away
+  - attack
+  - use
+  - block
+  - hotbar_1
+  - hotbar_2
+  - hotbar_3
+  - hotbar_4
+  - hotbar_5
+  - hotbar_6
+  - hotbar_7
+  - hotbar_8
+  - hotbar_9
+  - equip_helmet
+  - place_block
+  - place_water
+observation_space:
+  - position
+  - velocity
+  - health
+  - hunger
+  - inventory
+  - nearby_entities
+  - nearby_endermen
+  - enderman_count
+  - enderman_aggro_state
+  - enderman_positions
+  - wearing_pumpkin
+  - looking_at_enderman
+  - water_nearby
+  - ceiling_height
+  - equipped_item
+  - damage_source
+curriculum_threshold: 0.65
+shader_set:
+  - mob_ai_enderman_full
+  - enderman_spawning
+metadata:
+  enderman_spawn_rate: high
+  safe_zone_radius: 5
+  difficulty: hard
+  target_completion_time: 30000
+  hunting_strategies:
+    - water_trap
+    - low_ceiling
+    - pumpkin_safe
+    - boat_trap

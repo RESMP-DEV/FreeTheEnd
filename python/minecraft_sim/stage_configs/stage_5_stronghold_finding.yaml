@@ -1,0 +1,140 @@
+id: 5
+name: Stronghold Finding
+description: >-
+  Master triangulation navigation. Craft eyes of ender from blaze powder and
+  ender pearls, use them to triangulate stronghold location, dig to find it,
+  and locate the End portal room.
+objectives:
+  - Craft blaze powder from blaze rods
+  - Craft at least 12 eyes of ender
+  - Throw first eye to get initial direction
+  - Travel perpendicular for triangulation
+  - Throw second eye to triangulate position
+  - Dig down to stronghold
+  - Navigate to portal room
+  - Fill End portal frame with eyes
+spawn:
+  biome: plains
+  time_of_day: 6000
+  weather: clear
+  random_position: true
+  position: null
+  inventory:
+    blaze_rod: 7
+    ender_pearl: 14
+    diamond_pickaxe: 1
+    iron_pickaxe: 2
+    diamond_sword: 1
+    iron_helmet: 1
+    iron_chestplate: 1
+    iron_leggings: 1
+    iron_boots: 1
+    shield: 1
+    crafting_table: 1
+    torch: 64
+    cobblestone: 64
+    cooked_beef: 32
+    bed: 1
+  health: 20.0
+  hunger: 20.0
+rewards:
+  sparse_reward: 30.0
+  dense_rewards:
+    craft_blaze_powder: 0.2
+    craft_eye_of_ender: 0.5
+    throw_first_eye: 1.0
+    note_direction: 0.3
+    travel_for_triangulation: 0.01
+    throw_second_eye: 1.5
+    calculate_intersection: 2.0
+    approach_stronghold: 0.02
+    eye_drops_down: 1.0
+    dig_to_stronghold: 0.5
+    enter_stronghold: 2.0
+    find_library: 0.5
+    find_prison: 0.3
+    find_portal_room: 5.0
+    place_eye_in_frame: 0.5
+    portal_active: 3.0
+  penalty_per_death: -2.0
+  penalty_per_tick: -0.0001
+  exploration_bonus: 0.01
+termination:
+  max_ticks: 60000
+  max_deaths: 3
+  success_conditions:
+    - end_portal_active
+  failure_conditions:
+    - death_count >= max_deaths
+    - ticks >= max_ticks
+    - eyes_of_ender_remaining < portal_eyes_needed
+prerequisites:
+  - 4
+difficulty: 4
+expected_episodes: 1000
+action_space:
+  - move_forward
+  - move_backward
+  - move_left
+  - move_right
+  - jump
+  - sprint
+  - sneak
+  - camera_pitch
+  - camera_yaw
+  - throw_eye
+  - track_eye_trajectory
+  - mark_waypoint
+  - attack
+  - use
+  - place_block
+  - break_block
+  - hotbar_1
+  - hotbar_2
+  - hotbar_3
+  - hotbar_4
+  - hotbar_5
+  - hotbar_6
+  - hotbar_7
+  - hotbar_8
+  - hotbar_9
+  - open_inventory
+  - craft
+observation_space:
+  - player_position
+  - player_health
+  - player_hunger
+  - player_direction
+  - nearby_blocks
+  - nearby_entities
+  - inventory
+  - equipped_item
+  - time_of_day
+  - biome
+  - y_level
+  - eye_trajectory
+  - eye_landed_position
+  - triangulation_waypoints
+  - estimated_stronghold_pos
+  - in_stronghold
+  - stronghold_rooms_visited
+  - portal_frame_status
+curriculum_threshold: 0.55
+shader_set:
+  - stronghold_gen
+  - decoration
+metadata:
+  triangulation_guide:
+    step_1: Throw eye, record direction vector
+    step_2: Travel 200-500 blocks perpendicular to eye direction
+    step_3: Throw again, find intersection of two direction lines
+    step_4: When eye goes down, dig straight down
+  stronghold_depth_range:
+    - -64
+    - 0
+  portal_frames_needed: 12
+  eye_break_chance: 0.2
+  speedrun_notes: >-
+    Blind travel method: go to 0,0 coords, travel ~1800 blocks in any
+    direction, strongholds always generate in rings. First ring: 1408-2688
+    blocks from origin.

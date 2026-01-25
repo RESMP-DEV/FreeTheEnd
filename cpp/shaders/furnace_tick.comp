@@ -1,0 +1,550 @@
+#version 450
+
+/*
+ * furnace_tick.comp - Vulkan compute shader for Minecraft 1.8.9 furnace smelting
+ *
+ * Simulates furnace block entity with:
+ *   - 3 slots: input (0), fuel (1), output (2)
+ *   - Fuel consumption with varying burn times
+ *   - Smelting progress (200 ticks per item)
+ *   - Output stacking
+ *   - Fuel efficiency (don't light fuel if can't complete smelt)
+ *
+ * Important smelts for speedrun:
+ *   - Iron ore (15) -> Iron ingot (265) [bucket, tools]
+ *   - Raw beef (363) -> Cooked beef (364) [food]
+ *   - Raw porkchop (319) -> Cooked porkchop (320) [food]
+ *   - Sand (12) -> Glass (20) [optional]
+ *
+ * Furnace state buffer per furnace (24 bytes, padded to 32):
+ *   uint16 input_item, input_count, input_damage
+ *   uint16 fuel_item, fuel_count, fuel_damage
+ *   uint16 output_item, output_count, output_damage
+ *   uint16 burn_time_remaining   (ticks of fuel left)
+ *   uint16 total_burn_time       (initial burn time for progress bar)
+ *   uint16 smelt_progress        (ticks toward current smelt, 200 = done)
+ *   uint16 flags                 (reserved)
+ *   uint16 padding
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Slot indices
+const uint SLOT_INPUT = 0;
+const uint SLOT_FUEL = 1;
+const uint SLOT_OUTPUT = 2;
+
+// Smelting constants
+const uint SMELT_TIME = 200;  // Ticks to smelt one item
+
+// Fuel burn times (in ticks, 20 ticks = 1 second)
+// Coal/charcoal: smelts 8 items (1600 ticks)
+// Wood (logs, planks): 1.5 items (300 ticks)
+// Sticks: 0.5 items (100 ticks)
+// Blaze rod: 12 items (2400 ticks)
+// Lava bucket: 100 items (20000 ticks)
+const uint BURN_COAL = 1600;
+const uint BURN_CHARCOAL = 1600;
+const uint BURN_WOOD_LOG = 300;
+const uint BURN_WOOD_PLANK = 300;
+const uint BURN_STICK = 100;
+const uint BURN_BLAZE_ROD = 2400;
+const uint BURN_LAVA_BUCKET = 20000;
+const uint BURN_WOODEN_SLAB = 150;
+const uint BURN_SAPLING = 100;
+const uint BURN_BOWL = 100;
+const uint BURN_FENCE = 300;
+const uint BURN_WOODEN_STAIRS = 300;
+const uint BURN_TRAPDOOR = 300;
+const uint BURN_DOOR = 200;
+const uint BURN_BOOKSHELF = 300;
+const uint BURN_CHEST = 300;
+const uint BURN_CRAFTING_TABLE = 300;
+const uint BURN_JUKEBOX = 300;
+const uint BURN_NOTE_BLOCK = 300;
+
+// Item IDs (MC 1.8.9)
+const uint ITEM_COAL = 263;
+const uint ITEM_CHARCOAL = 263;  // Same ID, damage=1
+const uint ITEM_STICK = 280;
+const uint ITEM_BLAZE_ROD = 369;
+const uint ITEM_LAVA_BUCKET = 327;
+const uint ITEM_BUCKET = 325;
+
+// Wood-related items
+const uint ITEM_OAK_LOG = 17;
+const uint ITEM_SPRUCE_LOG = 17;  // damage variants
+const uint ITEM_BIRCH_LOG = 17;
+const uint ITEM_JUNGLE_LOG = 17;
+const uint ITEM_ACACIA_LOG = 162;
+const uint ITEM_DARK_OAK_LOG = 162;
+const uint ITEM_OAK_PLANK = 5;
+const uint ITEM_WOODEN_SLAB = 126;
+const uint ITEM_SAPLING = 6;
+const uint ITEM_BOWL = 281;
+const uint ITEM_OAK_FENCE = 85;
+const uint ITEM_OAK_STAIRS = 53;
+const uint ITEM_SPRUCE_STAIRS = 134;
+const uint ITEM_BIRCH_STAIRS = 135;
+const uint ITEM_JUNGLE_STAIRS = 136;
+const uint ITEM_ACACIA_STAIRS = 163;
+const uint ITEM_DARK_OAK_STAIRS = 164;
+const uint ITEM_TRAPDOOR = 96;
+const uint ITEM_WOODEN_DOOR = 324;
+const uint ITEM_BOOKSHELF = 47;
+const uint ITEM_CHEST = 54;
+const uint ITEM_CRAFTING_TABLE = 58;
+const uint ITEM_JUKEBOX = 84;
+const uint ITEM_NOTE_BLOCK = 25;
+const uint ITEM_FENCE_GATE = 107;
+
+// Smeltable items and their results
+const uint ITEM_IRON_ORE = 15;
+const uint ITEM_IRON_INGOT = 265;
+const uint ITEM_GOLD_ORE = 14;
+const uint ITEM_GOLD_INGOT = 266;
+const uint ITEM_SAND = 12;
+const uint ITEM_GLASS = 20;
+const uint ITEM_RAW_BEEF = 363;
+const uint ITEM_COOKED_BEEF = 364;
+const uint ITEM_RAW_PORKCHOP = 319;
+const uint ITEM_COOKED_PORKCHOP = 320;
+const uint ITEM_RAW_CHICKEN = 365;
+const uint ITEM_COOKED_CHICKEN = 366;
+const uint ITEM_RAW_MUTTON = 423;
+const uint ITEM_COOKED_MUTTON = 424;
+const uint ITEM_RAW_RABBIT = 411;
+const uint ITEM_COOKED_RABBIT = 412;
+const uint ITEM_RAW_FISH = 349;
+const uint ITEM_COOKED_FISH = 350;
+const uint ITEM_POTATO = 392;
+const uint ITEM_BAKED_POTATO = 393;
+const uint ITEM_COBBLESTONE = 4;
+const uint ITEM_STONE = 1;
+const uint ITEM_CLAY_BALL = 337;
+const uint ITEM_BRICK = 336;
+const uint ITEM_CLAY_BLOCK = 82;
+const uint ITEM_HARDENED_CLAY = 172;
+const uint ITEM_NETHERRACK = 87;
+const uint ITEM_NETHER_BRICK_ITEM = 405;
+const uint ITEM_CACTUS = 81;
+const uint ITEM_GREEN_DYE = 351;  // damage=2
+const uint ITEM_DIAMOND_ORE = 56;
+const uint ITEM_DIAMOND = 264;
+const uint ITEM_EMERALD_ORE = 129;
+const uint ITEM_EMERALD = 388;
+const uint ITEM_COAL_ORE = 16;
+const uint ITEM_REDSTONE_ORE = 73;
+const uint ITEM_REDSTONE = 331;
+const uint ITEM_LAPIS_ORE = 21;
+const uint ITEM_LAPIS = 351;  // damage=4
+const uint ITEM_QUARTZ_ORE = 153;
+const uint ITEM_QUARTZ = 406;
+const uint ITEM_WET_SPONGE = 19;  // damage=1
+const uint ITEM_DRY_SPONGE = 19;  // damage=0
+
+// Furnace state buffer (SSBO)
+layout(std430, set = 0, binding = 0) buffer FurnaceBuffer {
+    uint data[];  // Packed furnace state for all furnaces
+} furnaces;
+
+// Furnace active flags (for optimization - skip inactive furnaces)
+layout(std430, set = 0, binding = 1) buffer FurnaceActiveBuffer {
+    uint active_mask[];  // Bitmask of active furnaces (has fuel burning or can start)
+} active_buf;
+
+// Results buffers (for tracking smelted items)
+layout(std430, set = 0, binding = 2) buffer FurnaceSmeltedBuffer {
+    uint items_smelted[];     // Count of items smelted this tick
+} results_smelted;
+
+layout(std430, set = 0, binding = 3) buffer FurnaceFuelBuffer {
+    uint fuel_consumed[];     // Count of fuel items consumed this tick
+} results_fuel;
+
+layout(push_constant) uniform PushConstants {
+    uint num_furnaces;
+    uint tick;              // Current game tick
+} pc;
+
+// Furnace state stride (8 uints = 32 bytes)
+const uint FURNACE_STRIDE = 8;
+
+// Helper to get furnace data offset
+uint getFurnaceOffset(uint furnace_id) {
+    return furnace_id * FURNACE_STRIDE;
+}
+
+// Read furnace slot data
+uint readSlotItem(uint base, uint slot) {
+    // Slots packed: [input_item|input_count] [input_damage|fuel_item] [fuel_count|fuel_damage] [output_item|output_count] [output_damage|burn_time] [total_burn|smelt_progress] [flags|padding]
+    uint word_idx = slot;  // Each slot takes 3 uint16s, but we pack differently
+    // Simpler layout: word0=[input_item|input_count], word1=[input_damage|fuel_item], word2=[fuel_count|fuel_damage], word3=[output_item|output_count], etc.
+    // Let's use a cleaner layout:
+    // word0: input_item (low16), input_count (high16)
+    // word1: input_damage (low16), fuel_item (high16)
+    // word2: fuel_count (low16), fuel_damage (high16)
+    // word3: output_item (low16), output_count (high16)
+    // word4: output_damage (low16), burn_time_remaining (high16)
+    // word5: total_burn_time (low16), smelt_progress (high16)
+    // word6-7: reserved
+
+    uint word;
+    if (slot == SLOT_INPUT) {
+        word = furnaces.data[base];
+        return word & 0xFFFF;
+    } else if (slot == SLOT_FUEL) {
+        word = furnaces.data[base + 1];
+        return word >> 16;
+    } else { // SLOT_OUTPUT
+        word = furnaces.data[base + 3];
+        return word & 0xFFFF;
+    }
+}
+
+uint readSlotCount(uint base, uint slot) {
+    uint word;
+    if (slot == SLOT_INPUT) {
+        word = furnaces.data[base];
+        return (word >> 16) & 0xFFFF;
+    } else if (slot == SLOT_FUEL) {
+        word = furnaces.data[base + 2];
+        return word & 0xFFFF;
+    } else { // SLOT_OUTPUT
+        word = furnaces.data[base + 3];
+        return (word >> 16) & 0xFFFF;
+    }
+}
+
+uint readSlotDamage(uint base, uint slot) {
+    uint word;
+    if (slot == SLOT_INPUT) {
+        word = furnaces.data[base + 1];
+        return word & 0xFFFF;
+    } else if (slot == SLOT_FUEL) {
+        word = furnaces.data[base + 2];
+        return (word >> 16) & 0xFFFF;
+    } else { // SLOT_OUTPUT
+        word = furnaces.data[base + 4];
+        return word & 0xFFFF;
+    }
+}
+
+void writeSlotItem(uint base, uint slot, uint item) {
+    if (slot == SLOT_INPUT) {
+        uint word = furnaces.data[base];
+        furnaces.data[base] = (word & 0xFFFF0000) | (item & 0xFFFF);
+    } else if (slot == SLOT_FUEL) {
+        uint word = furnaces.data[base + 1];
+        furnaces.data[base + 1] = (word & 0x0000FFFF) | ((item & 0xFFFF) << 16);
+    } else { // SLOT_OUTPUT
+        uint word = furnaces.data[base + 3];
+        furnaces.data[base + 3] = (word & 0xFFFF0000) | (item & 0xFFFF);
+    }
+}
+
+void writeSlotCount(uint base, uint slot, uint count) {
+    if (slot == SLOT_INPUT) {
+        uint word = furnaces.data[base];
+        furnaces.data[base] = (word & 0x0000FFFF) | ((count & 0xFFFF) << 16);
+    } else if (slot == SLOT_FUEL) {
+        uint word = furnaces.data[base + 2];
+        furnaces.data[base + 2] = (word & 0xFFFF0000) | (count & 0xFFFF);
+    } else { // SLOT_OUTPUT
+        uint word = furnaces.data[base + 3];
+        furnaces.data[base + 3] = (word & 0x0000FFFF) | ((count & 0xFFFF) << 16);
+    }
+}
+
+void writeSlotDamage(uint base, uint slot, uint damage) {
+    if (slot == SLOT_INPUT) {
+        uint word = furnaces.data[base + 1];
+        furnaces.data[base + 1] = (word & 0xFFFF0000) | (damage & 0xFFFF);
+    } else if (slot == SLOT_FUEL) {
+        uint word = furnaces.data[base + 2];
+        furnaces.data[base + 2] = (word & 0x0000FFFF) | ((damage & 0xFFFF) << 16);
+    } else { // SLOT_OUTPUT
+        uint word = furnaces.data[base + 4];
+        furnaces.data[base + 4] = (word & 0xFFFF0000) | (damage & 0xFFFF);
+    }
+}
+
+// Read burn time remaining
+uint readBurnTime(uint base) {
+    return (furnaces.data[base + 4] >> 16) & 0xFFFF;
+}
+
+void writeBurnTime(uint base, uint burn_time) {
+    uint word = furnaces.data[base + 4];
+    furnaces.data[base + 4] = (word & 0x0000FFFF) | ((burn_time & 0xFFFF) << 16);
+}
+
+// Read total burn time (for progress bar calculation)
+uint readTotalBurnTime(uint base) {
+    return furnaces.data[base + 5] & 0xFFFF;
+}
+
+void writeTotalBurnTime(uint base, uint total) {
+    uint word = furnaces.data[base + 5];
+    furnaces.data[base + 5] = (word & 0xFFFF0000) | (total & 0xFFFF);
+}
+
+// Read smelt progress
+uint readSmeltProgress(uint base) {
+    return (furnaces.data[base + 5] >> 16) & 0xFFFF;
+}
+
+void writeSmeltProgress(uint base, uint progress) {
+    uint word = furnaces.data[base + 5];
+    furnaces.data[base + 5] = (word & 0x0000FFFF) | ((progress & 0xFFFF) << 16);
+}
+
+// Clear a slot
+void clearSlot(uint base, uint slot) {
+    writeSlotItem(base, slot, 0);
+    writeSlotCount(base, slot, 0);
+    writeSlotDamage(base, slot, 0);
+}
+
+// Get fuel burn time for an item
+uint getFuelBurnTime(uint item_id, uint damage) {
+    // Coal and charcoal
+    if (item_id == ITEM_COAL) {
+        return (damage == 1) ? BURN_CHARCOAL : BURN_COAL;
+    }
+
+    // Wood items
+    if (item_id == ITEM_OAK_LOG || item_id == ITEM_ACACIA_LOG) return BURN_WOOD_LOG;
+    if (item_id == ITEM_OAK_PLANK) return BURN_WOOD_PLANK;
+    if (item_id == ITEM_WOODEN_SLAB) return BURN_WOODEN_SLAB;
+    if (item_id == ITEM_STICK) return BURN_STICK;
+    if (item_id == ITEM_SAPLING) return BURN_SAPLING;
+    if (item_id == ITEM_BOWL) return BURN_BOWL;
+    if (item_id == ITEM_OAK_FENCE || item_id == ITEM_FENCE_GATE) return BURN_FENCE;
+    if (item_id == ITEM_OAK_STAIRS || item_id == ITEM_SPRUCE_STAIRS ||
+        item_id == ITEM_BIRCH_STAIRS || item_id == ITEM_JUNGLE_STAIRS ||
+        item_id == ITEM_ACACIA_STAIRS || item_id == ITEM_DARK_OAK_STAIRS) return BURN_WOODEN_STAIRS;
+    if (item_id == ITEM_TRAPDOOR) return BURN_TRAPDOOR;
+    if (item_id == ITEM_WOODEN_DOOR) return BURN_DOOR;
+    if (item_id == ITEM_BOOKSHELF) return BURN_BOOKSHELF;
+    if (item_id == ITEM_CHEST) return BURN_CHEST;
+    if (item_id == ITEM_CRAFTING_TABLE) return BURN_CRAFTING_TABLE;
+    if (item_id == ITEM_JUKEBOX) return BURN_JUKEBOX;
+    if (item_id == ITEM_NOTE_BLOCK) return BURN_NOTE_BLOCK;
+
+    // Special fuels
+    if (item_id == ITEM_BLAZE_ROD) return BURN_BLAZE_ROD;
+    if (item_id == ITEM_LAVA_BUCKET) return BURN_LAVA_BUCKET;
+
+    return 0;  // Not a fuel
+}
+
+// Get smelt result for an item
+// Returns: result_item in low 16 bits, 0 if not smeltable
+// For items that need damage tracking (like dyes), damage is in high 16 bits
+uint getSmeltResult(uint item_id, uint damage) {
+    // Ores -> ingots/gems (priority for speedrun)
+    if (item_id == ITEM_IRON_ORE) return ITEM_IRON_INGOT;
+    if (item_id == ITEM_GOLD_ORE) return ITEM_GOLD_INGOT;
+    if (item_id == ITEM_DIAMOND_ORE) return ITEM_DIAMOND;
+    if (item_id == ITEM_EMERALD_ORE) return ITEM_EMERALD;
+    if (item_id == ITEM_COAL_ORE) return ITEM_COAL;
+    if (item_id == ITEM_REDSTONE_ORE) return ITEM_REDSTONE;
+    if (item_id == ITEM_LAPIS_ORE) return ITEM_LAPIS | (4 << 16);  // damage=4 for lapis
+    if (item_id == ITEM_QUARTZ_ORE) return ITEM_QUARTZ;
+
+    // Food (priority for speedrun)
+    if (item_id == ITEM_RAW_BEEF) return ITEM_COOKED_BEEF;
+    if (item_id == ITEM_RAW_PORKCHOP) return ITEM_COOKED_PORKCHOP;
+    if (item_id == ITEM_RAW_CHICKEN) return ITEM_COOKED_CHICKEN;
+    if (item_id == ITEM_RAW_MUTTON) return ITEM_COOKED_MUTTON;
+    if (item_id == ITEM_RAW_RABBIT) return ITEM_COOKED_RABBIT;
+    if (item_id == ITEM_RAW_FISH) return ITEM_COOKED_FISH;
+    if (item_id == ITEM_POTATO) return ITEM_BAKED_POTATO;
+
+    // Building materials
+    if (item_id == ITEM_SAND) return ITEM_GLASS;
+    if (item_id == ITEM_COBBLESTONE) return ITEM_STONE;
+    if (item_id == ITEM_CLAY_BALL) return ITEM_BRICK;
+    if (item_id == ITEM_CLAY_BLOCK) return ITEM_HARDENED_CLAY;
+    if (item_id == ITEM_NETHERRACK) return ITEM_NETHER_BRICK_ITEM;
+
+    // Other
+    if (item_id == ITEM_CACTUS) return ITEM_GREEN_DYE | (2 << 16);  // damage=2 for green
+    if (item_id == ITEM_WET_SPONGE && damage == 1) return ITEM_DRY_SPONGE;
+
+    // Wood -> charcoal
+    if (item_id == ITEM_OAK_LOG || item_id == ITEM_ACACIA_LOG) {
+        return ITEM_CHARCOAL | (1 << 16);  // damage=1 for charcoal
+    }
+
+    return 0;  // Not smeltable
+}
+
+// Check if output can accept the smelt result
+bool canOutputAccept(uint base, uint result_item, uint result_damage) {
+    uint output_item = readSlotItem(base, SLOT_OUTPUT);
+    uint output_count = readSlotCount(base, SLOT_OUTPUT);
+    uint output_damage = readSlotDamage(base, SLOT_OUTPUT);
+
+    // Empty slot can accept anything
+    if (output_item == 0) return true;
+
+    // Must match item and damage
+    if (output_item != result_item) return false;
+    if (output_damage != result_damage) return false;
+
+    // Must have room (max stack 64)
+    return output_count < 64;
+}
+
+// Check if furnace can start/continue smelting
+bool canSmelt(uint base) {
+    uint input_item = readSlotItem(base, SLOT_INPUT);
+    uint input_count = readSlotCount(base, SLOT_INPUT);
+    uint input_damage = readSlotDamage(base, SLOT_INPUT);
+
+    if (input_item == 0 || input_count == 0) return false;
+
+    uint result = getSmeltResult(input_item, input_damage);
+    if (result == 0) return false;
+
+    uint result_item = result & 0xFFFF;
+    uint result_damage = (result >> 16) & 0xFFFF;
+
+    return canOutputAccept(base, result_item, result_damage);
+}
+
+// Check if furnace has valid fuel that can be consumed
+bool hasFuel(uint base) {
+    uint fuel_item = readSlotItem(base, SLOT_FUEL);
+    uint fuel_count = readSlotCount(base, SLOT_FUEL);
+    uint fuel_damage = readSlotDamage(base, SLOT_FUEL);
+
+    if (fuel_item == 0 || fuel_count == 0) return false;
+
+    return getFuelBurnTime(fuel_item, fuel_damage) > 0;
+}
+
+void main() {
+    uint furnace_id = gl_GlobalInvocationID.x;
+    if (furnace_id >= pc.num_furnaces) return;
+
+    uint base = getFurnaceOffset(furnace_id);
+
+    // Read current state
+    uint burn_time = readBurnTime(base);
+    uint smelt_progress = readSmeltProgress(base);
+    bool is_burning = burn_time > 0;
+
+    // Track results for this tick
+    uint smelted_this_tick = 0;
+    uint fuel_used_this_tick = 0;
+
+    // Decrement burn time if burning
+    if (is_burning) {
+        burn_time--;
+        writeBurnTime(base, burn_time);
+    }
+
+    // Check if we can smelt
+    bool can_smelt = canSmelt(base);
+
+    // If not burning and can smelt, try to light fuel
+    // IMPORTANT: Only light fuel if we can actually complete a smelt (fuel efficiency)
+    if (!is_burning && can_smelt && hasFuel(base)) {
+        uint fuel_item = readSlotItem(base, SLOT_FUEL);
+        uint fuel_count = readSlotCount(base, SLOT_FUEL);
+        uint fuel_damage = readSlotDamage(base, SLOT_FUEL);
+
+        uint new_burn_time = getFuelBurnTime(fuel_item, fuel_damage);
+
+        // Consume fuel
+        if (fuel_count > 1) {
+            writeSlotCount(base, SLOT_FUEL, fuel_count - 1);
+        } else {
+            // Last fuel item - check for special case (lava bucket returns empty bucket)
+            if (fuel_item == ITEM_LAVA_BUCKET) {
+                writeSlotItem(base, SLOT_FUEL, ITEM_BUCKET);
+                writeSlotCount(base, SLOT_FUEL, 1);
+                writeSlotDamage(base, SLOT_FUEL, 0);
+            } else {
+                clearSlot(base, SLOT_FUEL);
+            }
+        }
+
+        burn_time = new_burn_time;
+        writeBurnTime(base, burn_time);
+        writeTotalBurnTime(base, new_burn_time);
+        is_burning = true;
+        fuel_used_this_tick = 1;
+    }
+
+    // Progress smelting if burning and can smelt
+    if (is_burning && can_smelt) {
+        smelt_progress++;
+
+        // Smelt complete
+        if (smelt_progress >= SMELT_TIME) {
+            smelt_progress = 0;
+
+            // Get input and result
+            uint input_item = readSlotItem(base, SLOT_INPUT);
+            uint input_count = readSlotCount(base, SLOT_INPUT);
+            uint input_damage = readSlotDamage(base, SLOT_INPUT);
+
+            uint result = getSmeltResult(input_item, input_damage);
+            uint result_item = result & 0xFFFF;
+            uint result_damage = (result >> 16) & 0xFFFF;
+
+            // Consume input
+            if (input_count > 1) {
+                writeSlotCount(base, SLOT_INPUT, input_count - 1);
+            } else {
+                clearSlot(base, SLOT_INPUT);
+            }
+
+            // Add to output
+            uint output_item = readSlotItem(base, SLOT_OUTPUT);
+            uint output_count = readSlotCount(base, SLOT_OUTPUT);
+
+            if (output_item == 0) {
+                // First item in output
+                writeSlotItem(base, SLOT_OUTPUT, result_item);
+                writeSlotCount(base, SLOT_OUTPUT, 1);
+                writeSlotDamage(base, SLOT_OUTPUT, result_damage);
+            } else {
+                // Stack with existing
+                writeSlotCount(base, SLOT_OUTPUT, output_count + 1);
+            }
+
+            smelted_this_tick = 1;
+        }
+
+        writeSmeltProgress(base, smelt_progress);
+    } else if (!can_smelt && smelt_progress > 0) {
+        // Can't smelt anymore - reset progress (but faster than gaining)
+        // In MC, progress resets at 2x speed when input removed
+        if (smelt_progress > 2) {
+            smelt_progress -= 2;
+        } else {
+            smelt_progress = 0;
+        }
+        writeSmeltProgress(base, smelt_progress);
+    }
+
+    // Update active mask for optimization
+    uint mask_idx = furnace_id / 32;
+    uint mask_bit = 1u << (furnace_id & 31);
+    bool should_be_active = is_burning || (can_smelt && hasFuel(base));
+
+    if (should_be_active) {
+        atomicOr(active_buf.active_mask[mask_idx], mask_bit);
+    } else {
+        atomicAnd(active_buf.active_mask[mask_idx], ~mask_bit);
+    }
+
+    // Write results
+    results_smelted.items_smelted[furnace_id] = smelted_this_tick;
+    results_fuel.fuel_consumed[furnace_id] = fuel_used_this_tick;
+}

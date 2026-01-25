@@ -1,0 +1,159 @@
+id: 3
+name: Nether Navigation
+description: >-
+  Master Nether dimension mechanics. Build and activate a portal, navigate the
+  dangerous Nether wastes, locate a Nether fortress, and defeat blazes to
+  collect blaze rods.
+objectives:
+  - Mine 10 obsidian
+  - Build nether portal frame
+  - Light portal with flint and steel
+  - Enter the Nether
+  - Locate a Nether fortress
+  - Kill 7 blazes
+  - Collect 7 blaze rods
+spawn:
+  biome: plains
+  time_of_day: 6000
+  weather: clear
+  random_position: true
+  position: null
+  inventory:
+    iron_pickaxe: 2
+    iron_sword: 1
+    iron_helmet: 1
+    iron_chestplate: 1
+    iron_leggings: 1
+    iron_boots: 1
+    cobblestone: 64
+    oak_planks: 32
+    cooked_beef: 32
+    bucket: 2
+    flint_and_steel: 1
+  health: 20.0
+  hunger: 20.0
+rewards:
+  sparse_reward: 25.0
+  dense_rewards:
+    obsidian_mined: 0.3
+    lava_found: 0.2
+    water_placed: 0.1
+    obsidian_placed: 0.2
+    portal_frame_complete: 2.0
+    portal_lit: 3.0
+    nether_entered: 5.0
+    nether_distance_traveled: 0.01
+    nether_fortress_found: 5.0
+    fortress_entered: 2.0
+    blaze_damaged: 0.1
+    blaze_killed: 1.0
+    blaze_rod_obtained: 1.5
+    ghast_deflected: 0.5
+    wither_skeleton_killed: 0.3
+    fire_resistance_active: 0.02
+    escaped_lava: 0.5
+  penalty_per_death: -2.0
+  penalty_per_tick: -0.00015
+  exploration_bonus: 0.03
+termination:
+  max_ticks: 72000
+  max_deaths: 5
+  success_conditions:
+    - dimension == nether
+    - objective:blaze_rods >= 7
+  failure_conditions:
+    - deaths >= max_deaths
+    - ticks >= max_ticks
+prerequisites:
+  - 2
+difficulty: 5
+expected_episodes: 2000
+action_space:
+  - move_forward
+  - move_backward
+  - move_left
+  - move_right
+  - jump
+  - sprint
+  - sneak
+  - camera_pitch
+  - camera_yaw
+  - attack
+  - use
+  - block
+  - hotbar_1
+  - hotbar_2
+  - hotbar_3
+  - hotbar_4
+  - hotbar_5
+  - hotbar_6
+  - hotbar_7
+  - hotbar_8
+  - hotbar_9
+  - drop_item
+  - swap_hands
+  - place_block
+  - break_block
+  - open_inventory
+  - use_item
+observation_space:
+  # Core player state
+  - position              # xyz normalized to dimension bounds
+  - velocity              # blocks/tick
+  - health                # [0, 1] normalized from 0-20
+  - hunger                # [0, 1] normalized from 0-20
+  - inventory             # hotbar items/counts + key resource counts
+  - nearby_entities       # entity type/distance/angle
+  - nearby_blocks         # local voxel features
+
+  # Dimension flags (one-hot encoded at obs[224:227])
+  - dimension             # 0=overworld, 1=nether, 2=end
+  - is_in_nether          # binary flag: dimension == 1
+  - is_in_overworld       # binary flag: dimension == 0
+
+  # Portal state (obs[227:256] block)
+  - portal_nearby         # nether portal within 64 blocks
+  - portal_lit            # whether constructed portal is activated
+
+  # Fortress tracking
+  - fortress_direction    # normalized vec3 toward nearest fortress
+  - fortress_distance     # distance in blocks (0-500 range, normalized)
+  - fortress_entered      # binary: player inside fortress bounding box
+
+  # Blaze combat
+  - blaze_nearby          # count of blazes within aggro range
+  - blaze_rod_count       # inventory blaze rods (obs[32+22], /64 normalized)
+  - blazes_killed         # cumulative kill count this episode
+
+  # Hazard awareness
+  - projectile_incoming   # fireball/wither skull proximity
+  - on_fire               # player burning flag
+  - fire_resistance_duration  # remaining ticks of fire resistance
+  - lava_nearby           # lava blocks in local neighborhood
+  - ghast_nearby          # ghast entity within render distance
+  - y_level               # current y coordinate (nether ceiling=128)
+curriculum_threshold: 0.6
+shader_set:
+  - nether_gen
+  - fortress_gen
+  - mob_ai_ghast
+  - mob_ai_blaze
+metadata:
+  fortress_spawn_guarantee: true
+  max_fortress_distance: 500
+  blaze_spawner_active: true
+  difficulty: hard
+  target_completion_time: 54000
+  progress_keys:
+    obsidian_mined: "Obsidian Mined"
+    portal_frame_placed: "Portal Frame Blocks Placed"
+    portal_lit: "Portal Activated"
+    dimension_nether: "In Nether Dimension"
+    nether_entered: "Entered Nether"
+    fortress_distance: "Distance to Fortress"
+    fortress_found: "Fortress Located"
+    fortress_entered: "Inside Fortress"
+    blazes_killed: "Blazes Killed"
+    blaze_rods_collected: "Blaze Rods Collected"
+    ghasts_deflected: "Ghast Fireballs Deflected"
+    wither_skeletons_killed: "Wither Skeletons Killed"

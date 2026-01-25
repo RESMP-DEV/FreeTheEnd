@@ -1,0 +1,666 @@
+#version 450
+
+// Village generation compute shader
+// Simplified villages for speedrun: houses, farms, chests with loot
+// Generates in plains/savanna biomes without villagers
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+#define MAX_HOUSES 10
+#define MIN_HOUSES 5
+#define VILLAGE_RADIUS 64
+#define HOUSE_MIN_SPACING 12
+#define PATH_WIDTH 3
+
+// Block IDs (MC 1.8.9)
+#define AIR 0
+#define COBBLESTONE 4
+#define PLANKS 5
+#define LOG 17
+#define DIRT 3
+#define GRAVEL 13
+#define WATER 9
+#define TORCH 50
+#define CHEST 54
+#define FARMLAND 60
+#define WHEAT 59
+#define WOODEN_DOOR 64
+#define FENCE 85
+#define GLASS_PANE 102
+#define WOODEN_STAIRS 53
+
+// Biome IDs
+#define BIOME_PLAINS 1
+#define BIOME_SAVANNA 35
+
+// Loot item IDs (simplified)
+#define ITEM_IRON_INGOT 265
+#define ITEM_BREAD 297
+#define ITEM_OBSIDIAN 49
+#define ITEM_ENDER_PEARL 368
+#define ITEM_COAL 263
+#define ITEM_APPLE 260
+
+// Structure types
+#define STRUCT_WELL 0
+#define STRUCT_SMALL_HOUSE 1
+#define STRUCT_MEDIUM_HOUSE 2
+#define STRUCT_FARM 3
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct VillageBuilding {
+    ivec3 position;     // World position of building origin
+    uint type;          // STRUCT_* type
+    uint rotation;      // 0-3 (90 degree increments)
+    uint flags;         // Building-specific flags
+    ivec3 size;         // Bounding box
+};
+
+struct VillageLayout {
+    ivec3 center;           // Village center (well location)
+    uint building_count;
+    uint seed;
+    uint biome;
+    uint generation_pass;   // 0=init, 1=place_buildings, 2=place_paths, 3=place_loot
+    VillageBuilding buildings[MAX_HOUSES + 1]; // +1 for well
+};
+
+struct BlockPlacement {
+    ivec3 position;
+    uint block_id;
+    uint metadata;
+};
+
+struct LootItem {
+    uint item_id;
+    uint count;
+    uint slot;
+};
+
+struct ChestLoot {
+    ivec3 position;
+    uint item_count;
+    LootItem items[8];
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(std430, binding = 0) buffer VillageBuffer {
+    VillageLayout village;
+};
+
+layout(std430, binding = 1) buffer BlockBuffer {
+    uint block_count;
+    BlockPlacement blocks[];
+};
+
+layout(std430, binding = 2) buffer ChestBuffer {
+    uint chest_count;
+    ChestLoot chests[];
+};
+
+layout(std430, binding = 3) readonly buffer HeightmapBuffer {
+    int heightmap[];    // 128x128 heightmap for village area
+};
+
+layout(std430, binding = 4) readonly buffer BiomeBuffer {
+    uint biomes[];      // 128x128 biome map
+};
+
+layout(push_constant) uniform PushConstants {
+    ivec3 chunk_origin;
+    uint seed;
+    uint generation_mode;   // 0=init, 1=buildings, 2=paths, 3=loot
+    uint max_houses;
+} pc;
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint random_uint(inout uint seed) {
+    seed = pcg_hash(seed);
+    return seed;
+}
+
+float random_float(inout uint seed) {
+    return float(random_uint(seed)) / float(0xFFFFFFFFu);
+}
+
+int random_int_range(inout uint seed, int min_val, int max_val) {
+    return min_val + int(random_uint(seed) % uint(max_val - min_val + 1));
+}
+
+// ============================================================================
+// Heightmap Access
+// ============================================================================
+
+int get_height(int x, int z) {
+    // Clamp to heightmap bounds (centered on village)
+    int hx = clamp(x - village.center.x + 64, 0, 127);
+    int hz = clamp(z - village.center.z + 64, 0, 127);
+    return heightmap[hz * 128 + hx];
+}
+
+uint get_biome(int x, int z) {
+    int hx = clamp(x - village.center.x + 64, 0, 127);
+    int hz = clamp(z - village.center.z + 64, 0, 127);
+    return biomes[hz * 128 + hx];
+}
+
+// Check if area is flat enough for building (max 2 block height variation)
+bool is_flat_area(ivec3 origin, ivec3 size) {
+    int base_height = get_height(origin.x, origin.z);
+    int max_diff = 0;
+
+    for (int x = 0; x < size.x; x++) {
+        for (int z = 0; z < size.z; z++) {
+            int h = get_height(origin.x + x, origin.z + z);
+            max_diff = max(max_diff, abs(h - base_height));
+            if (max_diff > 2) return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Block Placement
+// ============================================================================
+
+void place_block(ivec3 pos, uint block_id, uint metadata) {
+    uint idx = atomicAdd(block_count, 1);
+    if (idx < 65536) {
+        blocks[idx].position = pos;
+        blocks[idx].block_id = block_id;
+        blocks[idx].metadata = metadata;
+    }
+}
+
+void fill_box(ivec3 origin, ivec3 size, uint block_id, uint metadata) {
+    for (int x = 0; x < size.x; x++) {
+        for (int y = 0; y < size.y; y++) {
+            for (int z = 0; z < size.z; z++) {
+                place_block(origin + ivec3(x, y, z), block_id, metadata);
+            }
+        }
+    }
+}
+
+void fill_hollow_box(ivec3 origin, ivec3 size, uint wall_block, uint metadata) {
+    for (int x = 0; x < size.x; x++) {
+        for (int y = 0; y < size.y; y++) {
+            for (int z = 0; z < size.z; z++) {
+                bool is_wall = x == 0 || x == size.x - 1 ||
+                              y == 0 || y == size.y - 1 ||
+                              z == 0 || z == size.z - 1;
+                uint block = is_wall ? wall_block : AIR;
+                place_block(origin + ivec3(x, y, z), block, metadata);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Building Placement Functions
+// ============================================================================
+
+// Well: 5x5 cobblestone frame with water
+void place_well(ivec3 pos) {
+    int base_y = get_height(pos.x + 2, pos.z + 2);
+    ivec3 origin = ivec3(pos.x, base_y, pos.z);
+
+    // Foundation
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(origin + ivec3(x, 0, z), COBBLESTONE, 0);
+        }
+    }
+
+    // Water in center, 3 blocks deep
+    for (int y = -2; y <= 0; y++) {
+        place_block(origin + ivec3(2, y, 2), WATER, 0);
+    }
+
+    // Corner posts
+    for (int y = 1; y <= 3; y++) {
+        place_block(origin + ivec3(0, y, 0), FENCE, 0);
+        place_block(origin + ivec3(4, y, 0), FENCE, 0);
+        place_block(origin + ivec3(0, y, 4), FENCE, 0);
+        place_block(origin + ivec3(4, y, 4), FENCE, 0);
+    }
+
+    // Roof
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(origin + ivec3(x, 4, z), PLANKS, 0);
+        }
+    }
+}
+
+// Small house: 5x5x4 cobblestone base with wooden roof
+// Contains 1 chest with speedrun loot
+void place_small_house(VillageBuilding building, inout uint rng) {
+    ivec3 pos = building.position;
+    int base_y = get_height(pos.x + 2, pos.z + 2);
+    ivec3 origin = ivec3(pos.x, base_y, pos.z);
+
+    // Floor
+    fill_box(origin, ivec3(5, 1, 5), COBBLESTONE, 0);
+
+    // Walls (hollow)
+    for (int y = 1; y <= 3; y++) {
+        // North/south walls
+        for (int x = 0; x < 5; x++) {
+            place_block(origin + ivec3(x, y, 0), COBBLESTONE, 0);
+            place_block(origin + ivec3(x, y, 4), COBBLESTONE, 0);
+        }
+        // East/west walls
+        for (int z = 1; z < 4; z++) {
+            place_block(origin + ivec3(0, y, z), COBBLESTONE, 0);
+            place_block(origin + ivec3(4, y, z), COBBLESTONE, 0);
+        }
+    }
+
+    // Roof (wooden planks, flat)
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(origin + ivec3(x, 4, z), PLANKS, 0);
+        }
+    }
+
+    // Door (based on rotation)
+    uint door_meta = building.rotation;
+    ivec3 door_pos = origin + ivec3(2, 1, 0);
+    switch (building.rotation) {
+        case 0: door_pos = origin + ivec3(2, 1, 0); break;
+        case 1: door_pos = origin + ivec3(4, 1, 2); break;
+        case 2: door_pos = origin + ivec3(2, 1, 4); break;
+        case 3: door_pos = origin + ivec3(0, 1, 2); break;
+    }
+    place_block(door_pos, AIR, 0);
+    place_block(door_pos + ivec3(0, 1, 0), AIR, 0);
+    place_block(door_pos, WOODEN_DOOR, door_meta);
+    place_block(door_pos + ivec3(0, 1, 0), WOODEN_DOOR, door_meta | 8);
+
+    // Window (glass pane on opposite wall)
+    ivec3 window_pos;
+    switch (building.rotation) {
+        case 0: window_pos = origin + ivec3(2, 2, 4); break;
+        case 1: window_pos = origin + ivec3(0, 2, 2); break;
+        case 2: window_pos = origin + ivec3(2, 2, 0); break;
+        case 3: window_pos = origin + ivec3(4, 2, 2); break;
+    }
+    place_block(window_pos, GLASS_PANE, 0);
+
+    // Interior: torch on wall
+    place_block(origin + ivec3(2, 2, 2), TORCH, 5); // On ground variant
+
+    // Chest with loot
+    ivec3 chest_pos = origin + ivec3(1, 1, 3);
+    place_block(chest_pos, CHEST, 2);
+
+    // Queue chest loot
+    uint chest_idx = atomicAdd(chest_count, 1);
+    if (chest_idx < 16) {
+        chests[chest_idx].position = chest_pos;
+        chests[chest_idx].item_count = 0;
+
+        // Iron ingots (1-3)
+        int iron_count = random_int_range(rng, 1, 3);
+        chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_IRON_INGOT, uint(iron_count), 0);
+
+        // Bread (2-5)
+        int bread_count = random_int_range(rng, 2, 5);
+        chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_BREAD, uint(bread_count), 1);
+
+        // Coal (1-4)
+        int coal_count = random_int_range(rng, 1, 4);
+        chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_COAL, uint(coal_count), 2);
+
+        // Obsidian (0-2, 30% chance)
+        if (random_float(rng) < 0.3) {
+            int obs_count = random_int_range(rng, 1, 2);
+            chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_OBSIDIAN, uint(obs_count), 3);
+        }
+
+        // Ender pearl (0-1, 5% chance - rare speedrun jackpot)
+        if (random_float(rng) < 0.05) {
+            chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_ENDER_PEARL, 1, 4);
+        }
+
+        // Apple (1-3, 50% chance)
+        if (random_float(rng) < 0.5) {
+            int apple_count = random_int_range(rng, 1, 3);
+            chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_APPLE, uint(apple_count), 5);
+        }
+    }
+}
+
+// Medium house: 7x7x5 with two floors
+void place_medium_house(VillageBuilding building, inout uint rng) {
+    ivec3 pos = building.position;
+    int base_y = get_height(pos.x + 3, pos.z + 3);
+    ivec3 origin = ivec3(pos.x, base_y, pos.z);
+
+    // Floor
+    fill_box(origin, ivec3(7, 1, 7), COBBLESTONE, 0);
+
+    // Walls (two stories)
+    for (int y = 1; y <= 5; y++) {
+        for (int x = 0; x < 7; x++) {
+            place_block(origin + ivec3(x, y, 0), COBBLESTONE, 0);
+            place_block(origin + ivec3(x, y, 6), COBBLESTONE, 0);
+        }
+        for (int z = 1; z < 6; z++) {
+            place_block(origin + ivec3(0, y, z), COBBLESTONE, 0);
+            place_block(origin + ivec3(6, y, z), COBBLESTONE, 0);
+        }
+    }
+
+    // Second floor
+    for (int x = 1; x < 6; x++) {
+        for (int z = 1; z < 6; z++) {
+            place_block(origin + ivec3(x, 3, z), PLANKS, 0);
+        }
+    }
+
+    // Peaked roof
+    for (int z = 0; z < 7; z++) {
+        place_block(origin + ivec3(0, 6, z), WOODEN_STAIRS, 0);
+        place_block(origin + ivec3(6, 6, z), WOODEN_STAIRS, 1);
+        for (int x = 1; x < 6; x++) {
+            place_block(origin + ivec3(x, 6, z), PLANKS, 0);
+        }
+        // Peak
+        place_block(origin + ivec3(3, 7, z), PLANKS, 0);
+    }
+
+    // Door
+    ivec3 door_pos = origin + ivec3(3, 1, 0);
+    place_block(door_pos, AIR, 0);
+    place_block(door_pos + ivec3(0, 1, 0), AIR, 0);
+    place_block(door_pos, WOODEN_DOOR, 0);
+    place_block(door_pos + ivec3(0, 1, 0), WOODEN_DOOR, 8);
+
+    // Windows
+    place_block(origin + ivec3(1, 2, 0), GLASS_PANE, 0);
+    place_block(origin + ivec3(5, 2, 0), GLASS_PANE, 0);
+    place_block(origin + ivec3(1, 5, 0), GLASS_PANE, 0);
+    place_block(origin + ivec3(5, 5, 0), GLASS_PANE, 0);
+
+    // Torches
+    place_block(origin + ivec3(3, 2, 3), TORCH, 5);
+    place_block(origin + ivec3(3, 5, 3), TORCH, 5);
+
+    // Chest on second floor
+    ivec3 chest_pos = origin + ivec3(1, 4, 5);
+    place_block(chest_pos, CHEST, 2);
+
+    uint chest_idx = atomicAdd(chest_count, 1);
+    if (chest_idx < 16) {
+        chests[chest_idx].position = chest_pos;
+        chests[chest_idx].item_count = 0;
+
+        // Better loot in medium house
+        int iron_count = random_int_range(rng, 2, 5);
+        chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_IRON_INGOT, uint(iron_count), 0);
+
+        int bread_count = random_int_range(rng, 3, 7);
+        chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_BREAD, uint(bread_count), 1);
+
+        // Higher chance for obsidian
+        if (random_float(rng) < 0.5) {
+            int obs_count = random_int_range(rng, 1, 3);
+            chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_OBSIDIAN, uint(obs_count), 2);
+        }
+
+        // Ender pearl (10% chance)
+        if (random_float(rng) < 0.1) {
+            chests[chest_idx].items[chests[chest_idx].item_count++] = LootItem(ITEM_ENDER_PEARL, 1, 3);
+        }
+    }
+}
+
+// Farm: 7x1x7 plot with wheat
+void place_farm(VillageBuilding building) {
+    ivec3 pos = building.position;
+    int base_y = get_height(pos.x + 3, pos.z + 3);
+    ivec3 origin = ivec3(pos.x, base_y, pos.z);
+
+    // Fence border
+    for (int x = 0; x < 7; x++) {
+        place_block(origin + ivec3(x, 0, 0), FENCE, 0);
+        place_block(origin + ivec3(x, 0, 6), FENCE, 0);
+    }
+    for (int z = 1; z < 6; z++) {
+        place_block(origin + ivec3(0, 0, z), FENCE, 0);
+        place_block(origin + ivec3(6, 0, z), FENCE, 0);
+    }
+
+    // Farmland with wheat
+    for (int x = 1; x < 6; x++) {
+        for (int z = 1; z < 6; z++) {
+            // Water in center
+            if (x == 3 && z == 3) {
+                place_block(origin + ivec3(x, -1, z), WATER, 0);
+            } else {
+                place_block(origin + ivec3(x, -1, z), FARMLAND, 7); // Wet farmland
+                place_block(origin + ivec3(x, 0, z), WHEAT, 7);     // Fully grown
+            }
+        }
+    }
+
+    // Gate opening
+    place_block(origin + ivec3(3, 0, 0), AIR, 0);
+}
+
+// ============================================================================
+// Path Generation
+// ============================================================================
+
+void place_path_segment(ivec3 from, ivec3 to) {
+    // Simple straight or L-shaped path
+    int dx = sign(to.x - from.x);
+    int dz = sign(to.z - from.z);
+
+    ivec3 current = from;
+
+    // Go X first, then Z
+    while (current.x != to.x) {
+        int y = get_height(current.x, current.z);
+        for (int w = -1; w <= 1; w++) {
+            place_block(ivec3(current.x, y, current.z + w), GRAVEL, 0);
+        }
+        current.x += dx;
+    }
+
+    while (current.z != to.z) {
+        int y = get_height(current.x, current.z);
+        for (int w = -1; w <= 1; w++) {
+            place_block(ivec3(current.x + w, y, current.z), GRAVEL, 0);
+        }
+        current.z += dz;
+    }
+}
+
+// ============================================================================
+// Layout Generation
+// ============================================================================
+
+bool buildings_overlap(VillageBuilding a, VillageBuilding b, int padding) {
+    ivec3 a_min = a.position - ivec3(padding);
+    ivec3 a_max = a.position + a.size + ivec3(padding);
+    ivec3 b_min = b.position - ivec3(padding);
+    ivec3 b_max = b.position + b.size + ivec3(padding);
+
+    return all(lessThan(a_min, b_max)) && all(lessThan(b_min, a_max));
+}
+
+bool can_place_building(VillageBuilding candidate, int padding) {
+    // Check collision with all placed buildings
+    for (uint i = 0; i < village.building_count; i++) {
+        if (buildings_overlap(candidate, village.buildings[i], padding)) {
+            return false;
+        }
+    }
+
+    // Check terrain flatness
+    if (!is_flat_area(candidate.position, candidate.size)) {
+        return false;
+    }
+
+    // Check biome (only plains/savanna)
+    uint biome = get_biome(candidate.position.x + candidate.size.x / 2,
+                           candidate.position.z + candidate.size.z / 2);
+    if (biome != BIOME_PLAINS && biome != BIOME_SAVANNA) {
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Main Entry Points
+// ============================================================================
+
+void init_village() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    village.center = pc.chunk_origin;
+    village.building_count = 0;
+    village.seed = pc.seed;
+    village.generation_pass = 0;
+
+    // Check center biome
+    uint center_biome = get_biome(pc.chunk_origin.x, pc.chunk_origin.z);
+    village.biome = center_biome;
+
+    if (center_biome != BIOME_PLAINS && center_biome != BIOME_SAVANNA) {
+        return; // No village in wrong biome
+    }
+
+    uint rng = pc.seed;
+
+    // Place well at center
+    VillageBuilding well;
+    well.position = village.center - ivec3(2, 0, 2);
+    well.type = STRUCT_WELL;
+    well.rotation = 0;
+    well.size = ivec3(5, 5, 5);
+    well.flags = 0;
+    village.buildings[village.building_count++] = well;
+
+    // Determine number of houses
+    uint target_houses = uint(random_int_range(rng, int(MIN_HOUSES), int(min(pc.max_houses, uint(MAX_HOUSES)))));
+    uint house_count = 0;
+    uint farm_count = 0;
+    uint attempts = 0;
+
+    // Try to place houses around well
+    while (house_count < target_houses && attempts < 100) {
+        attempts++;
+
+        // Random angle and distance from center
+        float angle = random_float(rng) * 6.28318;
+        float dist = 15.0 + random_float(rng) * 35.0;
+
+        int offset_x = int(cos(angle) * dist);
+        int offset_z = int(sin(angle) * dist);
+
+        VillageBuilding building;
+        building.rotation = random_uint(rng) & 3;
+        building.flags = 0;
+
+        // Decide building type
+        float type_roll = random_float(rng);
+        if (type_roll < 0.15 && farm_count < 2) {
+            // Farm (15% chance, max 2)
+            building.type = STRUCT_FARM;
+            building.size = ivec3(7, 2, 7);
+            farm_count++;
+        } else if (type_roll < 0.35) {
+            // Medium house (20% chance)
+            building.type = STRUCT_MEDIUM_HOUSE;
+            building.size = ivec3(7, 8, 7);
+        } else {
+            // Small house (65% chance)
+            building.type = STRUCT_SMALL_HOUSE;
+            building.size = ivec3(5, 5, 5);
+        }
+
+        building.position = village.center + ivec3(offset_x, 0, offset_z);
+
+        if (can_place_building(building, HOUSE_MIN_SPACING)) {
+            village.buildings[village.building_count++] = building;
+            if (building.type != STRUCT_FARM) {
+                house_count++;
+            }
+        }
+    }
+}
+
+void place_buildings() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= village.building_count) return;
+
+    VillageBuilding building = village.buildings[idx];
+    uint rng = village.seed ^ (idx * 12345u);
+
+    switch (building.type) {
+        case STRUCT_WELL:
+            place_well(building.position);
+            break;
+        case STRUCT_SMALL_HOUSE:
+            place_small_house(building, rng);
+            break;
+        case STRUCT_MEDIUM_HOUSE:
+            place_medium_house(building, rng);
+            break;
+        case STRUCT_FARM:
+            place_farm(building);
+            break;
+    }
+}
+
+void place_paths() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= village.building_count) return;
+    if (idx == 0) return; // Skip well
+
+    VillageBuilding building = village.buildings[idx];
+
+    // Connect to well
+    ivec3 building_center = building.position + building.size / 2;
+    ivec3 well_center = village.buildings[0].position + ivec3(2, 0, 2);
+
+    place_path_segment(building_center, well_center);
+}
+
+void main() {
+    switch (pc.generation_mode) {
+        case 0:
+            init_village();
+            break;
+        case 1:
+            place_buildings();
+            break;
+        case 2:
+            place_paths();
+            break;
+    }
+}

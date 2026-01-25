@@ -1,0 +1,588 @@
+#version 450
+
+// Dragon Knockback & Void Safety - Compute Shader
+// MC 1.8.9 accurate knockback mechanics and void death prevention
+//
+// Dragon attacks:
+//   1. Wing swipe: Knockback + 10 damage (close range)
+//   2. Charge: Knockback + 5 damage (dive attack)
+//   3. Breath: Lingering damage cloud (no knockback)
+//
+// Void safety:
+//   - Instant death below y=0 in the End
+//   - Knockback can push player off platform edge
+//   - Counter-strategies: pearl clutch, block placement, positioning
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS - Minecraft 1.8.9 accurate
+// ============================================================================
+
+// Knockback values
+const float WING_SWIPE_KNOCKBACK = 10.0;   // Horizontal units
+const float WING_SWIPE_VERTICAL = 3.0;    // Upward component
+const float CHARGE_KNOCKBACK = 6.0;        // Dive attack knockback
+const float CHARGE_VERTICAL = 2.0;
+const float BREATH_KNOCKBACK = 0.5;        // Minor push from breath
+
+// Damage values
+const float WING_SWIPE_DAMAGE = 10.0;
+const float CHARGE_DAMAGE = 5.0;
+const float BREATH_TICK_DAMAGE = 1.0;      // Per tick in breath cloud
+
+// Dragon attack ranges
+const float WING_SWIPE_RANGE = 8.0;        // Close range melee
+const float CHARGE_HIT_RANGE = 6.0;        // Contact during charge
+const float BREATH_CONE_ANGLE = 0.5;       // ~60 degree cone
+const float BREATH_RANGE = 15.0;
+
+// Void thresholds
+const float VOID_DEATH_Y = 0.0;            // Instant death below this
+const float VOID_DANGER_Y = 10.0;          // Warning threshold
+const float END_ISLAND_EDGE = 100.0;       // Island radius
+
+// Counter-strategy thresholds
+const float PEARL_THROW_TIME = 0.25;       // Seconds to throw pearl
+const float BLOCK_PLACE_RANGE = 4.5;       // Block reach distance
+const float SAFE_EDGE_DISTANCE = 5.0;      // Buffer from edges
+
+// Physics
+const float GRAVITY = 0.08;
+const float AIR_RESISTANCE = 0.02;
+const float KNOCKBACK_RESISTANCE_ARMOR = 0.1;  // Per armor point
+
+// Attack types (for identification)
+const uint ATTACK_NONE = 0u;
+const uint ATTACK_WING_SWIPE = 1u;
+const uint ATTACK_CHARGE = 2u;
+const uint ATTACK_BREATH = 3u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct PlayerState {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    float armor_points;         // 0-20
+    uint flags;                 // bit0: on_ground, bit1: invincible, etc.
+    uint invincibility_timer;
+    float knockback_resistance; // From enchant/effect
+    float padding;
+};
+
+struct DragonState {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    uint phase;                 // 0=circle, 1=strafe, 2=charge, 3=perch, 4=breath, 5=dying
+    float yaw;
+    float pitch;
+    uint attack_type;           // Current attack being executed
+    float attack_timer;
+    mat4 body_transform;
+    vec3 breath_origin;
+    float breath_timer;
+};
+
+struct KnockbackEvent {
+    vec3 direction;             // Normalized knockback direction
+    float magnitude;            // Knockback strength
+    float damage;               // Associated damage
+    uint attack_type;           // What caused this
+    uint source_id;             // Dragon id
+    uint target_id;             // Player id
+};
+
+struct VoidSafetyData {
+    float void_proximity;       // Distance to y=0 (negative if below)
+    float edge_proximity;       // Distance to island edge
+    bool knockback_incoming;    // True if dragon winding up attack
+    vec2 knockback_direction;   // Predicted knockback direction (xz)
+    float time_to_void;         // Estimated ticks until void at current velocity
+    vec3 safe_position;         // Nearest safe landing spot
+    bool can_pearl;             // Has pearl and can throw
+    bool can_block_clutch;      // Has blocks and skill timing
+};
+
+// Observation extension for RL agent
+struct KnockbackObservation {
+    float void_proximity;       // Normalized: 0 = at void, 1 = safe
+    float knockback_incoming;   // 1.0 if attack imminent
+    float knockback_dir_x;      // Normalized direction
+    float knockback_dir_z;
+    float edge_proximity;       // 0 = at edge, 1 = center
+    float predicted_landing_y;  // Where player will land
+    float can_survive;          // 0/1 if current trajectory survives
+    float counter_available;    // 0/1 if counter-strat possible
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+layout(std430, binding = 0) buffer PlayerBuffer {
+    PlayerState players[];
+};
+
+layout(std430, binding = 1) buffer DragonBuffer {
+    DragonState dragons[];
+};
+
+layout(std430, binding = 2) buffer KnockbackEventBuffer {
+    KnockbackEvent knockback_events[];
+};
+
+layout(std430, binding = 3) buffer VoidSafetyBuffer {
+    VoidSafetyData void_safety[];
+};
+
+layout(std430, binding = 4) buffer KnockbackObsBuffer {
+    KnockbackObservation knockback_obs[];
+};
+
+layout(std430, binding = 5) buffer OutputDamageBuffer {
+    vec4 damage_output[];       // xyz = final knockback, w = damage
+};
+
+layout(push_constant) uniform PushConstants {
+    float delta_time;
+    uint num_envs;
+    uint num_players_per_env;
+    uint tick;
+    uint flags;                 // bit0: apply knockback, bit1: compute safety only
+} pc;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Transform point from dragon body-local to world space
+vec3 dragon_body_to_world(uint dragon_idx, vec3 local_pos) {
+    vec4 world = dragons[dragon_idx].body_transform * vec4(local_pos, 1.0);
+    return world.xyz;
+}
+
+// Get dragon forward direction
+vec3 dragon_forward(uint dragon_idx) {
+    float yaw_rad = radians(dragons[dragon_idx].yaw);
+    float pitch_rad = radians(dragons[dragon_idx].pitch);
+    return vec3(
+        -sin(yaw_rad) * cos(pitch_rad),
+        -sin(pitch_rad),
+        cos(yaw_rad) * cos(pitch_rad)
+    );
+}
+
+// Calculate knockback direction from dragon to player
+vec3 calc_knockback_dir(vec3 dragon_pos, vec3 player_pos) {
+    vec3 dir = player_pos - dragon_pos;
+    dir.y = 0.0;  // Horizontal component only for direction
+    float len = length(dir);
+    if (len < 0.001) {
+        return vec3(1.0, 0.0, 0.0);  // Default if directly above/below
+    }
+    return dir / len;
+}
+
+// Apply knockback resistance (armor, enchants, effects)
+float apply_knockback_resistance(float base_knockback, PlayerState player) {
+    // Armor reduces knockback slightly
+    float armor_reduction = player.armor_points * KNOCKBACK_RESISTANCE_ARMOR;
+    // Knockback resistance enchant/effect
+    float total_resistance = min(1.0, armor_reduction + player.knockback_resistance);
+    return base_knockback * (1.0 - total_resistance);
+}
+
+// Predict player trajectory over N ticks
+vec3 predict_position(vec3 pos, vec3 vel, uint ticks) {
+    vec3 predicted = pos;
+    vec3 v = vel;
+
+    for (uint t = 0; t < ticks; t++) {
+        // Gravity
+        v.y -= GRAVITY;
+        // Air resistance
+        v *= (1.0 - AIR_RESISTANCE);
+        // Move
+        predicted += v;
+    }
+
+    return predicted;
+}
+
+// Check if position is over the void
+bool is_over_void(vec3 pos) {
+    float dist_from_center = length(vec2(pos.x, pos.z));
+    return dist_from_center > END_ISLAND_EDGE || pos.y < VOID_DEATH_Y;
+}
+
+// Get ground height at position (simplified End terrain)
+float get_end_ground_height(vec3 pos) {
+    float dist_from_center = length(vec2(pos.x, pos.z));
+
+    // Outside island = void
+    if (dist_from_center > END_ISLAND_EDGE) {
+        return -64.0;
+    }
+
+    // Main island surface (simplified)
+    return 64.0;
+}
+
+// Find nearest safe landing position
+vec3 find_safe_landing(vec3 pos, vec3 vel) {
+    // Predict where player will land
+    vec3 landing = pos;
+    vec3 v = vel;
+
+    for (int t = 0; t < 200; t++) {  // Max 10 seconds of flight
+        v.y -= GRAVITY;
+        v *= (1.0 - AIR_RESISTANCE);
+        landing += v;
+
+        float ground = get_end_ground_height(landing);
+        if (landing.y <= ground) {
+            landing.y = ground;
+            break;
+        }
+
+        // Fell into void - backtrack to find edge
+        if (landing.y < VOID_DEATH_Y) {
+            // Return last safe position
+            return vec3(
+                clamp(pos.x, -END_ISLAND_EDGE + SAFE_EDGE_DISTANCE, END_ISLAND_EDGE - SAFE_EDGE_DISTANCE),
+                64.0,
+                clamp(pos.z, -END_ISLAND_EDGE + SAFE_EDGE_DISTANCE, END_ISLAND_EDGE - SAFE_EDGE_DISTANCE)
+            );
+        }
+    }
+
+    return landing;
+}
+
+// ============================================================================
+// KNOCKBACK CALCULATION
+// ============================================================================
+
+// Wing swipe - close range, high knockback
+KnockbackEvent calc_wing_swipe(uint dragon_idx, uint player_idx) {
+    KnockbackEvent event;
+    event.attack_type = ATTACK_WING_SWIPE;
+    event.source_id = dragon_idx;
+    event.target_id = player_idx;
+
+    DragonState dragon = dragons[dragon_idx];
+    PlayerState player = players[player_idx];
+
+    vec3 to_player = player.position - dragon.position;
+    float dist = length(to_player);
+
+    // Check if in range
+    if (dist > WING_SWIPE_RANGE) {
+        event.magnitude = 0.0;
+        event.damage = 0.0;
+        return event;
+    }
+
+    // Calculate knockback direction (away from dragon, with bias from wing)
+    vec3 kb_dir = calc_knockback_dir(dragon.position, player.position);
+
+    // Wing swipe adds perpendicular component based on dragon facing
+    vec3 dragon_fwd = dragon_forward(dragon_idx);
+    vec3 dragon_right = cross(vec3(0.0, 1.0, 0.0), dragon_fwd);
+
+    // Determine which wing hit (left or right of dragon forward)
+    float side = dot(to_player, dragon_right);
+    vec3 wing_dir = normalize(kb_dir + dragon_right * sign(side) * 0.3);
+
+    event.direction = wing_dir;
+    event.magnitude = apply_knockback_resistance(WING_SWIPE_KNOCKBACK, player);
+    event.damage = WING_SWIPE_DAMAGE;
+
+    return event;
+}
+
+// Charge attack - dive attack knockback
+KnockbackEvent calc_charge(uint dragon_idx, uint player_idx) {
+    KnockbackEvent event;
+    event.attack_type = ATTACK_CHARGE;
+    event.source_id = dragon_idx;
+    event.target_id = player_idx;
+
+    DragonState dragon = dragons[dragon_idx];
+    PlayerState player = players[player_idx];
+
+    vec3 to_player = player.position - dragon.position;
+    float dist = length(to_player);
+
+    if (dist > CHARGE_HIT_RANGE) {
+        event.magnitude = 0.0;
+        event.damage = 0.0;
+        return event;
+    }
+
+    // Charge knockback follows dragon velocity direction
+    vec3 kb_dir = length(dragon.velocity) > 0.1
+        ? normalize(dragon.velocity)
+        : calc_knockback_dir(dragon.position, player.position);
+    kb_dir.y = 0.0;
+    kb_dir = normalize(kb_dir);
+
+    event.direction = kb_dir;
+    event.magnitude = apply_knockback_resistance(CHARGE_KNOCKBACK, player);
+    event.damage = CHARGE_DAMAGE;
+
+    return event;
+}
+
+// Dragon breath - lingering damage cloud
+KnockbackEvent calc_breath(uint dragon_idx, uint player_idx) {
+    KnockbackEvent event;
+    event.attack_type = ATTACK_BREATH;
+    event.source_id = dragon_idx;
+    event.target_id = player_idx;
+
+    DragonState dragon = dragons[dragon_idx];
+    PlayerState player = players[player_idx];
+
+    // Breath originates from dragon head position
+    vec3 breath_origin = dragon.breath_origin;
+    if (length(breath_origin) < 0.001) {
+        breath_origin = dragon_body_to_world(dragon_idx, vec3(0.0, 0.0, 8.0));
+    }
+
+    vec3 to_player = player.position - breath_origin;
+    float dist = length(to_player);
+
+    // Check cone angle
+    vec3 breath_dir = dragon_forward(dragon_idx);
+    float angle = dot(normalize(to_player), breath_dir);
+
+    if (dist > BREATH_RANGE || angle < BREATH_CONE_ANGLE) {
+        event.magnitude = 0.0;
+        event.damage = 0.0;
+        return event;
+    }
+
+    // Breath has minimal knockback but ticks damage
+    event.direction = normalize(to_player);
+    event.magnitude = BREATH_KNOCKBACK;  // Small push away
+    event.damage = BREATH_TICK_DAMAGE;
+
+    return event;
+}
+
+// ============================================================================
+// VOID SAFETY CALCULATION
+// ============================================================================
+
+VoidSafetyData calc_void_safety(uint dragon_idx, uint player_idx) {
+    VoidSafetyData safety;
+
+    PlayerState player = players[player_idx];
+    DragonState dragon = dragons[dragon_idx];
+
+    // Calculate void proximity (distance to y=0)
+    safety.void_proximity = player.position.y - VOID_DEATH_Y;
+
+    // Calculate edge proximity
+    float dist_from_center = length(vec2(player.position.x, player.position.z));
+    safety.edge_proximity = END_ISLAND_EDGE - dist_from_center;
+
+    // Detect incoming knockback from dragon attack patterns
+    safety.knockback_incoming = false;
+    safety.knockback_direction = vec2(0.0);
+
+    // Dragon phase indicates attack type
+    // Phase 2 = charging (will hit soon)
+    // Phase 4 = breath (continuous)
+    // Phase 1 = strafing (may swipe)
+    if (dragon.phase == 2u) {  // Charging
+        vec3 to_player = player.position - dragon.position;
+        float dist = length(to_player);
+        if (dist < 20.0) {
+            safety.knockback_incoming = true;
+            vec3 kb_dir = normalize(dragon.velocity);
+            safety.knockback_direction = vec2(kb_dir.x, kb_dir.z);
+        }
+    } else if (dragon.phase == 1u) {  // Strafing (may wing swipe)
+        vec3 to_player = player.position - dragon.position;
+        float dist = length(to_player);
+        if (dist < WING_SWIPE_RANGE * 1.5) {
+            safety.knockback_incoming = true;
+            vec3 kb_dir = calc_knockback_dir(dragon.position, player.position);
+            safety.knockback_direction = vec2(kb_dir.x, kb_dir.z);
+        }
+    }
+
+    // Calculate time to void at current trajectory
+    if (player.velocity.y < -0.1) {
+        // Falling - estimate time to y=0
+        float fall_time = (-safety.void_proximity) / (-player.velocity.y);
+        safety.time_to_void = fall_time / 0.05;  // Convert to ticks (assuming 20 TPS)
+    } else {
+        safety.time_to_void = 1000.0;  // Not falling toward void
+    }
+
+    // Add knockback to velocity if incoming, then predict
+    vec3 predicted_vel = player.velocity;
+    if (safety.knockback_incoming) {
+        // Estimate knockback magnitude based on dragon attack
+        float kb_mag = (dragon.phase == 2u) ? CHARGE_KNOCKBACK : WING_SWIPE_KNOCKBACK;
+        predicted_vel.x += safety.knockback_direction.x * kb_mag;
+        predicted_vel.z += safety.knockback_direction.y * kb_mag;
+        predicted_vel.y += 0.4;  // Upward component
+    }
+
+    // Find safe landing position
+    safety.safe_position = find_safe_landing(player.position, predicted_vel);
+
+    // Check if counter-strategies are available
+    // (simplified - actual implementation would check inventory)
+    safety.can_pearl = true;  // Assume player has pearls
+    safety.can_block_clutch = (player.flags & 0x4u) != 0u;  // Flag bit for blocks in hotbar
+
+    return safety;
+}
+
+// ============================================================================
+// OBSERVATION EXTRACTION
+// ============================================================================
+
+KnockbackObservation extract_knockback_obs(uint dragon_idx, uint player_idx) {
+    KnockbackObservation obs;
+
+    VoidSafetyData safety = calc_void_safety(dragon_idx, player_idx);
+    PlayerState player = players[player_idx];
+
+    // Normalize void proximity: 0 = at void (y=0), 1 = safe (y > 64)
+    obs.void_proximity = clamp(safety.void_proximity / 64.0, 0.0, 1.0);
+
+    // Knockback incoming flag
+    obs.knockback_incoming = safety.knockback_incoming ? 1.0 : 0.0;
+
+    // Knockback direction (normalized)
+    float kb_len = length(safety.knockback_direction);
+    if (kb_len > 0.001) {
+        obs.knockback_dir_x = safety.knockback_direction.x / kb_len;
+        obs.knockback_dir_z = safety.knockback_direction.y / kb_len;
+    } else {
+        obs.knockback_dir_x = 0.0;
+        obs.knockback_dir_z = 0.0;
+    }
+
+    // Edge proximity: 0 = at edge, 1 = at center
+    obs.edge_proximity = clamp(safety.edge_proximity / END_ISLAND_EDGE, 0.0, 1.0);
+
+    // Predicted landing Y (normalized)
+    obs.predicted_landing_y = clamp((safety.safe_position.y - VOID_DEATH_Y) / 100.0, 0.0, 1.0);
+
+    // Can survive current trajectory?
+    vec3 landing = find_safe_landing(player.position, player.velocity);
+    obs.can_survive = (landing.y >= VOID_DEATH_Y) ? 1.0 : 0.0;
+
+    // Counter-strategy available?
+    obs.counter_available = (safety.can_pearl || safety.can_block_clutch) ? 1.0 : 0.0;
+
+    return obs;
+}
+
+// ============================================================================
+// MAIN - Process knockback and void safety
+// ============================================================================
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+
+    // Each thread processes one player-dragon pair
+    uint env_id = global_id / pc.num_players_per_env;
+    uint player_local_id = global_id % pc.num_players_per_env;
+
+    if (env_id >= pc.num_envs) return;
+
+    uint player_idx = global_id;
+    uint dragon_idx = env_id;  // One dragon per env
+
+    // Skip dead players
+    PlayerState player = players[player_idx];
+    if (player.health <= 0.0) return;
+
+    DragonState dragon = dragons[dragon_idx];
+    if (dragon.health <= 0.0) return;
+
+    // ======== VOID SAFETY COMPUTATION ========
+    VoidSafetyData safety = calc_void_safety(dragon_idx, player_idx);
+    void_safety[player_idx] = safety;
+
+    // ======== OBSERVATION EXTRACTION ========
+    knockback_obs[player_idx] = extract_knockback_obs(dragon_idx, player_idx);
+
+    // If only computing safety (bit1 set), stop here
+    if ((pc.flags & 0x2u) != 0u) return;
+
+    // ======== KNOCKBACK PROCESSING ========
+    if ((pc.flags & 0x1u) == 0u) return;  // Knockback disabled
+
+    KnockbackEvent event;
+    event.magnitude = 0.0;
+    event.damage = 0.0;
+
+    // Determine attack type based on dragon phase and proximity
+    vec3 to_player = player.position - dragon.position;
+    float dist = length(to_player);
+
+    // Check invincibility
+    if (player.invincibility_timer > 0u) {
+        knockback_events[player_idx] = event;
+        return;
+    }
+
+    // Wing swipe - dragon in strafing phase and close
+    if (dragon.phase == 1u && dist < WING_SWIPE_RANGE) {
+        event = calc_wing_swipe(dragon_idx, player_idx);
+    }
+    // Charge - dragon in charging phase
+    else if (dragon.phase == 2u && dist < CHARGE_HIT_RANGE) {
+        event = calc_charge(dragon_idx, player_idx);
+    }
+    // Breath - dragon in breath phase
+    else if (dragon.phase == 4u && dragon.breath_timer > 0.0) {
+        event = calc_breath(dragon_idx, player_idx);
+    }
+
+    knockback_events[player_idx] = event;
+
+    // ======== APPLY KNOCKBACK AND DAMAGE ========
+    if (event.magnitude > 0.001) {
+        // Calculate final knockback vector
+        vec3 final_kb = event.direction * event.magnitude;
+
+        // Add vertical component based on attack type
+        float vert_component = 0.0;
+        if (event.attack_type == ATTACK_WING_SWIPE) {
+            vert_component = WING_SWIPE_VERTICAL;
+        } else if (event.attack_type == ATTACK_CHARGE) {
+            vert_component = CHARGE_VERTICAL;
+        }
+        final_kb.y += vert_component;
+
+        // Output for CPU to apply
+        damage_output[player_idx] = vec4(final_kb, event.damage);
+
+        // ======== VOID CHECK AFTER KNOCKBACK ========
+        // Predict trajectory with new velocity
+        vec3 new_vel = player.velocity + final_kb;
+        vec3 predicted_landing = find_safe_landing(player.position, new_vel);
+
+        // If would fall into void, flag for counter-strategy consideration
+        if (predicted_landing.y < VOID_DEATH_Y) {
+            // Mark as critical in safety data
+            void_safety[player_idx].time_to_void = 0.0;  // Immediate danger
+        }
+    } else {
+        damage_output[player_idx] = vec4(0.0);
+    }
+}

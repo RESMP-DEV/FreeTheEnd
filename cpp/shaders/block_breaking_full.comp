@@ -1,0 +1,303 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Block breaking compute shader with tool efficiency system
+// Simulates Minecraft-style block breaking mechanics
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Block Type Constants
+// ============================================================================
+const uint BLOCK_AIR        = 0;
+const uint BLOCK_DIRT       = 1;
+const uint BLOCK_WOOD       = 2;
+const uint BLOCK_STONE      = 3;
+const uint BLOCK_IRON_ORE   = 4;
+const uint BLOCK_COAL_ORE   = 5;
+const uint BLOCK_DIAMOND_ORE = 6;
+const uint BLOCK_OBSIDIAN   = 7;
+
+// ============================================================================
+// Tool Type Constants
+// ============================================================================
+const uint TOOL_NONE     = 0;  // Hand
+const uint TOOL_PICKAXE  = 1;
+const uint TOOL_AXE      = 2;
+const uint TOOL_SHOVEL   = 3;
+const uint TOOL_SWORD    = 4;
+
+// ============================================================================
+// Tool Material Constants
+// ============================================================================
+const uint MATERIAL_NONE    = 0;  // Hand
+const uint MATERIAL_WOOD    = 1;
+const uint MATERIAL_STONE   = 2;
+const uint MATERIAL_IRON    = 3;
+const uint MATERIAL_DIAMOND = 4;
+
+// ============================================================================
+// Block Category (for tool requirement matching)
+// ============================================================================
+const uint CATEGORY_SOFT   = 0;  // Dirt - any tool works, shovel best
+const uint CATEGORY_WOOD   = 1;  // Wood - any tool works, axe best
+const uint CATEGORY_STONE  = 2;  // Stone, ores - requires pickaxe for drops
+
+// ============================================================================
+// Hardness Values (ticks to break with bare hand)
+// ============================================================================
+float getBlockHardness(uint blockType) {
+    switch (blockType) {
+        case BLOCK_DIRT:        return 15.0;
+        case BLOCK_WOOD:        return 60.0;
+        case BLOCK_STONE:       return 150.0;
+        case BLOCK_IRON_ORE:    return 150.0;
+        case BLOCK_COAL_ORE:    return 150.0;
+        case BLOCK_DIAMOND_ORE: return 150.0;
+        case BLOCK_OBSIDIAN:    return 2500.0;
+        default:                return 1.0;  // Air/unknown instant
+    }
+}
+
+uint getBlockCategory(uint blockType) {
+    switch (blockType) {
+        case BLOCK_DIRT:        return CATEGORY_SOFT;
+        case BLOCK_WOOD:        return CATEGORY_WOOD;
+        case BLOCK_STONE:
+        case BLOCK_IRON_ORE:
+        case BLOCK_COAL_ORE:
+        case BLOCK_DIAMOND_ORE:
+        case BLOCK_OBSIDIAN:    return CATEGORY_STONE;
+        default:                return CATEGORY_SOFT;
+    }
+}
+
+uint getPreferredTool(uint blockCategory) {
+    switch (blockCategory) {
+        case CATEGORY_SOFT:  return TOOL_SHOVEL;
+        case CATEGORY_WOOD:  return TOOL_AXE;
+        case CATEGORY_STONE: return TOOL_PICKAXE;
+        default:             return TOOL_NONE;
+    }
+}
+
+// ============================================================================
+// Tool Efficiency Multipliers
+// ============================================================================
+float getMaterialMultiplier(uint material) {
+    switch (material) {
+        case MATERIAL_WOOD:    return 2.0;
+        case MATERIAL_STONE:   return 4.0;
+        case MATERIAL_IRON:    return 6.0;
+        case MATERIAL_DIAMOND: return 8.0;
+        default:               return 1.0;  // Hand
+    }
+}
+
+// Minimum material level required for drops from certain blocks
+uint getMinHarvestLevel(uint blockType) {
+    switch (blockType) {
+        case BLOCK_IRON_ORE:    return MATERIAL_STONE;   // Stone+ pickaxe
+        case BLOCK_DIAMOND_ORE: return MATERIAL_IRON;    // Iron+ pickaxe
+        case BLOCK_OBSIDIAN:    return MATERIAL_DIAMOND; // Diamond pickaxe
+        default:                return MATERIAL_NONE;
+    }
+}
+
+// ============================================================================
+// Block Drop Mapping
+// ============================================================================
+uint getBlockDrop(uint blockType) {
+    // Most blocks drop themselves
+    // Special cases: coal ore -> coal, diamond ore -> diamond
+    switch (blockType) {
+        case BLOCK_COAL_ORE:    return 100;  // ITEM_COAL
+        case BLOCK_DIAMOND_ORE: return 101;  // ITEM_DIAMOND
+        default:                return blockType;  // Drop the block itself
+    }
+}
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct BreakRequest {
+    uint   playerIndex;      // Which player is breaking
+    ivec3  blockPos;         // Block position (x, y, z, padding)
+    uint   toolType;         // TOOL_* constant
+    uint   toolMaterial;     // MATERIAL_* constant
+    uint   toolDurability;   // Current durability
+    float  breakProgress;    // 0.0 to 1.0
+    uint   ticksElapsed;     // Ticks spent breaking
+};
+
+struct BreakResult {
+    uint  playerIndex;       // Corresponding player
+    ivec3 blockPos;          // Block position
+    uint  dropId;            // Item/block ID to drop (0 = no drop)
+    vec3  dropPosition;      // World position for drop entity
+    int   durabilityChange;  // Negative = damage to tool
+    float breakProgress;     // Updated progress (1.0 = broken)
+    uint  status;            // 0=in progress, 1=complete, 2=failed
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+// World block data (3D texture flattened to buffer)
+layout(std430, binding = 0) buffer WorldBlocks {
+    uint blocks[];  // Indexed by linearized position
+};
+
+// Breaking requests from players
+layout(std430, binding = 1) buffer BreakRequests {
+    uint numRequests;
+    BreakRequest requests[];
+};
+
+// Results written back
+layout(std430, binding = 2) buffer BreakResults {
+    uint numResults;
+    BreakResult results[];
+};
+
+// World dimensions uniform
+layout(push_constant) uniform PushConstants {
+    ivec3 worldSize;       // World dimensions
+    uint  tickDelta;       // Ticks since last update
+};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+uint linearizePos(ivec3 pos) {
+    return uint(pos.x + pos.y * worldSize.x + pos.z * worldSize.x * worldSize.y);
+}
+
+bool isValidPos(ivec3 pos) {
+    return pos.x >= 0 && pos.x < worldSize.x &&
+           pos.y >= 0 && pos.y < worldSize.y &&
+           pos.z >= 0 && pos.z < worldSize.z;
+}
+
+// ============================================================================
+// Main Breaking Logic
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= numRequests) return;
+
+    BreakRequest req = requests[idx];
+    BreakResult result;
+
+    result.playerIndex = req.playerIndex;
+    result.blockPos = req.blockPos;
+    result.dropId = 0;
+    result.dropPosition = vec3(0.0);
+    result.durabilityChange = 0;
+    result.status = 0;  // In progress
+
+    // Validate position
+    if (!isValidPos(req.blockPos)) {
+        result.status = 2;  // Failed - invalid position
+        result.breakProgress = 0.0;
+        uint resultIdx = atomicAdd(numResults, 1);
+        results[resultIdx] = result;
+        return;
+    }
+
+    // Get block at position
+    uint blockIdx = linearizePos(req.blockPos);
+    uint blockType = blocks[blockIdx];
+
+    // Air blocks break instantly
+    if (blockType == BLOCK_AIR) {
+        result.status = 2;  // Failed - nothing to break
+        result.breakProgress = 0.0;
+        uint resultIdx = atomicAdd(numResults, 1);
+        results[resultIdx] = result;
+        return;
+    }
+
+    // Get block properties
+    float hardness = getBlockHardness(blockType);
+    uint category = getBlockCategory(blockType);
+    uint preferredTool = getPreferredTool(category);
+
+    // Calculate efficiency multiplier
+    float efficiency = 1.0;  // Base: bare hand
+    bool correctTool = (req.toolType == preferredTool);
+    bool canHarvest = true;  // Can get drops
+
+    if (req.toolType != TOOL_NONE) {
+        if (correctTool) {
+            // Correct tool type: apply material multiplier
+            efficiency = getMaterialMultiplier(req.toolMaterial);
+        } else if (category != CATEGORY_STONE) {
+            // Wrong tool but soft/wood blocks: slight bonus
+            efficiency = 1.5;
+        }
+        // Wrong tool on stone: no speed bonus, efficiency stays 1.0
+    }
+
+    // Check harvest level requirement (for stone-type blocks)
+    if (category == CATEGORY_STONE) {
+        uint minLevel = getMinHarvestLevel(blockType);
+        if (req.toolType != TOOL_PICKAXE || req.toolMaterial < minLevel) {
+            canHarvest = false;  // Will break but no drop
+        }
+    }
+
+    // Calculate ticks needed to break
+    float ticksNeeded = hardness / efficiency;
+
+    // Calculate progress increment
+    float progressPerTick = 1.0 / ticksNeeded;
+    float newProgress = req.breakProgress + (progressPerTick * float(tickDelta));
+    newProgress = min(newProgress, 1.0);
+
+    result.breakProgress = newProgress;
+
+    // Check if block is fully broken
+    if (newProgress >= 1.0) {
+        result.status = 1;  // Complete
+
+        // Set block to air
+        blocks[blockIdx] = BLOCK_AIR;
+
+        // Calculate drop
+        if (canHarvest) {
+            result.dropId = getBlockDrop(blockType);
+            // Drop spawns at block center with slight random offset
+            result.dropPosition = vec3(
+                float(req.blockPos.x) + 0.5,
+                float(req.blockPos.y) + 0.25,
+                float(req.blockPos.z) + 0.5
+            );
+        }
+        // If !canHarvest, dropId stays 0 (no drop)
+
+        // Tool durability damage (1 point per block broken with correct tool)
+        if (req.toolType != TOOL_NONE && correctTool) {
+            result.durabilityChange = -1;
+        }
+        // Breaking with wrong tool: -2 durability penalty
+        else if (req.toolType != TOOL_NONE && !correctTool) {
+            result.durabilityChange = -2;
+        }
+    }
+
+    // Write result
+    uint resultIdx = atomicAdd(numResults, 1);
+    results[resultIdx] = result;
+
+    // Update request progress for next tick (if not complete)
+    if (result.status == 0) {
+        requests[idx].breakProgress = newProgress;
+        requests[idx].ticksElapsed += tickDelta;
+    }
+}

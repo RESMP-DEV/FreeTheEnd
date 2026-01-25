@@ -1,0 +1,244 @@
+#version 450
+
+// Biome determination compute shader
+// Generates MC 1.8.9-style biomes based on temperature and humidity noise maps
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Chunk dimensions
+#define CHUNK_SIZE 16
+
+// Biome IDs (MC 1.8.9)
+#define BIOME_OCEAN 0
+#define BIOME_PLAINS 1
+#define BIOME_DESERT 2
+#define BIOME_EXTREME_HILLS 3
+#define BIOME_FOREST 4
+#define BIOME_TAIGA 5
+#define BIOME_SWAMP 6
+#define BIOME_RIVER 7
+#define BIOME_FROZEN_OCEAN 10
+#define BIOME_FROZEN_RIVER 11
+#define BIOME_ICE_PLAINS 12
+#define BIOME_ICE_MOUNTAINS 13
+#define BIOME_MUSHROOM_ISLAND 14
+#define BIOME_BEACH 16
+#define BIOME_JUNGLE 21
+#define BIOME_ROOFED_FOREST 29
+#define BIOME_SAVANNA 35
+#define BIOME_MESA 37
+#define BIOME_ICE_SPIKES 140
+
+// Temperature thresholds (normalized 0-1 range)
+#define TEMP_COLD 0.25
+#define TEMP_MEDIUM 0.50
+#define TEMP_WARM 0.75
+// >= 0.75 is Hot
+
+// Humidity thresholds (normalized 0-1 range)
+#define HUM_DRY 0.25
+#define HUM_MEDIUM 0.50
+#define HUM_WET 0.75
+// >= 0.75 is Very Wet
+
+// Push constants for generation parameters
+layout(push_constant) uniform GenParams {
+    uint seed;
+    int chunk_x;
+    int chunk_z;
+} params;
+
+// Output biome map (16x16 uint8 packed as uint32)
+layout(std430, binding = 0) writeonly buffer BiomeMap {
+    uint biome_data[64]; // 256 bytes = 64 uint32
+} biome_out;
+
+// Output temperature map (16x16 floats)
+layout(std430, binding = 1) writeonly buffer TemperatureMap {
+    float temperature[256];
+} temp_out;
+
+// Output humidity map (16x16 floats)
+layout(std430, binding = 2) writeonly buffer HumidityMap {
+    float humidity[256];
+} humid_out;
+
+// Permutation table for noise (seeded)
+layout(std430, binding = 3) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+// Quintic interpolation curve (Ken Perlin's improved noise)
+float fade(float t) {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// Gradient function for 2D Perlin noise
+float grad2D(int hash, float x, float y) {
+    int h = hash & 7;
+    float u = h < 4 ? x : y;
+    float v = h < 4 ? y : x;
+    return ((h & 1) != 0 ? -u : u) + ((h & 2) != 0 ? -2.0 * v : 2.0 * v);
+}
+
+// 2D Perlin noise
+float perlin2D(vec2 p, int seedOffset) {
+    int X = int(floor(p.x)) & 255;
+    int Y = int(floor(p.y)) & 255;
+    float x = fract(p.x);
+    float y = fract(p.y);
+    float u = fade(x);
+    float v = fade(y);
+
+    // Add seed offset to permutation lookups
+    int A = (perm_table.perm[(X + seedOffset) & 255] + Y) & 255;
+    int B = (perm_table.perm[(X + 1 + seedOffset) & 255] + Y) & 255;
+
+    return mix(
+        mix(grad2D(perm_table.perm[A], x, y), grad2D(perm_table.perm[B], x - 1, y), u),
+        mix(grad2D(perm_table.perm[(A + 1) & 255], x, y - 1),
+            grad2D(perm_table.perm[(B + 1) & 255], x - 1, y - 1), u),
+        v
+    );
+}
+
+// Octave noise with MC 1.8.9-style parameters
+float octaveNoise(vec2 pos, float scale, int octaves, int seedOffset) {
+    float total = 0.0;
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float maxValue = 0.0;
+
+    vec2 scaledPos = pos * scale;
+
+    for (int i = 0; i < octaves; i++) {
+        total += perlin2D(scaledPos * frequency, seedOffset + i * 17) * amplitude;
+        maxValue += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+
+    // Normalize to [0, 1]
+    return (total / maxValue) * 0.5 + 0.5;
+}
+
+// Temperature noise: scale 0.025, 4 octaves (MC 1.8.9 parameters)
+float generateTemperature(vec2 worldPos) {
+    // Primary temperature layer
+    float temp = octaveNoise(worldPos, 0.025, 4, int(params.seed));
+
+    // Small variation layer for local climate differences
+    float variation = octaveNoise(worldPos, 0.1, 2, int(params.seed) + 1000) * 0.1;
+
+    return clamp(temp + variation - 0.05, 0.0, 1.0);
+}
+
+// Humidity noise: scale 0.05, 4 octaves (MC 1.8.9 parameters)
+float generateHumidity(vec2 worldPos) {
+    // Primary humidity layer
+    float humid = octaveNoise(worldPos, 0.05, 4, int(params.seed) + 500);
+
+    // River influence - creates wet corridors
+    float riverNoise = abs(octaveNoise(worldPos, 0.01, 2, int(params.seed) + 700) - 0.5);
+    float riverInfluence = smoothstep(0.05, 0.0, riverNoise) * 0.3;
+
+    return clamp(humid + riverInfluence, 0.0, 1.0);
+}
+
+// Determine biome from temperature and humidity
+// Based on MC 1.8.9 biome mapping table:
+//
+// Temperature ->    Cold(<0.25)    Medium(0.25-0.5)  Warm(0.5-0.75)   Hot(>=0.75)
+// Humidity:
+// Dry (<0.25)       Ice Plains     Plains            Desert           Desert
+// Medium (0.25-0.5) Taiga          Forest            Savanna          Savanna
+// Wet (0.5-0.75)    Ice Spikes     Swamp             Jungle           Mesa
+// Very Wet (>=0.75) Frozen River   Roofed Forest     Jungle           Mesa
+//
+uint determineBiome(float temperature, float humidity) {
+    // Cold biomes (temp < 0.25)
+    if (temperature < TEMP_COLD) {
+        if (humidity < HUM_DRY) {
+            return BIOME_ICE_PLAINS;
+        } else if (humidity < HUM_MEDIUM) {
+            return BIOME_TAIGA;
+        } else if (humidity < HUM_WET) {
+            return BIOME_ICE_SPIKES;
+        } else {
+            return BIOME_FROZEN_RIVER;
+        }
+    }
+    // Medium temperature biomes (0.25 <= temp < 0.50)
+    else if (temperature < TEMP_MEDIUM) {
+        if (humidity < HUM_DRY) {
+            return BIOME_PLAINS;
+        } else if (humidity < HUM_MEDIUM) {
+            return BIOME_FOREST;
+        } else if (humidity < HUM_WET) {
+            return BIOME_SWAMP;
+        } else {
+            return BIOME_ROOFED_FOREST;
+        }
+    }
+    // Warm biomes (0.50 <= temp < 0.75)
+    else if (temperature < TEMP_WARM) {
+        if (humidity < HUM_DRY) {
+            return BIOME_DESERT;
+        } else if (humidity < HUM_MEDIUM) {
+            return BIOME_SAVANNA;
+        } else {
+            return BIOME_JUNGLE;
+        }
+    }
+    // Hot biomes (temp >= 0.75)
+    else {
+        if (humidity < HUM_DRY) {
+            return BIOME_DESERT;
+        } else if (humidity < HUM_MEDIUM) {
+            return BIOME_SAVANNA;
+        } else {
+            return BIOME_MESA;
+        }
+    }
+}
+
+// Write packed biome byte to output buffer
+// biome_data stores 4 bytes per uint32
+void writeBiome(uint idx, uint biome) {
+    uint wordIdx = idx >> 2;       // idx / 4
+    uint byteOffset = idx & 3;     // idx % 4
+    uint shift = byteOffset * 8;
+
+    // Atomic OR to set our byte (since multiple threads write to same word)
+    atomicOr(biome_out.biome_data[wordIdx], (biome & 0xFF) << shift);
+}
+
+void main() {
+    uvec2 localPos = gl_GlobalInvocationID.xy;
+
+    // Bounds check
+    if (localPos.x >= CHUNK_SIZE || localPos.y >= CHUNK_SIZE) {
+        return;
+    }
+
+    // World position for this column
+    vec2 worldPos = vec2(
+        float(params.chunk_x * CHUNK_SIZE + int(localPos.x)),
+        float(params.chunk_z * CHUNK_SIZE + int(localPos.y))
+    );
+
+    // Generate temperature and humidity
+    float temperature = generateTemperature(worldPos);
+    float humidity = generateHumidity(worldPos);
+
+    // Determine biome from climate
+    uint biome = determineBiome(temperature, humidity);
+
+    // Output index (z * 16 + x)
+    uint idx = localPos.y * CHUNK_SIZE + localPos.x;
+
+    // Write outputs
+    temp_out.temperature[idx] = temperature;
+    humid_out.humidity[idx] = humidity;
+    writeBiome(idx, biome);
+}

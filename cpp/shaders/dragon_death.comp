@@ -1,0 +1,563 @@
+#version 450
+
+// Dragon Death Sequence and Victory Conditions
+// Implements MC 1.8.9 Ender Dragon death behavior for RL training
+//
+// Death sequence:
+// 1. Dragon health reaches 0 -> phase = DYING
+// 2. Dragon flies to fountain at (0, 64, 0)
+// 3. Ascends above fountain with dramatic animation
+// 4. Explodes into 12000 XP (dropped as ~500 orbs)
+// 5. Dragon egg spawns on fountain pillar
+// 6. Exit portal activates (bedrock frame + portal block)
+//
+// Episode termination:
+// - Dragon killed (victory) -> done=true, reward=1000+time_bonus
+// - Player death (failure) -> done=true, reward=-50
+// - Max ticks reached (timeout) -> done=true, reward=partial
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint stage;        // 0=update_death, 1=spawn_xp, 2=check_victory
+    uint num_envs;
+    uint tick;
+    uint random_seed;
+} pc;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Death sequence timing (in ticks, 20 ticks = 1 second)
+const uint FLY_TO_FOUNTAIN_TICKS = 60u;    // 3 seconds
+const uint ASCEND_TICKS = 80u;             // 4 seconds
+const uint EXPLOSION_TICKS = 60u;          // 3 seconds
+const uint TOTAL_DEATH_TICKS = 200u;       // 10 seconds total
+
+// Fountain position (bedrock pillar in End)
+const vec3 FOUNTAIN_CENTER = vec3(0.0, 64.0, 0.0);
+const float ASCEND_HEIGHT = 50.0;
+
+// XP values
+const uint DRAGON_XP_TOTAL = 12000u;       // Total XP from dragon
+const uint XP_ORB_COUNT = 500u;            // Split into orbs
+const uint XP_PER_ORB = 24u;               // 12000 / 500 = 24 each
+const float XP_SPREAD_RADIUS = 8.0;
+
+// Dragon phases
+const uint DRAGON_CIRCLING = 0u;
+const uint DRAGON_STRAFING = 1u;
+const uint DRAGON_CHARGING = 2u;
+const uint DRAGON_LANDING = 3u;
+const uint DRAGON_PERCHING = 4u;
+const uint DRAGON_TAKING_OFF = 5u;
+const uint DRAGON_DYING = 6u;              // Flying to fountain
+const uint DRAGON_ASCENDING = 7u;          // Rising above fountain
+const uint DRAGON_EXPLODING = 8u;          // Death explosion
+const uint DRAGON_DEAD = 9u;               // Fully dead, portal active
+
+// Episode limits
+const uint MAX_EPISODE_TICKS = 24000u;     // 20 minutes
+const float TIME_BONUS_MAX = 500.0;        // Bonus for fast kills
+
+// Player flags
+const uint FLAG_DEAD = 8u;
+const uint FLAG_WON = 16u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint invincibility_timer;
+    uint attack_cooldown;
+    uint weapon_slot;
+    float arrow_charge;
+    uint arrows;
+    uint reserved[2];
+};
+
+struct Dragon {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    uint phase;
+    uint phase_timer;
+    uint target_pillar;
+    vec3 target_position;
+    float breath_timer;
+    uint perch_timer;
+    uint attack_cooldown;
+    uint flags;
+    float circle_angle;
+    uint reserved[3];
+};
+
+struct DeathState {
+    uint death_tick;           // Ticks since death started
+    uint death_phase;          // Sub-phase of death sequence
+    vec3 death_start_pos;      // Position when death started
+    float explosion_progress;  // 0.0 to 1.0 during explosion
+    uint xp_spawned;           // Has XP been spawned
+    uint portal_active;        // Is exit portal ready
+    uint egg_spawned;          // Is dragon egg placed
+    float body_scale;          // Dragon body scale (dissolves to 0)
+    uint reserved[4];
+};
+
+struct GameState {
+    uint tick_number;
+    uint game_flags;
+    uint random_seed;
+    float delta_time;
+    uint crystals_destroyed;
+    uint dragon_hits;
+    uint player_deaths;
+    float best_dragon_damage;
+};
+
+struct XPOrb {
+    vec3 position;
+    float velocity_y;
+    uint value;
+    uint collected;
+    uint reserved[2];
+};
+
+struct VictoryInfo {
+    uint victory;              // 1 = player won
+    uint time_ticks;           // Total ticks taken
+    float time_bonus;          // Time-based bonus reward
+    float total_reward;        // Base + time_bonus
+    uint xp_collected;         // XP collected by player
+    uint final_level;          // Player level after XP
+    uint death_cause;          // 0=win, 1=player_death, 2=timeout, 3=void
+    float dragon_health_remaining; // For partial rewards on timeout
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) buffer DragonBuffer {
+    Dragon dragons[];
+};
+
+layout(set = 0, binding = 2) buffer DeathStateBuffer {
+    DeathState death_states[];
+};
+
+layout(set = 0, binding = 3) buffer GameStateBuffer {
+    GameState game_states[];
+};
+
+layout(set = 0, binding = 4) buffer XPOrbBuffer {
+    XPOrb xp_orbs[];  // XP_ORB_COUNT per env
+};
+
+layout(set = 0, binding = 5) buffer VictoryInfoBuffer {
+    VictoryInfo victory_info[];
+};
+
+layout(set = 0, binding = 6) buffer RewardBuffer {
+    float rewards[];
+};
+
+layout(set = 0, binding = 7) buffer DoneBuffer {
+    uint dones[];
+};
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+vec3 rand_sphere(inout uint seed) {
+    float theta = rand(seed) * 6.283185;
+    float phi = acos(2.0 * rand(seed) - 1.0);
+    return vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+}
+
+// Smooth step for animation easing
+float ease_out_cubic(float t) {
+    return 1.0 - pow(1.0 - t, 3.0);
+}
+
+float ease_in_out_quad(float t) {
+    return t < 0.5 ? 2.0 * t * t : 1.0 - pow(-2.0 * t + 2.0, 2.0) / 2.0;
+}
+
+// ============================================================================
+// STAGE 0: Update Death Sequence
+// ============================================================================
+
+void stage_update_death(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    Dragon d = dragons[env_id];
+    DeathState ds = death_states[env_id];
+    GameState gs = game_states[env_id];
+
+    // Only process if dragon is in a dying phase
+    if (d.phase < DRAGON_DYING || d.phase == DRAGON_DEAD) return;
+
+    uint seed = gs.random_seed ^ env_id ^ pc.tick;
+
+    ds.death_tick++;
+
+    switch (d.phase) {
+        case DRAGON_DYING: {
+            // Phase 1: Fly to fountain
+            // Save start position on first tick
+            if (ds.death_tick == 1u) {
+                ds.death_start_pos = d.position;
+                ds.explosion_progress = 0.0;
+                ds.xp_spawned = 0u;
+                ds.portal_active = 0u;
+                ds.egg_spawned = 0u;
+                ds.body_scale = 1.0;
+            }
+
+            float progress = float(ds.death_tick) / float(FLY_TO_FOUNTAIN_TICKS);
+            progress = min(progress, 1.0);
+
+            // Interpolate position toward fountain (maintain height initially)
+            vec3 target = FOUNTAIN_CENTER;
+            target.y = mix(ds.death_start_pos.y, FOUNTAIN_CENTER.y + 10.0, ease_out_cubic(progress));
+
+            d.position = mix(ds.death_start_pos, target, ease_out_cubic(progress));
+
+            // Wobble/spiral as dragon struggles
+            float wobble = sin(float(ds.death_tick) * 0.5) * (1.0 - progress) * 5.0;
+            d.position.x += wobble;
+            d.position.z += cos(float(ds.death_tick) * 0.3) * wobble;
+
+            // Face toward fountain
+            vec3 to_fountain = FOUNTAIN_CENTER - d.position;
+            d.yaw = degrees(atan(to_fountain.x, to_fountain.z));
+
+            if (ds.death_tick >= FLY_TO_FOUNTAIN_TICKS) {
+                d.phase = DRAGON_ASCENDING;
+                ds.death_tick = 0u;
+            }
+            break;
+        }
+
+        case DRAGON_ASCENDING: {
+            // Phase 2: Rise dramatically above fountain
+            float progress = float(ds.death_tick) / float(ASCEND_TICKS);
+            progress = min(progress, 1.0);
+
+            // Keep centered on fountain
+            d.position.x = FOUNTAIN_CENTER.x;
+            d.position.z = FOUNTAIN_CENTER.z;
+
+            // Rise with easing
+            float base_y = FOUNTAIN_CENTER.y + 10.0;
+            d.position.y = base_y + ASCEND_HEIGHT * ease_out_cubic(progress);
+
+            // Slow rotation during ascent (dramatic effect)
+            d.yaw = mod(d.yaw + 2.0, 360.0);
+
+            // Start glowing/particle effects (body_scale used as intensity)
+            ds.body_scale = 1.0 + progress * 0.5;  // Grows slightly before explosion
+
+            if (ds.death_tick >= ASCEND_TICKS) {
+                d.phase = DRAGON_EXPLODING;
+                ds.death_tick = 0u;
+            }
+            break;
+        }
+
+        case DRAGON_EXPLODING: {
+            // Phase 3: Explosion and dissolution
+            float progress = float(ds.death_tick) / float(EXPLOSION_TICKS);
+            progress = min(progress, 1.0);
+            ds.explosion_progress = progress;
+
+            // Dragon body dissolves
+            ds.body_scale = max(0.0, 1.5 - progress * 1.5);
+
+            // Spawn XP orbs at explosion start
+            if (ds.xp_spawned == 0u && progress > 0.05) {
+                ds.xp_spawned = 1u;
+                // XP orb spawning handled in stage 1
+            }
+
+            // Portal activates mid-explosion
+            if (ds.portal_active == 0u && progress > 0.5) {
+                ds.portal_active = 1u;
+            }
+
+            // Egg spawns at end
+            if (ds.egg_spawned == 0u && progress > 0.9) {
+                ds.egg_spawned = 1u;
+            }
+
+            if (ds.death_tick >= EXPLOSION_TICKS) {
+                d.phase = DRAGON_DEAD;
+                ds.death_tick = 0u;
+                ds.body_scale = 0.0;
+
+                // Move dragon to "nowhere"
+                d.position = vec3(0.0, -1000.0, 0.0);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    dragons[env_id] = d;
+    death_states[env_id] = ds;
+    game_states[env_id].random_seed = seed;
+}
+
+// ============================================================================
+// STAGE 1: Spawn and Update XP Orbs
+// ============================================================================
+
+void stage_spawn_xp(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    DeathState ds = death_states[env_id];
+    Dragon d = dragons[env_id];
+    GameState gs = game_states[env_id];
+
+    uint seed = gs.random_seed ^ env_id ^ (pc.tick + 1000u);
+    uint orb_base = env_id * XP_ORB_COUNT;
+
+    // Spawn orbs when xp_spawned flag is set
+    if (ds.xp_spawned == 1u && d.phase == DRAGON_EXPLODING) {
+        // Only spawn on the tick when flag first set (check explosion_progress)
+        if (ds.explosion_progress > 0.05 && ds.explosion_progress < 0.15) {
+            vec3 spawn_center = vec3(
+                FOUNTAIN_CENTER.x,
+                FOUNTAIN_CENTER.y + 10.0 + ASCEND_HEIGHT,
+                FOUNTAIN_CENTER.z
+            );
+
+            for (uint i = 0; i < XP_ORB_COUNT; i++) {
+                XPOrb orb;
+
+                // Scatter orbs in sphere around explosion point
+                vec3 offset = rand_sphere(seed) * XP_SPREAD_RADIUS * rand(seed);
+                orb.position = spawn_center + offset;
+
+                // Initial upward velocity with spread
+                orb.velocity_y = 0.5 + rand(seed) * 1.0;
+                orb.value = XP_PER_ORB;
+                orb.collected = 0u;
+
+                xp_orbs[orb_base + i] = orb;
+            }
+        }
+    }
+
+    // Update XP orb physics (gravity, collection)
+    Player p = players[env_id];
+    float collection_radius = 2.0;  // MC orb collection radius
+    float magnet_radius = 8.0;      // Orbs get pulled toward player
+
+    for (uint i = 0; i < XP_ORB_COUNT; i++) {
+        XPOrb orb = xp_orbs[orb_base + i];
+
+        if (orb.collected != 0u || orb.value == 0u) continue;
+
+        // Gravity
+        orb.velocity_y -= 0.04;  // MC gravity for items
+        orb.position.y += orb.velocity_y;
+
+        // Ground collision
+        if (orb.position.y < FOUNTAIN_CENTER.y) {
+            orb.position.y = FOUNTAIN_CENTER.y;
+            orb.velocity_y = 0.0;
+        }
+
+        // Magnet toward player
+        vec3 to_player = p.position - orb.position;
+        float dist = length(to_player);
+
+        if (dist < magnet_radius && dist > 0.1) {
+            vec3 pull = normalize(to_player) * 0.3;
+            orb.position += pull;
+        }
+
+        // Collection
+        if (dist < collection_radius) {
+            orb.collected = 1u;
+            // XP added to player in victory stage
+        }
+
+        xp_orbs[orb_base + i] = orb;
+    }
+
+    game_states[env_id].random_seed = seed;
+}
+
+// ============================================================================
+// STAGE 2: Check Victory Conditions
+// ============================================================================
+
+void stage_check_victory(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    Player p = players[env_id];
+    Dragon d = dragons[env_id];
+    DeathState ds = death_states[env_id];
+    GameState gs = game_states[env_id];
+    VictoryInfo vi = victory_info[env_id];
+
+    // Already done?
+    if (dones[env_id] != 0u) return;
+
+    uint orb_base = env_id * XP_ORB_COUNT;
+
+    // Count collected XP
+    uint xp_collected = 0u;
+    for (uint i = 0; i < XP_ORB_COUNT; i++) {
+        XPOrb orb = xp_orbs[orb_base + i];
+        if (orb.collected != 0u) {
+            xp_collected += orb.value;
+        }
+    }
+    vi.xp_collected = xp_collected;
+
+    // Calculate level from XP (simplified MC formula)
+    // Level 30 requires ~1395 XP, 12000 XP gets you to ~level 78
+    uint level = 0u;
+    uint xp_remaining = xp_collected;
+    while (xp_remaining >= 7u + 2u * level && level < 100u) {
+        xp_remaining -= 7u + 2u * level;
+        level++;
+    }
+    vi.final_level = level;
+
+    // ===== VICTORY: Dragon killed =====
+    if (d.phase == DRAGON_DEAD) {
+        // Check if player enters portal
+        float dist_to_portal = length(vec2(p.position.x, p.position.z));
+        bool in_portal = dist_to_portal < 2.0 &&
+                        p.position.y >= FOUNTAIN_CENTER.y - 1.0 &&
+                        p.position.y <= FOUNTAIN_CENTER.y + 5.0;
+
+        if (in_portal && ds.portal_active != 0u) {
+            // VICTORY!
+            vi.victory = 1u;
+            vi.time_ticks = gs.tick_number;
+
+            // Time bonus: faster kills get more reward
+            // Max bonus at 2 minutes (2400 ticks), zero at 20 minutes
+            float time_ratio = float(gs.tick_number) / float(MAX_EPISODE_TICKS);
+            vi.time_bonus = TIME_BONUS_MAX * max(0.0, 1.0 - time_ratio);
+
+            // Base reward + time bonus
+            float base_reward = 1000.0;
+            vi.total_reward = base_reward + vi.time_bonus;
+
+            // Bonus for XP collection
+            float xp_ratio = float(xp_collected) / float(DRAGON_XP_TOTAL);
+            vi.total_reward += xp_ratio * 100.0;  // Up to 100 extra for all XP
+
+            vi.death_cause = 0u;  // Win
+            vi.dragon_health_remaining = 0.0;
+
+            p.flags |= FLAG_WON;
+            dones[env_id] = 1u;
+            rewards[env_id] += vi.total_reward;
+        }
+    }
+
+    // ===== FAILURE: Player death =====
+    if ((p.flags & FLAG_DEAD) != 0u) {
+        vi.victory = 0u;
+        vi.time_ticks = gs.tick_number;
+        vi.time_bonus = 0.0;
+        vi.total_reward = -50.0;
+        vi.death_cause = 1u;  // Player death
+        vi.dragon_health_remaining = d.health;
+
+        dones[env_id] = 1u;
+        rewards[env_id] += vi.total_reward;
+    }
+
+    // ===== FAILURE: Void death (handled separately for clarity) =====
+    if (p.position.y < -60.0) {
+        vi.victory = 0u;
+        vi.time_ticks = gs.tick_number;
+        vi.time_bonus = 0.0;
+        vi.total_reward = -50.0;
+        vi.death_cause = 3u;  // Void
+        vi.dragon_health_remaining = d.health;
+
+        p.flags |= FLAG_DEAD;
+        dones[env_id] = 1u;
+        rewards[env_id] += vi.total_reward;
+    }
+
+    // ===== TIMEOUT: Max ticks reached =====
+    if (gs.tick_number >= MAX_EPISODE_TICKS) {
+        vi.victory = 0u;
+        vi.time_ticks = gs.tick_number;
+        vi.time_bonus = 0.0;
+
+        // Partial reward based on dragon damage dealt
+        float damage_dealt = 200.0 - d.health;  // Max health - current
+        float damage_ratio = damage_dealt / 200.0;
+        vi.total_reward = damage_ratio * 100.0 - 25.0;  // -25 to +75 based on progress
+
+        vi.death_cause = 2u;  // Timeout
+        vi.dragon_health_remaining = d.health;
+
+        dones[env_id] = 1u;
+        rewards[env_id] += vi.total_reward;
+    }
+
+    players[env_id] = p;
+    victory_info[env_id] = vi;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0u: stage_update_death(env_id); break;
+        case 1u: stage_spawn_xp(env_id); break;
+        case 2u: stage_check_victory(env_id); break;
+    }
+}

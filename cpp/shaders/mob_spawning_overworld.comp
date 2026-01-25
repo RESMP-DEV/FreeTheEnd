@@ -1,0 +1,648 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Overworld Hostile Mob Spawning
+// Handles Zombie, Skeleton, Spider, Creeper spawning with MC 1.8.9 rules
+// ============================================================================
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Mob types (must match mob_state.h)
+const uint MOB_TYPE_ZOMBIE = 0;
+const uint MOB_TYPE_SKELETON = 1;
+const uint MOB_TYPE_SPIDER = 5;
+const uint MOB_TYPE_CREEPER = 6;
+
+// AI states
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;
+const uint AI_STATE_DEAD = 9;
+
+// Mob flags
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_CAN_DESPAWN = 1 << 9;
+const uint MOB_FLAG_NEUTRAL_DAY = 1 << 10;  // Spider neutral during day
+
+// Spawning constants
+const uint MAX_HOSTILE_LIGHT = 7;           // Light level must be < 7 for hostile spawns
+const uint HOSTILE_MOB_CAP = 70;            // Max hostile mobs within spawn radius
+const float SPAWN_RADIUS_MIN = 24.0;        // Minimum spawn distance from player
+const float SPAWN_RADIUS_MAX = 128.0;       // Maximum spawn distance from player
+const float DESPAWN_RADIUS = 128.0;         // Mobs despawn beyond this distance
+const float INSTANT_DESPAWN_RADIUS = 128.0; // For mob cap calculation
+
+// Spawn weights (out of 100)
+const uint ZOMBIE_WEIGHT = 40;
+const uint SKELETON_WEIGHT = 30;
+const uint SPIDER_WEIGHT = 20;
+const uint CREEPER_WEIGHT = 10;
+
+// Mob stats
+const float ZOMBIE_HEALTH = 20.0;
+const float ZOMBIE_SPEED = 0.23;
+const float ZOMBIE_DAMAGE = 3.0;
+
+const float SKELETON_HEALTH = 20.0;
+const float SKELETON_SPEED = 0.25;
+const float SKELETON_DAMAGE_MIN = 2.0;
+const float SKELETON_DAMAGE_MAX = 5.0;
+const float SKELETON_PREFERRED_DISTANCE = 10.0;
+
+const float SPIDER_HEALTH = 16.0;
+const float SPIDER_SPEED = 0.3;
+const float SPIDER_DAMAGE = 2.0;
+
+const float CREEPER_HEALTH = 20.0;
+const float CREEPER_SPEED = 0.25;
+const float CREEPER_EXPLOSION_RADIUS = 3.0;
+const float CREEPER_FUSE_TIME = 30.0;  // 1.5 seconds at 20 tps
+
+// Physics
+const float GRAVITY = 0.08;
+const float JUMP_VELOCITY = 0.42;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct SpawnCandidate {
+    vec3 position;
+    uint chunk_x;
+    uint chunk_z;
+    uint light_level;
+    uint surface_block;
+    uint _pad;
+};
+
+struct SpawnResult {
+    MobState mob;
+    uint valid;
+    uint spawn_index;
+    uint _pad[2];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+// Input: candidate spawn positions from spatial hashing
+layout(set = 0, binding = 0) buffer readonly CandidateBuffer {
+    uint candidate_count;
+    SpawnCandidate candidates[];
+};
+
+// Output: spawned mobs
+layout(set = 0, binding = 1) buffer SpawnResultBuffer {
+    uint spawn_count;
+    SpawnResult spawns[];
+};
+
+// Current mobs for density checking
+layout(set = 0, binding = 2) buffer readonly MobBuffer {
+    uint mob_count;
+    MobState existing_mobs[];
+};
+
+// World blocks for collision
+layout(set = 0, binding = 3) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+// Light levels (packed 4-bit per block)
+layout(set = 0, binding = 4) buffer readonly LightBuffer {
+    uint light_levels[];
+};
+
+// Player positions for distance checks
+layout(set = 0, binding = 5) buffer readonly PlayerBuffer {
+    uint player_count;
+    EntityRef players[];
+};
+
+layout(push_constant) uniform PushConstants {
+    vec3 primary_player_pos;
+    float world_time;          // 0-24000 day/night cycle
+    uint tick;
+    uint random_seed;
+    uint max_spawns;           // Max new spawns this tick
+    float difficulty;          // 0.0 = peaceful, 1.0 = easy, 2.0 = normal, 3.0 = hard
+    uint current_hostile_count;
+} pc;
+
+// ============================================================================
+// Shared memory
+// ============================================================================
+
+shared uint s_spawn_count;
+shared uint s_valid_indices[64];
+
+// ============================================================================
+// Random
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+// ============================================================================
+// World queries
+// ============================================================================
+
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+uint get_light_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 15;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return (light_levels[idx >> 1] >> ((idx & 1) * 4)) & 0xF;
+}
+
+bool is_solid(uint block_id) {
+    // Air=0, water=8,9, lava=10,11 are not solid
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+bool is_spawnable_surface(uint block_id) {
+    // Opaque solid blocks mobs can spawn on
+    // Stone=1, Grass=2, Dirt=3, Cobblestone=4, Planks=5, Bedrock=7
+    // Sand=12, Gravel=13, Sandstone=24, Netherrack=87
+    return (block_id >= 1 && block_id <= 5) ||
+           block_id == 7 || block_id == 12 || block_id == 13 ||
+           block_id == 24 || block_id == 87;
+}
+
+bool is_transparent(uint block_id) {
+    // Glass=20, Leaves=18, Ice=79, etc.
+    return block_id == 0 || block_id == 20 || block_id == 18 || block_id == 79;
+}
+
+// ============================================================================
+// Time of day
+// ============================================================================
+
+bool is_nighttime() {
+    // Minecraft day: 0-12000 = day, 12000-24000 = night
+    // Night starts at 13000, full dark at 14000
+    return pc.world_time >= 13000.0 && pc.world_time < 23000.0;
+}
+
+bool is_daytime() {
+    return !is_nighttime();
+}
+
+float get_sky_light_reduction() {
+    // Returns 0.0 during day, up to 1.0 during night
+    if (pc.world_time < 12000.0) return 0.0;
+    if (pc.world_time < 13000.0) return (pc.world_time - 12000.0) / 1000.0;
+    if (pc.world_time < 23000.0) return 1.0;
+    return 1.0 - (pc.world_time - 23000.0) / 1000.0;
+}
+
+// ============================================================================
+// Distance calculations
+// ============================================================================
+
+float nearest_player_distance(vec3 pos) {
+    float min_dist = distance(pos, pc.primary_player_pos);
+    for (uint i = 0; i < player_count && i < 256; i++) {
+        float d = distance(pos, players[i].position);
+        min_dist = min(min_dist, d);
+    }
+    return min_dist;
+}
+
+// Count hostile mobs within radius of position
+uint count_nearby_hostiles(vec3 pos, float radius) {
+    uint count = 0;
+    float radius_sq = radius * radius;
+
+    for (uint i = 0; i < mob_count && i < 1024; i++) {
+        MobState m = existing_mobs[i];
+        if (m.ai_state == AI_STATE_DEAD) continue;
+
+        // Check if hostile type
+        bool is_hostile = (m.mob_type == MOB_TYPE_ZOMBIE ||
+                          m.mob_type == MOB_TYPE_SKELETON ||
+                          m.mob_type == MOB_TYPE_SPIDER ||
+                          m.mob_type == MOB_TYPE_CREEPER);
+        if (!is_hostile) continue;
+
+        vec3 diff = m.position - pos;
+        if (dot(diff, diff) < radius_sq) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// Spawn validation
+// ============================================================================
+
+bool validate_spawn_position(vec3 pos, uint mob_type) {
+    ivec3 block = world_to_block(pos);
+
+    // Check solid ground below
+    uint below = get_block_at(block + ivec3(0, -1, 0));
+    if (!is_spawnable_surface(below)) {
+        return false;
+    }
+
+    // Check air at spawn position
+    uint at_feet = get_block_at(block);
+    if (is_solid(at_feet)) {
+        return false;
+    }
+
+    // Check air above (head height)
+    uint at_head = get_block_at(block + ivec3(0, 1, 0));
+    if (is_solid(at_head)) {
+        return false;
+    }
+
+    // Light level check
+    uint light = get_light_at(block);
+    if (light >= MAX_HOSTILE_LIGHT) {
+        // Spiders can spawn at higher light in enclosed spaces
+        if (mob_type == MOB_TYPE_SPIDER) {
+            // Check if sky is blocked
+            bool sky_blocked = false;
+            for (int y = block.y + 2; y < 256; y++) {
+                if (is_solid(get_block_at(ivec3(block.x, y, block.z)))) {
+                    sky_blocked = true;
+                    break;
+                }
+            }
+            if (!sky_blocked) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    // Distance from player check
+    float player_dist = nearest_player_distance(pos);
+    if (player_dist < SPAWN_RADIUS_MIN || player_dist > SPAWN_RADIUS_MAX) {
+        return false;
+    }
+
+    // Mob cap check
+    if (pc.current_hostile_count >= HOSTILE_MOB_CAP) {
+        return false;
+    }
+
+    // Local density check (don't spawn too many in one area)
+    uint nearby = count_nearby_hostiles(pos, 16.0);
+    if (nearby > 8) {
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Mob type selection
+// ============================================================================
+
+uint select_mob_type(vec3 pos, inout uint seed) {
+    float roll = random_float(seed) * 100.0;
+
+    float cumulative = 0.0;
+
+    // Zombie
+    cumulative += float(ZOMBIE_WEIGHT);
+    if (roll < cumulative) {
+        return MOB_TYPE_ZOMBIE;
+    }
+
+    // Skeleton - slightly more common at night
+    float skeleton_bonus = is_nighttime() ? 5.0 : 0.0;
+    cumulative += float(SKELETON_WEIGHT) + skeleton_bonus;
+    if (roll < cumulative) {
+        return MOB_TYPE_SKELETON;
+    }
+
+    // Spider
+    cumulative += float(SPIDER_WEIGHT);
+    if (roll < cumulative) {
+        return MOB_TYPE_SPIDER;
+    }
+
+    // Creeper
+    return MOB_TYPE_CREEPER;
+}
+
+// ============================================================================
+// Mob initialization
+// ============================================================================
+
+MobState create_zombie(vec3 pos, inout uint seed) {
+    MobState mob;
+    mob.position = pos;
+    mob._pad0 = 0.0;
+    mob.velocity = vec3(0.0);
+    mob._pad1 = 0.0;
+    mob.mob_type = MOB_TYPE_ZOMBIE;
+    mob.ai_state = AI_STATE_IDLE;
+    mob.target_entity_id = 0xFFFFFFFF;
+    mob.flags = MOB_FLAG_ON_GROUND | MOB_FLAG_CAN_DESPAWN;
+    mob.health = ZOMBIE_HEALTH;
+    mob.max_health = ZOMBIE_HEALTH;
+    mob.hurt_time = 0;
+    mob.no_damage_time = 0;
+    mob.yaw = random_float(seed) * 6.28318;
+    mob.pitch = 0.0;
+    mob.move_speed = ZOMBIE_SPEED;
+    mob.jump_velocity = JUMP_VELOCITY;
+    mob.ai_tick_cooldown = 0;
+    mob.attack_cooldown = 0;
+    mob.state_timer = 0;
+    mob.random_seed = seed;
+    mob.path_target = pos;
+    mob.path_state = 0;
+
+    // type_data[0] = baby flag, type_data[1] = villager flag
+    mob.type_data[0] = (random_float(seed) < 0.05) ? 1 : 0;  // 5% baby zombie
+    mob.type_data[1] = 0;
+    mob.type_data[2] = 0;
+    mob.type_data[3] = 0;
+    mob.type_data[4] = 0;
+    mob.type_data[5] = 0;
+
+    return mob;
+}
+
+MobState create_skeleton(vec3 pos, inout uint seed) {
+    MobState mob;
+    mob.position = pos;
+    mob._pad0 = 0.0;
+    mob.velocity = vec3(0.0);
+    mob._pad1 = 0.0;
+    mob.mob_type = MOB_TYPE_SKELETON;
+    mob.ai_state = AI_STATE_IDLE;
+    mob.target_entity_id = 0xFFFFFFFF;
+    mob.flags = MOB_FLAG_ON_GROUND | MOB_FLAG_CAN_DESPAWN;
+    mob.health = SKELETON_HEALTH;
+    mob.max_health = SKELETON_HEALTH;
+    mob.hurt_time = 0;
+    mob.no_damage_time = 0;
+    mob.yaw = random_float(seed) * 6.28318;
+    mob.pitch = 0.0;
+    mob.move_speed = SKELETON_SPEED;
+    mob.jump_velocity = JUMP_VELOCITY;
+    mob.ai_tick_cooldown = 0;
+    mob.attack_cooldown = 0;
+    mob.state_timer = 0;
+    mob.random_seed = seed;
+    mob.path_target = pos;
+    mob.path_state = 0;
+
+    // type_data[0] = bow draw time, type_data[1] = strafe direction
+    mob.type_data[0] = 0;
+    mob.type_data[1] = (random_float(seed) < 0.5) ? 0 : 1;  // Strafe left/right
+    mob.type_data[2] = floatBitsToUint(SKELETON_PREFERRED_DISTANCE);
+    mob.type_data[3] = 0;
+    mob.type_data[4] = 0;
+    mob.type_data[5] = 0;
+
+    return mob;
+}
+
+MobState create_spider(vec3 pos, inout uint seed) {
+    MobState mob;
+    mob.position = pos;
+    mob._pad0 = 0.0;
+    mob.velocity = vec3(0.0);
+    mob._pad1 = 0.0;
+    mob.mob_type = MOB_TYPE_SPIDER;
+    mob.ai_state = AI_STATE_IDLE;
+    mob.target_entity_id = 0xFFFFFFFF;
+
+    // Spiders are neutral during day
+    uint spider_flags = MOB_FLAG_ON_GROUND | MOB_FLAG_CAN_DESPAWN;
+    if (is_daytime()) {
+        spider_flags |= MOB_FLAG_NEUTRAL_DAY;
+    }
+    mob.flags = spider_flags;
+
+    mob.health = SPIDER_HEALTH;
+    mob.max_health = SPIDER_HEALTH;
+    mob.hurt_time = 0;
+    mob.no_damage_time = 0;
+    mob.yaw = random_float(seed) * 6.28318;
+    mob.pitch = 0.0;
+    mob.move_speed = SPIDER_SPEED;
+    mob.jump_velocity = JUMP_VELOCITY * 1.2;  // Spiders jump higher
+    mob.ai_tick_cooldown = 0;
+    mob.attack_cooldown = 0;
+    mob.state_timer = 0;
+    mob.random_seed = seed;
+    mob.path_target = pos;
+    mob.path_state = 0;
+
+    // type_data[0] = climbing flag, type_data[1] = wall direction
+    mob.type_data[0] = 0;
+    mob.type_data[1] = 0;
+    mob.type_data[2] = 0;
+    mob.type_data[3] = 0;
+    mob.type_data[4] = 0;
+    mob.type_data[5] = 0;
+
+    return mob;
+}
+
+MobState create_creeper(vec3 pos, inout uint seed) {
+    MobState mob;
+    mob.position = pos;
+    mob._pad0 = 0.0;
+    mob.velocity = vec3(0.0);
+    mob._pad1 = 0.0;
+    mob.mob_type = MOB_TYPE_CREEPER;
+    mob.ai_state = AI_STATE_IDLE;
+    mob.target_entity_id = 0xFFFFFFFF;
+    mob.flags = MOB_FLAG_ON_GROUND | MOB_FLAG_CAN_DESPAWN;
+    mob.health = CREEPER_HEALTH;
+    mob.max_health = CREEPER_HEALTH;
+    mob.hurt_time = 0;
+    mob.no_damage_time = 0;
+    mob.yaw = random_float(seed) * 6.28318;
+    mob.pitch = 0.0;
+    mob.move_speed = CREEPER_SPEED;
+    mob.jump_velocity = JUMP_VELOCITY;
+    mob.ai_tick_cooldown = 0;
+    mob.attack_cooldown = 0;
+    mob.state_timer = 0;
+    mob.random_seed = seed;
+    mob.path_target = pos;
+    mob.path_state = 0;
+
+    // type_data[0] = fuse timer, type_data[1] = charged flag
+    // type_data[2] = explosion radius multiplier (stored as float bits)
+    mob.type_data[0] = 0;  // Fuse not started
+    mob.type_data[1] = (random_float(seed) < 0.01) ? 1 : 0;  // 1% charged creeper
+    mob.type_data[2] = floatBitsToUint(CREEPER_EXPLOSION_RADIUS);
+    mob.type_data[3] = floatBitsToUint(CREEPER_FUSE_TIME);
+    mob.type_data[4] = 0;
+    mob.type_data[5] = 0;
+
+    // Charged creepers have larger explosion
+    if (mob.type_data[1] == 1) {
+        mob.type_data[2] = floatBitsToUint(CREEPER_EXPLOSION_RADIUS * 2.0);
+    }
+
+    return mob;
+}
+
+MobState create_mob(uint mob_type, vec3 pos, inout uint seed) {
+    switch (mob_type) {
+        case MOB_TYPE_ZOMBIE:
+            return create_zombie(pos, seed);
+        case MOB_TYPE_SKELETON:
+            return create_skeleton(pos, seed);
+        case MOB_TYPE_SPIDER:
+            return create_spider(pos, seed);
+        case MOB_TYPE_CREEPER:
+            return create_creeper(pos, seed);
+        default:
+            return create_zombie(pos, seed);
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint global_id = gl_GlobalInvocationID.x;
+
+    // Initialize shared memory
+    if (local_id == 0) {
+        s_spawn_count = 0;
+    }
+    barrier();
+
+    // Skip if peaceful difficulty
+    if (pc.difficulty < 0.5) {
+        return;
+    }
+
+    // Early exit if over candidate count
+    if (global_id >= candidate_count) {
+        return;
+    }
+
+    SpawnCandidate candidate = candidates[global_id];
+    uint seed = pc.random_seed ^ global_id ^ pc.tick;
+
+    // Select mob type
+    uint mob_type = select_mob_type(candidate.position, seed);
+
+    // Validate spawn
+    bool valid = validate_spawn_position(candidate.position, mob_type);
+
+    // Difficulty-based spawn rate
+    // Easy = 50% spawn rate, Normal = 75%, Hard = 100%
+    if (valid) {
+        float spawn_chance = 0.5 + (pc.difficulty - 1.0) * 0.25;
+        spawn_chance = clamp(spawn_chance, 0.25, 1.0);
+        if (random_float(seed) > spawn_chance) {
+            valid = false;
+        }
+    }
+
+    // Collect valid spawns
+    if (valid) {
+        uint idx = atomicAdd(s_spawn_count, 1);
+        if (idx < 64) {
+            s_valid_indices[idx] = global_id;
+        }
+    }
+
+    barrier();
+
+    // Write results (only first thread per workgroup)
+    if (local_id == 0) {
+        uint count = min(s_spawn_count, 64u);
+        uint base_idx = atomicAdd(spawn_count, count);
+
+        for (uint i = 0; i < count && (base_idx + i) < pc.max_spawns; i++) {
+            uint cand_idx = s_valid_indices[i];
+            SpawnCandidate c = candidates[cand_idx];
+
+            // Recalculate mob type for consistency
+            uint s = pc.random_seed ^ cand_idx ^ pc.tick;
+            uint mt = select_mob_type(c.position, s);
+
+            // Create the mob
+            MobState mob = create_mob(mt, c.position, s);
+
+            SpawnResult result;
+            result.mob = mob;
+            result.valid = 1;
+            result.spawn_index = cand_idx;
+            result._pad[0] = 0;
+            result._pad[1] = 0;
+
+            spawns[base_idx + i] = result;
+        }
+    }
+}

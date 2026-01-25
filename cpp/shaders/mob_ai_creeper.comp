@@ -1,0 +1,683 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const uint MOB_TYPE_CREEPER = 5;
+
+// AI states
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_STALK = 10;    // Silent approach
+const uint AI_STATE_FUSE = 11;     // Countdown to explosion
+const uint AI_STATE_EXPLODE = 12;  // Explosion this tick
+const uint AI_STATE_DEAD = 9;
+
+// Mob flags
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_IN_WATER = 1 << 1;
+const uint MOB_FLAG_IN_LAVA = 1 << 2;
+const uint MOB_FLAG_NO_AI = 1 << 3;
+const uint MOB_FLAG_CHARGED = 1 << 10;  // Lightning-struck creeper
+
+// Creeper-specific constants
+const float CREEPER_DETECTION_RANGE = 16.0;
+const float CREEPER_STALK_RANGE = 3.0;      // Start fuse when this close
+const float CREEPER_ABORT_RANGE = 7.0;      // Abort fuse if player escapes
+const float CREEPER_SPEED = 0.25;
+const float CREEPER_STALK_SPEED = 0.2;      // Slower when stalking (silent)
+const uint CREEPER_FUSE_TIME = 30;          // 1.5 seconds at 20 ticks/sec
+const float CREEPER_EXPLOSION_POWER = 3.0;  // vs TNT power 4
+const float CREEPER_EXPLOSION_RADIUS = 3.0;
+const float CREEPER_CHARGED_MULTIPLIER = 2.0;
+
+// Damage constants
+const float CREEPER_MIN_DAMAGE = 25.0;      // Damage at center
+const float CREEPER_MAX_DAMAGE = 49.0;      // Max damage (charged)
+const float DAMAGE_FALLOFF_RATE = 8.0;      // Damage decrease per block
+
+// Type data indices for creeper
+const uint TD_FUSE_TIMER = 0;
+const uint TD_IGNITED = 1;         // Forced ignition (flint and steel)
+const uint TD_SWELL_AMOUNT = 2;    // Animation state (float bits)
+const uint TD_WAS_CHARGED = 3;     // Struck by lightning
+const uint TD_LAST_PLAYER_DIST = 4; // Track distance for abort check
+
+// Block destruction resistance thresholds (higher = harder to destroy)
+const float WEAK_BLOCK_THRESHOLD = 3.0;     // Dirt, sand, wood planks
+const float MEDIUM_BLOCK_THRESHOLD = 6.0;   // Cobblestone, bricks
+const float STRONG_BLOCK_THRESHOLD = 18.0;  // Obsidian (creeper can't break)
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+};
+
+// Explosion request for CPU to process terrain destruction
+struct ExplosionRequest {
+    vec3 position;
+    float power;
+    float radius;
+    uint source_entity;
+    uint flags;  // bit 0: charged, bit 1: caused by player ignition
+};
+
+// Damage event for entities near explosion
+struct DamageEvent {
+    uint target_entity;
+    float damage;
+    vec3 knockback;
+    uint source_entity;
+};
+
+// Drop request for loot spawning
+struct DropRequest {
+    vec3 position;
+    uint item_id;     // 289 = gunpowder, 2256-2267 = music discs
+    uint count;
+    uint source_entity;
+    uint killer_type;  // 0 = generic, 1 = skeleton (music disc)
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer ExplosionBuffer {
+    uint explosion_count;
+    ExplosionRequest explosions[];
+};
+
+layout(set = 0, binding = 4) buffer DamageBuffer {
+    uint damage_event_count;
+    DamageEvent damage_events[];
+};
+
+layout(set = 0, binding = 5) buffer DropBuffer {
+    uint drop_count;
+    DropRequest drops[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+} pc;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+uint random_int(inout uint seed, uint max_val) {
+    return pcg_hash(seed) % max_val;
+}
+
+vec2 random_horizontal(inout uint seed) {
+    float angle = random_float(seed) * 6.28318530718;
+    return vec2(cos(angle), sin(angle));
+}
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+float horizontal_distance(vec3 a, vec3 b) {
+    vec2 d = a.xz - b.xz;
+    return length(d);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float angle_to(vec3 from, vec3 to) {
+    vec2 dir = normalize(to.xz - from.xz);
+    return atan(dir.x, dir.y);
+}
+
+// Block queries
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+bool is_walkable(vec3 pos) {
+    ivec3 block = world_to_block(pos);
+    return !is_solid(get_block_at(block)) &&
+           !is_solid(get_block_at(block + ivec3(0, 1, 0))) &&
+           is_solid(get_block_at(block + ivec3(0, -1, 0)));
+}
+
+// Get block blast resistance (simplified)
+float get_blast_resistance(uint block_id) {
+    // Air
+    if (block_id == 0) return 0.0;
+    // Weak: dirt, grass, sand, gravel, leaves, wood
+    if (block_id == 2 || block_id == 3 || block_id == 12 ||
+        block_id == 13 || block_id == 18 || block_id == 17 ||
+        block_id == 5) return 2.0;
+    // Medium: cobblestone, stone, bricks
+    if (block_id == 1 || block_id == 4 || block_id == 45) return 6.0;
+    // Strong: obsidian, bedrock (essentially indestructible)
+    if (block_id == 49 || block_id == 7) return 1200.0;
+    // Default for most blocks
+    return 5.0;
+}
+
+// Entity queries
+vec3 get_entity_position(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool entity_exists(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint find_nearest_entity(vec3 pos, float max_range, out float out_distance) {
+    uint nearest = 0xFFFFFFFF;
+    float nearest_dist = max_range * max_range;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist_sq = distance_squared(pos, entities[i].position);
+        if (dist_sq < nearest_dist) {
+            nearest_dist = dist_sq;
+            nearest = entities[i].entity_id;
+        }
+    }
+
+    out_distance = sqrt(nearest_dist);
+    return nearest;
+}
+
+// Pathfinding step (silent movement - no pathfind sounds)
+vec3 pathfind_step_silent(vec3 from, vec3 to, inout uint seed) {
+    vec3 dir = normalize_safe(to - from);
+    vec3 step = from + dir * 0.8;  // Slightly shorter steps for stealth
+
+    if (is_walkable(step)) {
+        return step;
+    }
+
+    // Try stepping up
+    vec3 step_up = step + vec3(0.0, 1.0, 0.0);
+    if (is_walkable(step_up)) {
+        return step_up;
+    }
+
+    // Random sidestep
+    vec2 offset = random_horizontal(seed) * 0.5;
+    vec3 alt_step = from + vec3(offset.x, 0.0, offset.y);
+    if (is_walkable(alt_step)) {
+        return alt_step;
+    }
+
+    return from;
+}
+
+// ============================================================================
+// Explosion Logic
+// ============================================================================
+
+void queue_explosion(vec3 pos, float power, float radius, uint source, bool charged) {
+    uint idx = atomicAdd(explosion_count, 1);
+    if (idx < 32) {  // Max explosions per frame
+        explosions[idx].position = pos;
+        explosions[idx].power = power;
+        explosions[idx].radius = radius;
+        explosions[idx].source_entity = source;
+        explosions[idx].flags = charged ? 1u : 0u;
+    }
+}
+
+void queue_damage(uint target, float damage, vec3 knockback, uint source) {
+    uint idx = atomicAdd(damage_event_count, 1);
+    if (idx < 256) {  // Max damage events per frame
+        damage_events[idx].target_entity = target;
+        damage_events[idx].damage = damage;
+        damage_events[idx].knockback = knockback;
+        damage_events[idx].source_entity = source;
+    }
+}
+
+void queue_drop(vec3 pos, uint item_id, uint count, uint source, uint killer_type) {
+    uint idx = atomicAdd(drop_count, 1);
+    if (idx < 128) {  // Max drops per frame
+        drops[idx].position = pos;
+        drops[idx].item_id = item_id;
+        drops[idx].count = count;
+        drops[idx].source_entity = source;
+        drops[idx].killer_type = killer_type;
+    }
+}
+
+// Calculate explosion damage with distance falloff
+float calculate_explosion_damage(float dist, float power, bool charged) {
+    float base_damage = CREEPER_MIN_DAMAGE;
+    if (charged) {
+        base_damage = CREEPER_MAX_DAMAGE;
+        power *= CREEPER_CHARGED_MULTIPLIER;
+    }
+
+    // Linear falloff from center
+    float falloff = max(0.0, 1.0 - dist / (power + 1.0));
+    return base_damage * falloff * falloff;  // Quadratic falloff
+}
+
+// Apply explosion to all nearby entities
+void apply_explosion_damage(vec3 explosion_pos, float power, bool charged, uint source_id) {
+    float radius = power + 1.0;
+    float max_dist_sq = radius * radius;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        vec3 target_pos = entities[i].position;
+        float dist_sq = distance_squared(explosion_pos, target_pos);
+
+        if (dist_sq < max_dist_sq && dist_sq > 0.01) {
+            float dist = sqrt(dist_sq);
+            float damage = calculate_explosion_damage(dist, power, charged);
+
+            if (damage > 0.5) {
+                // Knockback direction
+                vec3 knockback_dir = normalize_safe(target_pos - explosion_pos);
+                float knockback_strength = (1.0 - dist / radius) * power * 0.5;
+                vec3 knockback = knockback_dir * knockback_strength;
+
+                queue_damage(entities[i].entity_id, damage, knockback, source_id);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Creeper AI States
+// ============================================================================
+
+void creeper_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Reset swell animation
+    float current_swell = uintBitsToFloat(mob.type_data[TD_SWELL_AMOUNT]);
+    if (current_swell > 0.0) {
+        current_swell = max(0.0, current_swell - 0.1);
+        mob.type_data[TD_SWELL_AMOUNT] = floatBitsToUint(current_swell);
+    }
+
+    // Check for forced ignition (flint and steel)
+    if (mob.type_data[TD_IGNITED] != 0) {
+        mob.ai_state = AI_STATE_FUSE;
+        mob.type_data[TD_FUSE_TIMER] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Look for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, CREEPER_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_STALK;
+        mob.type_data[TD_LAST_PLAYER_DIST] = floatBitsToUint(dist);
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Random wander
+    if (mob.state_timer > 40 + uint(random_float(seed) * 80.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec2 offset = random_horizontal(seed) * 6.0;
+        mob.path_target = mob.position + vec3(offset.x, 0.0, offset.y);
+        mob.state_timer = 0;
+    }
+
+    // Slow to stop
+    mob.velocity.x *= 0.9;
+    mob.velocity.z *= 0.9;
+}
+
+void creeper_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, CREEPER_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_STALK;
+        mob.type_data[TD_LAST_PLAYER_DIST] = floatBitsToUint(dist);
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Move toward wander target
+    float target_dist = horizontal_distance(mob.position, mob.path_target);
+    if (target_dist < 1.0 || mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 dir = normalize_safe(mob.path_target - mob.position);
+    mob.velocity.x = dir.x * CREEPER_SPEED * 0.5;
+    mob.velocity.z = dir.z * CREEPER_SPEED * 0.5;
+    mob.yaw = angle_to(mob.position, mob.path_target);
+
+    // Jump over obstacles
+    ivec3 front = world_to_block(mob.position + normalize_safe(mob.velocity) * 0.5);
+    if (is_solid(get_block_at(front)) && (mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        mob.velocity.y = mob.jump_velocity;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+// Stalk: silently approach player
+void creeper_stalk(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Validate target
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Store distance for abort check
+    mob.type_data[TD_LAST_PLAYER_DIST] = floatBitsToUint(dist);
+
+    // Lost target (player escaped)
+    if (dist > CREEPER_DETECTION_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Close enough - start fuse!
+    if (dist <= CREEPER_STALK_RANGE) {
+        mob.ai_state = AI_STATE_FUSE;
+        mob.type_data[TD_FUSE_TIMER] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Silent approach (creepers don't make footstep sounds)
+    mob.path_target = pathfind_step_silent(mob.position, target_pos, seed);
+
+    vec3 dir = normalize_safe(mob.path_target - mob.position);
+    dir.y = 0.0;  // Horizontal movement
+
+    // Slower speed while stalking
+    mob.velocity.x = dir.x * CREEPER_STALK_SPEED;
+    mob.velocity.z = dir.z * CREEPER_STALK_SPEED;
+    mob.yaw = angle_to(mob.position, target_pos);
+
+    // Jump over obstacles (quietly)
+    ivec3 front = world_to_block(mob.position + normalize_safe(mob.velocity) * 0.5);
+    if (is_solid(get_block_at(front)) && (mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        mob.velocity.y = mob.jump_velocity;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+// Fuse: 1.5 second countdown with hissing
+void creeper_fuse(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_FUSE_TIMER]++;
+
+    uint fuse_timer = mob.type_data[TD_FUSE_TIMER];
+    bool forced_ignition = mob.type_data[TD_IGNITED] != 0;
+
+    // Swelling animation (0.0 to 1.0 over fuse time)
+    float swell = float(fuse_timer) / float(CREEPER_FUSE_TIME);
+    swell = clamp(swell, 0.0, 1.0);
+    mob.type_data[TD_SWELL_AMOUNT] = floatBitsToUint(swell);
+
+    // Stop moving during fuse
+    mob.velocity.x *= 0.8;
+    mob.velocity.z *= 0.8;
+
+    // Check abort condition (unless forced ignition)
+    if (!forced_ignition && entity_exists(mob.target_entity_id)) {
+        vec3 target_pos = get_entity_position(mob.target_entity_id);
+        float dist = distance(mob.position, target_pos);
+
+        // Player escaped beyond abort range
+        if (dist > CREEPER_ABORT_RANGE) {
+            mob.ai_state = AI_STATE_STALK;  // Go back to stalking
+            mob.type_data[TD_FUSE_TIMER] = 0;
+            mob.state_timer = 0;
+            return;
+        }
+
+        // Face target during fuse
+        mob.yaw = angle_to(mob.position, target_pos);
+    }
+
+    // EXPLODE!
+    if (fuse_timer >= CREEPER_FUSE_TIME) {
+        mob.ai_state = AI_STATE_EXPLODE;
+        mob.state_timer = 0;
+    }
+}
+
+// Explode: deal damage and destroy terrain
+void creeper_explode(inout MobState mob, inout uint seed) {
+    bool charged = (mob.flags & MOB_FLAG_CHARGED) != 0;
+    float power = CREEPER_EXPLOSION_POWER;
+    float radius = CREEPER_EXPLOSION_RADIUS;
+
+    if (charged) {
+        power *= CREEPER_CHARGED_MULTIPLIER;
+        radius *= CREEPER_CHARGED_MULTIPLIER;
+    }
+
+    // Queue explosion for CPU to process terrain destruction
+    queue_explosion(mob.position, power, radius, mob.target_entity_id, charged);
+
+    // Apply damage to nearby entities
+    apply_explosion_damage(mob.position, power, charged, mob.target_entity_id);
+
+    // Creeper dies
+    mob.health = 0.0;
+    mob.ai_state = AI_STATE_DEAD;
+}
+
+// Handle death drops
+void creeper_death(inout MobState mob, uint killer_type, inout uint seed) {
+    // 0-2 gunpowder (item ID 289)
+    uint gunpowder_count = random_int(seed, 3);  // 0, 1, or 2
+    if (gunpowder_count > 0) {
+        queue_drop(mob.position, 289, gunpowder_count, mob.target_entity_id, killer_type);
+    }
+
+    // Music disc if killed by skeleton arrow (killer_type == 1)
+    // Music discs are item IDs 2256-2267
+    if (killer_type == 1) {
+        uint disc_id = 2256 + random_int(seed, 12);  // Random disc
+        queue_drop(mob.position, disc_id, 1, mob.target_entity_id, killer_type);
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    // Only process creepers
+    if (mob.mob_type != MOB_TYPE_CREEPER) return;
+    if ((mob.flags & MOB_FLAG_NO_AI) != 0) return;
+
+    uint seed = mob.random_seed ^ pc.random_seed ^ idx;
+    float dt = pc.delta_time;
+
+    // Handle death
+    if (mob.ai_state == AI_STATE_DEAD) {
+        // Death drops already handled when health went to 0
+        mob.random_seed = seed;
+        mobs[idx] = mob;
+        return;
+    }
+
+    // Check for death (not from explosion - that's handled in explode state)
+    if (mob.health <= 0.0 && mob.ai_state != AI_STATE_EXPLODE) {
+        // Determine killer type (simplified - would need damage source tracking)
+        uint killer_type = 0;  // Generic
+        // In real implementation, check last damage source for skeleton arrow
+        creeper_death(mob, killer_type, seed);
+        mob.ai_state = AI_STATE_DEAD;
+        mob.random_seed = seed;
+        mobs[idx] = mob;
+        return;
+    }
+
+    // Timers
+    mob.hurt_time = max(mob.hurt_time - 1, 0);
+    mob.no_damage_time = max(mob.no_damage_time - 1, 0);
+    mob.ai_tick_cooldown = max(mob.ai_tick_cooldown - 1, 0);
+
+    // AI (runs every tick during fuse for precise timing)
+    bool in_fuse = (mob.ai_state == AI_STATE_FUSE);
+    if (mob.ai_tick_cooldown == 0 || in_fuse) {
+        if (!in_fuse) {
+            mob.ai_tick_cooldown = 2;
+        }
+
+        switch (mob.ai_state) {
+            case AI_STATE_IDLE:
+                creeper_idle(mob, seed);
+                break;
+            case AI_STATE_WANDER:
+                creeper_wander(mob, seed);
+                break;
+            case AI_STATE_STALK:
+                creeper_stalk(mob, seed);
+                break;
+            case AI_STATE_FUSE:
+                creeper_fuse(mob, seed);
+                break;
+            case AI_STATE_EXPLODE:
+                creeper_explode(mob, seed);
+                break;
+        }
+    }
+
+    // Physics (gravity and drag)
+    if ((mob.flags & MOB_FLAG_ON_GROUND) == 0) {
+        mob.velocity.y -= 0.08 * dt * 20.0;
+        mob.velocity.y = max(mob.velocity.y, -3.92);
+    }
+    mob.velocity *= 0.98;
+
+    // Apply velocity
+    mob.position += mob.velocity * dt * 20.0;
+
+    // Ground collision check (simplified)
+    ivec3 feet = world_to_block(mob.position - vec3(0.0, 0.01, 0.0));
+    if (is_solid(get_block_at(feet))) {
+        mob.flags |= MOB_FLAG_ON_GROUND;
+        mob.velocity.y = max(mob.velocity.y, 0.0);
+    } else {
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+
+    // Water/lava detection
+    uint block_at_pos = get_block_at(world_to_block(mob.position));
+    mob.flags = (mob.flags & ~MOB_FLAG_IN_WATER) | ((block_at_pos == 8 || block_at_pos == 9) ? MOB_FLAG_IN_WATER : 0);
+    mob.flags = (mob.flags & ~MOB_FLAG_IN_LAVA) | ((block_at_pos == 10 || block_at_pos == 11) ? MOB_FLAG_IN_LAVA : 0);
+
+    mob.random_seed = seed;
+    mobs[idx] = mob;
+}

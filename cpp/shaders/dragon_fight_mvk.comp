@@ -1,0 +1,950 @@
+#version 450
+
+// MoltenVK-compatible DRAGON FIGHT shader
+// Full combat mechanics for "Free The End" RL training
+// All bindings in single descriptor set for MoltenVK compatibility
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint stage;        // Simulation stage
+    uint num_envs;     // Parallel environments
+    uint tick;         // Current tick
+    uint random_seed;  // RNG seed
+} pc;
+
+// ============================================================================
+// CONSTANTS - Minecraft 1.8.9 accurate values
+// ============================================================================
+
+// Physics
+const float GRAVITY = -0.08;
+const float DRAG_AIR = 0.98;
+const float DRAG_GROUND = 0.6;
+const float WALK_SPEED = 0.1;
+const float SPRINT_MULT = 1.3;
+const float SNEAK_MULT = 0.3;
+const float JUMP_VEL = 0.42;
+const float PLAYER_WIDTH = 0.6;
+const float PLAYER_HEIGHT = 1.8;
+
+// Combat
+const float SWORD_DAMAGE = 7.0;       // Diamond sword
+const float HAND_DAMAGE = 1.0;
+const float BOW_DAMAGE = 9.0;         // Full charge
+const float KNOCKBACK_BASE = 0.4;
+const uint INVINCIBILITY_TICKS = 10;  // 0.5 seconds
+const uint PLAYER_ATTACK_COOLDOWN_TICKS = 10;
+const float CRIT_MULTIPLIER = 1.5;
+
+// Bed explosion mechanics (speedrun one-cycle)
+const float BED_EXPLOSION_POWER = 5.0;
+const float BED_EXPLOSION_RADIUS = 12.5;        // 2.5 * power
+const float BED_EXPLOSION_BASE_DAMAGE = 50.0;   // Base damage at center
+const float BED_HEAD_DAMAGE_MULT = 4.0;         // 4x damage to dragon head
+const float BED_SELF_DAMAGE_MIN = 8.0;          // Min self damage
+const float BED_PLACEMENT_REACH = 4.5;          // Max bed placement distance
+
+// Dragon
+const float DRAGON_MAX_HEALTH = 200.0;
+const float DRAGON_MELEE_DAMAGE = 10.0;
+const float DRAGON_CHARGE_DAMAGE = 5.0;
+const float DRAGON_BREATH_DAMAGE = 6.0;
+const float DRAGON_CIRCLE_RADIUS = 75.0;
+const float DRAGON_SPEED = 1.5;
+const float CRYSTAL_HEAL_RATE = 1.0;
+const uint NUM_CRYSTALS = 10;
+
+// End dimension
+const float END_SPAWN_X = 0.0;
+const float END_SPAWN_Y = 64.0;
+const float END_SPAWN_Z = 0.0;
+const float END_ISLAND_RADIUS = 100.0;
+const float PILLAR_RADIUS = 3.0;
+const float PILLAR_HEIGHT = 76.0;
+
+// Flags
+const uint FLAG_ON_GROUND = 1u;
+const uint FLAG_SPRINTING = 2u;
+const uint FLAG_SNEAKING = 4u;
+const uint FLAG_DEAD = 8u;
+const uint FLAG_WON = 16u;
+const uint FLAG_INVINCIBLE = 32u;
+
+// Dragon phases
+const uint DRAGON_CIRCLING = 0u;
+const uint DRAGON_STRAFING = 1u;
+const uint DRAGON_CHARGING = 2u;
+const uint DRAGON_LANDING = 3u;
+const uint DRAGON_PERCHING = 4u;
+const uint DRAGON_TAKING_OFF = 5u;
+const uint DRAGON_DEAD = 6u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint invincibility_timer;
+    uint attack_cooldown;
+    uint weapon_slot;  // 0=hand, 1=sword, 2=bow, 3=bed
+    float arrow_charge;
+    uint arrows;
+    uint beds;         // Bed count in inventory (speedrun loadout)
+    uint bed_placed;   // 1 if player has placed a bed (position stored separately)
+};
+
+struct Dragon {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    uint phase;
+    uint phase_timer;
+    uint target_pillar;
+    vec3 target_position;
+    float breath_timer;
+    uint perch_timer;
+    uint attack_cooldown;
+    uint flags;
+    float circle_angle;
+    uint reserved[3];
+};
+
+struct Crystal {
+    vec3 position;
+    float is_alive;  // 1.0 = alive, 0.0 = destroyed
+};
+
+struct InputState {
+    float movement_x;
+    float movement_y;
+    float movement_z;
+    float look_delta_x;
+    float look_delta_y;
+    uint action;        // 0=none, 1=attack, 2=use, 3=swap_weapon, 4=place_bed, 5=click_bed
+    uint action_data;
+    uint flags;         // bit0=jump, bit1=sprint, bit2=sneak
+};
+
+struct GameState {
+    uint tick_number;
+    uint game_flags;
+    uint random_seed;
+    float delta_time;
+    uint crystals_destroyed;
+    uint dragon_hits;
+    uint player_deaths;
+    float best_dragon_damage;
+};
+
+struct Observation {
+    // Player (16 floats)
+    float pos_x, pos_y, pos_z;
+    float vel_x, vel_y, vel_z;
+    float yaw, pitch;
+    float health, hunger;
+    float on_ground, attack_ready;
+    float weapon, arrows, arrow_charge;
+    float reserved0;
+    
+    // Dragon (16 floats)
+    float dragon_health;
+    float dragon_x, dragon_y, dragon_z;
+    float dragon_vel_x, dragon_vel_y, dragon_vel_z;
+    float dragon_yaw;
+    float dragon_phase;
+    float dragon_dist;
+    float dragon_dir_x, dragon_dir_z;
+    float can_hit_dragon;
+    float dragon_attacking;
+    float reserved1, reserved2;
+    
+    // Environment (16 floats)
+    float crystals_remaining;
+    float nearest_crystal_dist;
+    float nearest_crystal_dir_x, nearest_crystal_dir_z;
+    float nearest_crystal_y;
+    float portal_active;
+    float portal_dist;
+    float time_remaining;
+    float total_damage_dealt;
+    float reserved3, reserved4, reserved5;
+    float reserved6, reserved7, reserved8, reserved9;
+};
+
+// ============================================================================
+// BUFFERS - All in set 0 for MoltenVK
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) buffer InputBuffer {
+    InputState inputs[];
+};
+
+layout(set = 0, binding = 2) buffer DragonBuffer {
+    Dragon dragons[];
+};
+
+layout(set = 0, binding = 3) buffer CrystalBuffer {
+    Crystal crystals[];  // NUM_CRYSTALS per env
+};
+
+layout(set = 0, binding = 4) buffer GameStateBuffer {
+    GameState game_states[];
+};
+
+layout(set = 0, binding = 5) buffer ObservationBuffer {
+    Observation observations[];
+};
+
+layout(set = 0, binding = 6) buffer RewardBuffer {
+    float rewards[];
+};
+
+layout(set = 0, binding = 7) buffer DoneBuffer {
+    uint dones[];
+};
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+float rand_range(inout uint seed, float a, float b) {
+    return a + rand(seed) * (b - a);
+}
+
+vec3 rand_sphere(inout uint seed) {
+    float theta = rand(seed) * 6.283185;
+    float phi = acos(2.0 * rand(seed) - 1.0);
+    return vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+}
+
+float clamp01(float x) { return clamp(x, 0.0, 1.0); }
+
+// End island collision (simplified - cylindrical island)
+bool is_on_end_island(vec3 pos) {
+    float dist = length(vec2(pos.x, pos.z));
+    return dist < END_ISLAND_RADIUS && pos.y >= 0.0 && pos.y < 100.0;
+}
+
+float get_ground_height(vec3 pos) {
+    float dist = length(vec2(pos.x, pos.z));
+    if (dist > END_ISLAND_RADIUS) return -64.0;  // Void
+    
+    // Check if on pillar
+    for (int i = 0; i < 10; i++) {
+        float angle = float(i) * 0.628318;  // 2*PI/10
+        float pillar_dist = 40.0 + float(i % 3) * 15.0;
+        vec2 pillar_pos = vec2(cos(angle), sin(angle)) * pillar_dist;
+        if (length(pos.xz - pillar_pos) < PILLAR_RADIUS) {
+            return PILLAR_HEIGHT;
+        }
+    }
+    
+    return END_SPAWN_Y;  // Main island surface
+}
+
+vec3 get_pillar_position(uint idx) {
+    float angle = float(idx) * 0.628318;
+    float dist = 40.0 + float(idx % 3) * 15.0;
+    return vec3(cos(angle) * dist, PILLAR_HEIGHT + 1.0, sin(angle) * dist);
+}
+
+// ============================================================================
+// STAGE 0: Setup
+// ============================================================================
+
+void stage_setup(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    game_states[env_id].tick_number = pc.tick;
+    game_states[env_id].random_seed = hash(pc.random_seed ^ env_id ^ pc.tick);
+    rewards[env_id] = 0.0;
+}
+
+// ============================================================================
+// STAGE 1: Player Physics & Movement
+// ============================================================================
+
+void stage_player_physics(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    
+    // Skip if dead
+    if ((p.flags & FLAG_DEAD) != 0u) return;
+    
+    // Look - deltas are already in degrees (5, 7.5, 45, 30 etc from action decoder)
+    p.yaw = mod(p.yaw + inp.look_delta_x, 360.0);
+    p.pitch = clamp(p.pitch + inp.look_delta_y, -90.0, 90.0);
+    
+    // Movement vectors
+    float yaw_rad = radians(p.yaw);
+    vec3 forward = vec3(-sin(yaw_rad), 0.0, cos(yaw_rad));
+    vec3 right = vec3(cos(yaw_rad), 0.0, sin(yaw_rad));
+    
+    // Input to movement
+    vec3 move = forward * inp.movement_z + right * inp.movement_x;
+    
+    // Speed modifiers
+    float speed = WALK_SPEED;
+    bool sprint = (inp.flags & 2u) != 0u;
+    bool sneak = (inp.flags & 4u) != 0u;
+    bool on_ground = (p.flags & FLAG_ON_GROUND) != 0u;
+    
+    if (sprint && !sneak) {
+        speed *= SPRINT_MULT;
+        p.flags |= FLAG_SPRINTING;
+    } else {
+        p.flags &= ~FLAG_SPRINTING;
+    }
+    
+    if (sneak) {
+        speed *= SNEAK_MULT;
+        p.flags |= FLAG_SNEAKING;
+    } else {
+        p.flags &= ~FLAG_SNEAKING;
+    }
+    
+    // Apply movement
+    if (length(move) > 0.001) {
+        move = normalize(move) * speed;
+        p.velocity.x += move.x;
+        p.velocity.z += move.z;
+    }
+    
+    // Jump
+    bool jump = (inp.flags & 1u) != 0u;
+    if (jump && on_ground) {
+        p.velocity.y = JUMP_VEL;
+        p.flags &= ~FLAG_ON_GROUND;
+        if (sprint) p.exhaustion += 0.2;
+    }
+    
+    // Gravity
+    if (!on_ground) {
+        p.velocity.y += GRAVITY;
+    }
+    
+    // Drag
+    float drag = on_ground ? DRAG_GROUND : DRAG_AIR;
+    p.velocity.x *= drag;
+    p.velocity.z *= drag;
+    p.velocity.y *= DRAG_AIR;
+    
+    // Position update
+    p.position += p.velocity;
+    
+    // Ground collision
+    float ground = get_ground_height(p.position);
+    if (p.position.y < ground) {
+        p.position.y = ground;
+        p.velocity.y = 0.0;
+        p.flags |= FLAG_ON_GROUND;
+    } else if (p.position.y > ground + 0.1) {
+        p.flags &= ~FLAG_ON_GROUND;
+    }
+    
+    // Void death - kill if below the main island level or off the island
+    float dist_from_center = length(vec2(p.position.x, p.position.z));
+    if (p.position.y <= -60.0 || (dist_from_center > END_ISLAND_RADIUS && p.position.y < END_SPAWN_Y - 10.0)) {
+        p.health = 0.0;
+        p.flags |= FLAG_DEAD;
+        dones[env_id] = 1u;
+        rewards[env_id] -= 50.0;  // Heavy death penalty
+    }
+    
+    // Timers
+    if (p.invincibility_timer > 0u) p.invincibility_timer--;
+    // MC 1.8.9: No player attack cooldown (spam-click meta)
+    
+    // Bow charge
+    if (inp.action == 2u && p.arrows > 0u && p.weapon_slot == 2u) {
+        p.arrow_charge = min(p.arrow_charge + 0.05, 1.0);
+    }
+    
+    players[env_id] = p;
+}
+
+// ============================================================================
+// STAGE 2: Dragon AI
+// ============================================================================
+
+void stage_dragon_ai(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Dragon d = dragons[env_id];
+    Player p = players[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = gs.random_seed;
+    
+    // Skip if dragon dead
+    if (d.health <= 0.0 || d.phase == DRAGON_DEAD) return;
+    
+    // Crystal healing (disabled for testing)
+    // uint base_crystal = env_id * NUM_CRYSTALS;
+    // for (uint i = 0; i < NUM_CRYSTALS; i++) {
+    //     if (crystals[base_crystal + i].is_alive > 0.5) {
+    //         vec3 crystal_pos = crystals[base_crystal + i].position;
+    //         float dist = length(d.position - crystal_pos);
+    //         if (dist < 32.0) {
+    //             d.health = min(d.health + CRYSTAL_HEAL_RATE * 0.05, DRAGON_MAX_HEALTH);
+    //         }
+    //     }
+    // }
+    
+    // Phase-specific behavior
+    vec3 to_player = p.position - d.position;
+    float player_dist = length(to_player);
+    
+    d.phase_timer++;
+    
+    switch (d.phase) {
+        case DRAGON_CIRCLING: {
+            // Circle around (0, 70, 0)
+            d.circle_angle += 0.02;
+            d.target_position = vec3(
+                cos(d.circle_angle) * DRAGON_CIRCLE_RADIUS,
+                70.0 + sin(d.circle_angle * 2.0) * 15.0,
+                sin(d.circle_angle) * DRAGON_CIRCLE_RADIUS
+            );
+            
+            // Transition to charging if player is close
+            if (player_dist < 40.0 && rand(seed) < 0.02) {
+                d.phase = DRAGON_CHARGING;
+                d.phase_timer = 0u;
+                d.target_position = p.position;
+            }
+            
+            // Transition to perching - more often for training
+            // Original: only when no crystals. Now: also randomly after circling a while
+            bool all_crystals_destroyed = (gs.crystals_destroyed >= NUM_CRYSTALS);
+            bool random_perch = (d.phase_timer > 200u && rand(seed) < 0.005);  // ~1% per tick after 10 sec
+            
+            if (all_crystals_destroyed || random_perch) {
+                if (rand(seed) < 0.5) {  // 50% chance to try landing
+                    d.phase = DRAGON_LANDING;
+                    d.phase_timer = 0u;
+                    d.target_position = vec3(0.0, END_SPAWN_Y + 4.0, 0.0);
+                }
+            }
+            break;
+        }
+        
+        case DRAGON_CHARGING: {
+            // Dive toward player
+            d.target_position = p.position + vec3(0, 2, 0);
+            
+            // Hit player on contact
+            if (player_dist < 8.0 && d.attack_cooldown == 0u) {
+                // Damage handled in combat stage
+                d.attack_cooldown = 20u;
+            }
+            
+            // Return to circling after charge
+            if (d.phase_timer > 60u || player_dist < 5.0) {
+                d.phase = DRAGON_CIRCLING;
+                d.phase_timer = 0u;
+            }
+            break;
+        }
+        
+        case DRAGON_LANDING: {
+            // Move to center
+            d.target_position = vec3(0.0, END_SPAWN_Y + 4.0, 0.0);
+            
+            if (length(d.position - d.target_position) < 3.0) {
+                d.phase = DRAGON_PERCHING;
+                d.phase_timer = 0u;
+                d.perch_timer = 200u;  // 10 seconds
+            }
+            break;
+        }
+        
+        case DRAGON_PERCHING: {
+            // Stay on perch, breath attack
+            d.target_position = vec3(0.0, END_SPAWN_Y + 4.0, 0.0);
+            d.breath_timer += 1.0;
+            
+            // Breath damage handled in combat
+            
+            d.perch_timer--;
+            if (d.perch_timer == 0u) {
+                d.phase = DRAGON_TAKING_OFF;
+                d.phase_timer = 0u;
+                d.breath_timer = 0.0;
+            }
+            break;
+        }
+        
+        case DRAGON_TAKING_OFF: {
+            // Rise up
+            d.target_position = vec3(0.0, 90.0, 0.0);
+            
+            if (d.position.y > 80.0) {
+                d.phase = DRAGON_CIRCLING;
+                d.phase_timer = 0u;
+            }
+            break;
+        }
+        
+        default:
+            break;
+    }
+    
+    // Move toward target
+    vec3 to_target = d.target_position - d.position;
+    float dist = length(to_target);
+    if (dist > 0.5) {
+        float speed = (d.phase == DRAGON_CHARGING) ? DRAGON_SPEED * 2.0 : DRAGON_SPEED;
+        d.velocity = normalize(to_target) * speed;
+        d.yaw = degrees(atan(to_target.x, to_target.z));
+        d.pitch = degrees(atan(-to_target.y, length(to_target.xz)));
+    } else {
+        d.velocity = vec3(0);
+    }
+    
+    d.position += d.velocity;
+    
+    if (d.attack_cooldown > 0u) d.attack_cooldown--;
+    
+    dragons[env_id] = d;
+    game_states[env_id].random_seed = seed;
+}
+
+// ============================================================================
+// STAGE 3: Combat
+// ============================================================================
+
+void stage_combat(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    Dragon d = dragons[env_id];
+    InputState inp = inputs[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = gs.random_seed;
+    
+    if ((p.flags & FLAG_DEAD) != 0u || d.health <= 0.0) return;
+    
+    if (p.attack_cooldown > 0u) {
+        p.attack_cooldown--;
+    }
+
+    // ===== Player attacks =====
+    if (inp.action == 1u && p.attack_cooldown == 0u) {
+        p.attack_cooldown = PLAYER_ATTACK_COOLDOWN_TICKS;
+        
+        // Attack direction
+        vec3 look_dir = vec3(
+            -sin(radians(p.yaw)) * cos(radians(p.pitch)),
+            -sin(radians(p.pitch)),
+            cos(radians(p.yaw)) * cos(radians(p.pitch))
+        );
+        
+        // Check dragon hit (melee)
+        vec3 to_dragon = d.position - p.position;
+        float dragon_dist = length(to_dragon);
+        float reach = (p.weapon_slot == 1u) ? 4.5 : 3.5;  // Sword has longer reach (+0.5 for hitbox)
+        
+        bool can_hit = dragon_dist <= reach && 
+                       dot(normalize(to_dragon), look_dir) > 0.5;
+        
+        // Can only hit dragon when perching (vulnerable)
+        bool dragon_vulnerable = (d.phase == DRAGON_PERCHING);
+        
+        if (can_hit) {
+            float damage = (p.weapon_slot == 1u) ? SWORD_DAMAGE : HAND_DAMAGE;
+            
+            // Critical hit (falling + not on ground)
+            bool crit = p.velocity.y < -0.1 && (p.flags & FLAG_ON_GROUND) == 0u;
+            if (crit) {
+                damage *= CRIT_MULTIPLIER;
+                rewards[env_id] += 2.0;  // Crit bonus
+            }
+            
+            if (dragon_vulnerable) {
+                // Deal damage to dragon
+                d.health = max(0.0, d.health - damage);
+                gs.dragon_hits++;
+                gs.best_dragon_damage = max(gs.best_dragon_damage, damage);
+
+                // Reward for dragon damage
+                rewards[env_id] += damage * 2.0;  // Big reward
+
+                // Knockback dragon slightly
+                d.velocity += look_dir * 0.5;
+            } else {
+                // Bounced off (not vulnerable)
+                rewards[env_id] += 0.1;  // Small reward for trying
+            }
+        }
+        
+        // Check crystal hit
+        uint base_crystal = env_id * NUM_CRYSTALS;
+        for (uint i = 0; i < NUM_CRYSTALS; i++) {
+            Crystal c = crystals[base_crystal + i];
+            if (c.is_alive < 0.5) continue;
+            
+            vec3 to_crystal = c.position - p.position;
+            float crystal_dist = length(to_crystal);
+            
+            if (crystal_dist <= reach && dot(normalize(to_crystal), look_dir) > 0.3) {
+                // Destroy crystal
+                crystals[base_crystal + i].is_alive = 0.0;
+                gs.crystals_destroyed++;
+
+                // Big reward for destroying crystal
+                rewards[env_id] += 10.0;
+                break;
+            }
+        }
+    }
+    
+    // Bow attack
+    if (inp.action == 2u && p.weapon_slot == 2u && p.arrows > 0u && p.arrow_charge >= 1.0) {
+        vec3 arrow_dir = vec3(
+            -sin(radians(p.yaw)) * cos(radians(p.pitch)),
+            -sin(radians(p.pitch)),
+            cos(radians(p.yaw)) * cos(radians(p.pitch))
+        );
+        
+        // Simple raycast for arrow
+        vec3 arrow_pos = p.position + vec3(0, 1.6, 0);
+        for (int t = 0; t < 100; t++) {
+            arrow_pos += arrow_dir * 1.5;
+            
+            // Check dragon
+            if (length(arrow_pos - d.position) < 5.0) {
+                float damage = BOW_DAMAGE * p.arrow_charge;
+                d.health = max(0.0, d.health - damage);
+                gs.dragon_hits++;
+                rewards[env_id] += damage * 1.5;
+                break;
+            }
+            
+            // Check crystals
+            uint base_crystal = env_id * NUM_CRYSTALS;
+            for (uint i = 0; i < NUM_CRYSTALS; i++) {
+                Crystal c = crystals[base_crystal + i];
+                if (c.is_alive < 0.5) continue;
+                
+                if (length(arrow_pos - c.position) < 2.0) {
+                    crystals[base_crystal + i].is_alive = 0.0;
+                    gs.crystals_destroyed++;
+                    rewards[env_id] += 10.0;
+                    break;
+                }
+            }
+            
+            // Hit ground
+            if (arrow_pos.y < get_ground_height(arrow_pos)) break;
+        }
+        
+        p.arrows--;
+        p.arrow_charge = 0.0;
+    }
+    
+    // Weapon swap
+    if (inp.action == 3u) {
+        p.weapon_slot = (p.weapon_slot + 1u) % 3u;
+    }
+    
+    // ===== Dragon attacks player =====
+    vec3 to_player = p.position - d.position;
+    float player_dist = length(to_player);
+    
+    // Contact damage during charge
+    if (d.phase == DRAGON_CHARGING && player_dist < 6.0 &&
+        p.invincibility_timer == 0u && d.attack_cooldown == 0u) {
+        float damage = DRAGON_CHARGE_DAMAGE;
+        p.health = max(0.0, p.health - damage);
+        p.invincibility_timer = INVINCIBILITY_TICKS;
+
+        // Knockback - MC 1.8.9 formula from EntityLivingBase.attackEntityFrom
+        // d0 = attacker.posX - this.posX, d1 = attacker.posZ - this.posZ
+        float d0 = d.position.x - p.position.x;
+        float d1 = d.position.z - p.position.z;
+        float f = sqrt(d0 * d0 + d1 * d1);
+        float knockbackStrength = 1.0;  // Base knockback for charge
+
+        // Halve existing velocity
+        p.velocity.x /= 2.0;
+        p.velocity.z /= 2.0;
+        p.velocity.y /= 2.0;
+
+        // Apply horizontal knockback (push away from attacker)
+        if (f > 0.001) {
+            p.velocity.x -= (d0 / f) * knockbackStrength * KNOCKBACK_BASE;
+            p.velocity.z -= (d1 / f) * knockbackStrength * KNOCKBACK_BASE;
+        }
+
+        // Apply vertical knockback with cap
+        p.velocity.y += knockbackStrength * KNOCKBACK_BASE;
+        if (p.velocity.y > 0.4) {
+            p.velocity.y = 0.4;
+        }
+
+        rewards[env_id] -= 5.0;  // Damage penalty
+    }
+    
+    // Breath damage during perch
+    if (d.phase == DRAGON_PERCHING && d.breath_timer > 0.0) {
+        // Cone in front of dragon
+        vec3 dragon_forward = vec3(-sin(radians(d.yaw)), 0, cos(radians(d.yaw)));
+        if (player_dist < 15.0 && 
+            dot(normalize(to_player), dragon_forward) > 0.3 &&
+            p.invincibility_timer == 0u) {
+            
+            if (int(d.breath_timer) % 10 == 0) {
+                float damage = DRAGON_BREATH_DAMAGE;
+                p.health = max(0.0, p.health - damage);
+                p.invincibility_timer = INVINCIBILITY_TICKS / 2u;
+                rewards[env_id] -= 3.0;
+            }
+        }
+    }
+    
+    // Melee when close
+    if (player_dist < 4.0 && p.invincibility_timer == 0u && d.attack_cooldown == 0u) {
+        float damage = DRAGON_MELEE_DAMAGE;
+        p.health = max(0.0, p.health - damage);
+        p.invincibility_timer = INVINCIBILITY_TICKS;
+        d.attack_cooldown = 20u;
+
+        // Knockback - MC 1.8.9 formula from EntityLivingBase.attackEntityFrom
+        float d0 = d.position.x - p.position.x;
+        float d1 = d.position.z - p.position.z;
+        float f = sqrt(d0 * d0 + d1 * d1);
+        float knockbackStrength = 2.0;  // Stronger knockback for melee
+
+        // Halve existing velocity
+        p.velocity.x /= 2.0;
+        p.velocity.z /= 2.0;
+        p.velocity.y /= 2.0;
+
+        // Apply horizontal knockback (push away from attacker)
+        if (f > 0.001) {
+            p.velocity.x -= (d0 / f) * knockbackStrength * KNOCKBACK_BASE;
+            p.velocity.z -= (d1 / f) * knockbackStrength * KNOCKBACK_BASE;
+        }
+
+        // Apply vertical knockback with cap
+        p.velocity.y += knockbackStrength * KNOCKBACK_BASE;
+        if (p.velocity.y > 0.4) {
+            p.velocity.y = 0.4;
+        }
+
+        rewards[env_id] -= 8.0;
+    }
+    
+    // Player death
+    if (p.health <= 0.0) {
+        p.flags |= FLAG_DEAD;
+        gs.player_deaths++;
+        dones[env_id] = 1u;
+        rewards[env_id] -= 50.0;
+    }
+    
+    // Dragon death = WIN!
+    if (d.health <= 0.0) {
+        d.phase = DRAGON_DEAD;
+        p.flags |= FLAG_WON;
+        dones[env_id] = 1u;
+        rewards[env_id] += 1000.0;  // MASSIVE WIN REWARD
+    }
+    
+    players[env_id] = p;
+    dragons[env_id] = d;
+    game_states[env_id] = gs;
+    game_states[env_id].random_seed = seed;
+}
+
+// ============================================================================
+// STAGE 4: Environment Update
+// ============================================================================
+
+void stage_environment(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    GameState gs = game_states[env_id];
+    
+    // Hunger (simplified)
+    if (p.exhaustion >= 4.0) {
+        p.exhaustion -= 4.0;
+        if (p.saturation > 0.0) {
+            p.saturation = max(0.0, p.saturation - 1.0);
+        } else {
+            p.hunger = max(0.0, p.hunger - 1.0);
+        }
+    }
+    
+    // Regen
+    if (p.hunger >= 18.0 && p.health < 20.0) {
+        p.health = min(20.0, p.health + 0.025);
+        p.exhaustion += 0.05;
+    }
+    
+    // Starvation
+    if (p.hunger <= 0.0 && gs.tick_number % 80u == 0u) {
+        p.health = max(0.0, p.health - 1.0);
+    }
+    
+    // Time penalty (encourage speed)
+    rewards[env_id] -= 0.001;
+    
+    // Progress rewards
+    Dragon d = dragons[env_id];
+    float health_ratio = d.health / DRAGON_MAX_HEALTH;
+    float crystal_ratio = float(gs.crystals_destroyed) / float(NUM_CRYSTALS);
+    
+    // Small reward for being close to dragon when it's vulnerable
+    if (d.phase == DRAGON_PERCHING) {
+        float dist = length(p.position - d.position);
+        if (dist < 15.0) {
+            rewards[env_id] += 0.01;  // Encourage staying close
+        }
+    }
+    
+    // Reward for crystal progress
+    // (main reward is in combat, this is small shaping)
+    
+    players[env_id] = p;
+}
+
+// ============================================================================
+// STAGE 5: Observation Extraction
+// ============================================================================
+
+void stage_observations(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    Dragon d = dragons[env_id];
+    GameState gs = game_states[env_id];
+    
+    Observation obs;
+    
+    // Player state (normalized)
+    obs.pos_x = p.position.x / 100.0;
+    obs.pos_y = (p.position.y - 64.0) / 50.0;
+    obs.pos_z = p.position.z / 100.0;
+    obs.vel_x = p.velocity.x / 2.0;
+    obs.vel_y = p.velocity.y / 2.0;
+    obs.vel_z = p.velocity.z / 2.0;
+    obs.yaw = p.yaw / 360.0;
+    obs.pitch = (p.pitch + 90.0) / 180.0;
+    obs.health = p.health / 20.0;
+    obs.hunger = p.hunger / 20.0;
+    obs.on_ground = (p.flags & FLAG_ON_GROUND) != 0u ? 1.0 : 0.0;
+    obs.attack_ready = (p.attack_cooldown == 0u) ? 1.0 : 0.0;
+    obs.weapon = float(p.weapon_slot) / 2.0;
+    obs.arrows = float(p.arrows) / 64.0;
+    obs.arrow_charge = p.arrow_charge;
+    
+    // DEBUG: store inp.action in reserved0 to verify input is being read
+    InputState inp = inputs[env_id];
+    obs.reserved0 = float(inp.action);  // Should be 1.0 when attacking
+    obs.reserved1 = float(p.attack_cooldown) / float(PLAYER_ATTACK_COOLDOWN_TICKS);
+    obs.reserved2 = float(p.flags);  // Check if player is dead
+    
+    // Dragon state
+    vec3 to_dragon = d.position - p.position;
+    float dragon_dist = length(to_dragon);
+    
+    obs.dragon_health = d.health / DRAGON_MAX_HEALTH;
+    obs.dragon_x = d.position.x / 100.0;
+    obs.dragon_y = (d.position.y - 64.0) / 50.0;
+    obs.dragon_z = d.position.z / 100.0;
+    obs.dragon_vel_x = d.velocity.x / 2.0;
+    obs.dragon_vel_y = d.velocity.y / 2.0;
+    obs.dragon_vel_z = d.velocity.z / 2.0;
+    obs.dragon_yaw = d.yaw / 360.0;
+    obs.dragon_phase = float(d.phase) / 6.0;
+    obs.dragon_dist = clamp01(dragon_dist / 150.0);
+    obs.dragon_dir_x = dragon_dist > 0.1 ? to_dragon.x / dragon_dist : 0.0;
+    obs.dragon_dir_z = dragon_dist > 0.1 ? to_dragon.z / dragon_dist : 0.0;
+    obs.can_hit_dragon = (d.phase == DRAGON_PERCHING && dragon_dist < 5.0) ? 1.0 : 0.0;
+    obs.dragon_attacking = (d.phase == DRAGON_CHARGING || d.phase == DRAGON_PERCHING) ? 1.0 : 0.0;
+    
+    // Environment
+    uint crystals_alive = NUM_CRYSTALS - gs.crystals_destroyed;
+    obs.crystals_remaining = float(crystals_alive) / float(NUM_CRYSTALS);
+    
+    // Find nearest crystal
+    float nearest_dist = 1000.0;
+    vec3 nearest_dir = vec3(0);
+    float nearest_y = 0.0;
+    uint base_crystal = env_id * NUM_CRYSTALS;
+    for (uint i = 0; i < NUM_CRYSTALS; i++) {
+        Crystal c = crystals[base_crystal + i];
+        if (c.is_alive < 0.5) continue;
+        
+        vec3 to_crystal = c.position - p.position;
+        float dist = length(to_crystal);
+        if (dist < nearest_dist) {
+            nearest_dist = dist;
+            nearest_dir = to_crystal / dist;
+            nearest_y = c.position.y;
+        }
+    }
+    obs.nearest_crystal_dist = clamp01(nearest_dist / 100.0);
+    obs.nearest_crystal_dir_x = nearest_dir.x;
+    obs.nearest_crystal_dir_z = nearest_dir.z;
+    obs.nearest_crystal_y = (nearest_y - 64.0) / 50.0;
+    
+    obs.portal_active = d.health <= 0.0 ? 1.0 : 0.0;
+    obs.portal_dist = clamp01(length(p.position.xz) / 100.0);
+    obs.time_remaining = 1.0 - float(gs.tick_number) / 24000.0;  // 20 min limit
+    obs.total_damage_dealt = (DRAGON_MAX_HEALTH - d.health) / DRAGON_MAX_HEALTH;
+    
+    observations[env_id] = obs;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+    
+    switch (pc.stage) {
+        case 0u: stage_setup(env_id); break;
+        case 1u: stage_player_physics(env_id); break;
+        case 2u: stage_dragon_ai(env_id); break;
+        case 3u: stage_combat(env_id); break;
+        case 4u: stage_environment(env_id); break;
+        case 5u: stage_observations(env_id); break;
+    }
+}

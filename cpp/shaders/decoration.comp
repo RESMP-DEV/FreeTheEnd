@@ -1,0 +1,508 @@
+#version 450
+
+// Surface decoration compute shader
+// Places trees, grass, flowers, cactus, etc. on terrain after generation
+// Biome-aware decoration with structure buffers for complex multi-block features
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 16) in;
+
+// Chunk dimensions
+#define CHUNK_SIZE_X 16
+#define CHUNK_SIZE_Y 256
+#define CHUNK_SIZE_Z 16
+#define SEA_LEVEL 63
+
+// Block IDs (MC 1.8.9)
+#define AIR 0
+#define STONE 1
+#define GRASS_BLOCK 2
+#define DIRT 3
+#define SAND 12
+#define SNOW_LAYER 78
+#define OAK_LOG 17
+#define BIRCH_LOG 17      // metadata 2
+#define SPRUCE_LOG 17     // metadata 1
+#define OAK_LEAVES 18
+#define BIRCH_LEAVES 18   // metadata 2
+#define SPRUCE_LEAVES 18  // metadata 1
+#define TALLGRASS 31
+#define DEAD_BUSH 32
+#define DANDELION 37
+#define POPPY 38
+#define CACTUS 81
+#define SNOW_BLOCK 80
+
+// Biome types (MC 1.8.9)
+#define BIOME_OCEAN 0
+#define BIOME_PLAINS 1
+#define BIOME_DESERT 2
+#define BIOME_EXTREME_HILLS 3
+#define BIOME_FOREST 4
+#define BIOME_TAIGA 5
+#define BIOME_SWAMP 6
+#define BIOME_RIVER 7
+#define BIOME_FROZEN_OCEAN 10
+#define BIOME_FROZEN_RIVER 11
+#define BIOME_ICE_PLAINS 12
+#define BIOME_ICE_MOUNTAINS 13
+#define BIOME_BEACH 16
+#define BIOME_JUNGLE 21
+#define BIOME_SAVANNA 35
+
+// Structure types for queuing
+#define STRUCT_NONE 0
+#define STRUCT_OAK_TREE 1
+#define STRUCT_BIRCH_TREE 2
+#define STRUCT_SPRUCE_TREE 3
+#define STRUCT_CACTUS 4
+
+// Max structures per chunk
+#define MAX_STRUCTURES 32
+
+// Push constants
+layout(push_constant) uniform ChunkParams {
+    ivec3 chunk_pos;    // Chunk coordinates in world
+    int seed;           // World seed
+    uint pass;          // 0 = collect placement locations, 1 = place structures
+    uint flags;         // Generation flags
+} params;
+
+// Chunk voxel storage
+layout(std430, binding = 0) buffer ChunkData {
+    int voxels[];
+} chunk;
+
+// Heightmap from terrain generation
+layout(std430, binding = 1) readonly buffer HeightmapCache {
+    int heightmap[256];
+} height_cache;
+
+// Biome data (256 values for 16x16)
+layout(std430, binding = 2) readonly buffer BiomeData {
+    uint biomes[256];
+} biome_in;
+
+// Structure placement buffer - stores positions and types for multi-block structures
+struct StructurePlacement {
+    ivec3 pos;           // Base position (trunk bottom / cactus bottom)
+    uint type;           // STRUCT_* type
+    uint height;         // Tree height / cactus height
+    uint metadata;       // Log/leaf metadata variant
+    uint _pad;
+};
+
+layout(std430, binding = 3) buffer StructureBuffer {
+    uint count;
+    StructurePlacement structures[MAX_STRUCTURES];
+} structure_queue;
+
+// Permutation table for noise (shared with terrain gen)
+layout(std430, binding = 4) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+// Hash functions for deterministic randomness
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+uint hash2(uint x, uint y) {
+    return hash(x ^ (y * 0x9e3779b9u));
+}
+
+uint hash3(uint x, uint y, uint z) {
+    return hash(hash2(x, y) ^ (z * 0x517cc1b7u));
+}
+
+float rand(uint seed) {
+    return float(hash(seed)) / 4294967295.0;
+}
+
+// Voxel index into chunk buffer
+uint voxelIndex(int x, int y, int z) {
+    return uint(z) * CHUNK_SIZE_X * CHUNK_SIZE_Y + uint(y) * CHUNK_SIZE_X + uint(x);
+}
+
+// Heightmap index
+uint heightIndex(int x, int z) {
+    return uint(z) * CHUNK_SIZE_X + uint(x);
+}
+
+// Safe block setter (bounds checked)
+void setBlock(int x, int y, int z, int block_id) {
+    if (x < 0 || x >= CHUNK_SIZE_X || y < 0 || y >= CHUNK_SIZE_Y || z < 0 || z >= CHUNK_SIZE_Z) {
+        return;
+    }
+    chunk.voxels[voxelIndex(x, y, z)] = block_id;
+}
+
+// Safe block getter
+int getBlock(int x, int y, int z) {
+    if (x < 0 || x >= CHUNK_SIZE_X || y < 0 || y >= CHUNK_SIZE_Y || z < 0 || z >= CHUNK_SIZE_Z) {
+        return AIR;
+    }
+    return chunk.voxels[voxelIndex(x, y, z)];
+}
+
+// Check if surface is suitable for plant placement
+bool canPlacePlant(int x, int y, int z, uint biome) {
+    int surface = getBlock(x, y - 1, z);
+    int here = getBlock(x, y, z);
+
+    if (here != AIR) return false;
+
+    // Desert plants only on sand
+    if (biome == BIOME_DESERT) {
+        return surface == SAND;
+    }
+
+    // Regular plants on grass or dirt
+    return surface == GRASS_BLOCK || surface == DIRT;
+}
+
+// Check if location can support a tree
+bool canPlaceTree(int x, int y, int z, int height) {
+    // Check trunk area is clear
+    for (int dy = 0; dy < height + 3; dy++) {
+        if (getBlock(x, y + dy, z) != AIR) return false;
+    }
+
+    // Check there's space for canopy (3 block radius check at top)
+    int canopy_y = y + height - 1;
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dz = -2; dz <= 2; dz++) {
+            if (dx == 0 && dz == 0) continue;
+            int check_x = x + dx;
+            int check_z = z + dz;
+            if (check_x >= 0 && check_x < CHUNK_SIZE_X &&
+                check_z >= 0 && check_z < CHUNK_SIZE_Z) {
+                // Just check there's air for canopy
+                if (getBlock(check_x, canopy_y, check_z) != AIR) return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Place an oak/birch tree structure
+void placeTree(int base_x, int base_y, int base_z, int height, int log_id, int leaf_id) {
+    // Trunk
+    for (int dy = 0; dy < height; dy++) {
+        setBlock(base_x, base_y + dy, base_z, log_id);
+    }
+
+    // Canopy - spherical with corners removed
+    // Layer 1 (bottom): 5x5 minus corners
+    int leaf_y = base_y + height - 3;
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dz = -2; dz <= 2; dz++) {
+            // Remove corners
+            if (abs(dx) == 2 && abs(dz) == 2) continue;
+            int lx = base_x + dx;
+            int lz = base_z + dz;
+            if (lx >= 0 && lx < CHUNK_SIZE_X && lz >= 0 && lz < CHUNK_SIZE_Z) {
+                if (getBlock(lx, leaf_y, lz) == AIR) {
+                    setBlock(lx, leaf_y, lz, leaf_id);
+                }
+            }
+        }
+    }
+
+    // Layer 2: 5x5 minus corners
+    leaf_y++;
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dz = -2; dz <= 2; dz++) {
+            if (abs(dx) == 2 && abs(dz) == 2) continue;
+            int lx = base_x + dx;
+            int lz = base_z + dz;
+            if (lx >= 0 && lx < CHUNK_SIZE_X && lz >= 0 && lz < CHUNK_SIZE_Z) {
+                if (getBlock(lx, leaf_y, lz) == AIR) {
+                    setBlock(lx, leaf_y, lz, leaf_id);
+                }
+            }
+        }
+    }
+
+    // Layer 3 (top): 3x3 minus corners
+    leaf_y++;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dz = -1; dz <= 1; dz++) {
+            if (abs(dx) == 1 && abs(dz) == 1) continue;
+            int lx = base_x + dx;
+            int lz = base_z + dz;
+            if (lx >= 0 && lx < CHUNK_SIZE_X && lz >= 0 && lz < CHUNK_SIZE_Z) {
+                if (getBlock(lx, leaf_y, lz) == AIR) {
+                    setBlock(lx, leaf_y, lz, leaf_id);
+                }
+            }
+        }
+    }
+}
+
+// Place a spruce tree (conical shape)
+void placeSpruceTree(int base_x, int base_y, int base_z, int height) {
+    int log_id = SPRUCE_LOG;
+    int leaf_id = SPRUCE_LEAVES;
+
+    // Trunk
+    for (int dy = 0; dy < height; dy++) {
+        setBlock(base_x, base_y + dy, base_z, log_id);
+    }
+
+    // Conical canopy (wider at bottom, narrow at top)
+    int start_y = base_y + 2;
+    for (int layer = 0; layer < height - 2; layer++) {
+        int y = start_y + layer;
+        int radius = (height - 2 - layer) / 2;
+        if (radius < 1) radius = 1;
+
+        // Alternate between full and partial layers
+        bool full_layer = (layer % 2 == 0);
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                // Skip center (trunk)
+                if (dx == 0 && dz == 0 && layer < height - 3) continue;
+
+                // Create rough circular shape
+                if (dx*dx + dz*dz > radius*radius + 1) continue;
+
+                // Skip some corners for less boxy look
+                if (!full_layer && abs(dx) == radius && abs(dz) == radius) continue;
+
+                int lx = base_x + dx;
+                int lz = base_z + dz;
+                if (lx >= 0 && lx < CHUNK_SIZE_X && lz >= 0 && lz < CHUNK_SIZE_Z) {
+                    if (getBlock(lx, y, lz) == AIR) {
+                        setBlock(lx, y, lz, leaf_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Top leaf (above trunk)
+    setBlock(base_x, base_y + height, base_z, leaf_id);
+}
+
+// Place cactus
+void placeCactus(int base_x, int base_y, int base_z, int height) {
+    for (int dy = 0; dy < height; dy++) {
+        setBlock(base_x, base_y + dy, base_z, CACTUS);
+    }
+}
+
+// Queue a structure for placement (atomic add to structure buffer)
+void queueStructure(ivec3 pos, uint type, uint height, uint metadata) {
+    uint idx = atomicAdd(structure_queue.count, 1);
+    if (idx < MAX_STRUCTURES) {
+        structure_queue.structures[idx].pos = pos;
+        structure_queue.structures[idx].type = type;
+        structure_queue.structures[idx].height = height;
+        structure_queue.structures[idx].metadata = metadata;
+    }
+}
+
+// Get decoration density for biome
+void getBiomeDecorationParams(uint biome, out float grass_chance, out float flower_chance, out float tree_chance) {
+    switch (biome) {
+        case BIOME_PLAINS:
+            grass_chance = 0.08;    // ~10 per chunk
+            flower_chance = 0.02;   // ~3 per chunk
+            tree_chance = 0.002;    // ~0.5 per chunk
+            break;
+        case BIOME_FOREST:
+            grass_chance = 0.04;    // ~5 per chunk
+            flower_chance = 0.01;
+            tree_chance = 0.04;     // ~10 per chunk
+            break;
+        case BIOME_TAIGA:
+            grass_chance = 0.02;
+            flower_chance = 0.005;
+            tree_chance = 0.04;     // ~10 per chunk (spruce)
+            break;
+        case BIOME_DESERT:
+            grass_chance = 0.0;
+            flower_chance = 0.0;
+            tree_chance = 0.0;      // Cactus handled separately
+            break;
+        case BIOME_SWAMP:
+            grass_chance = 0.06;
+            flower_chance = 0.01;
+            tree_chance = 0.02;
+            break;
+        case BIOME_JUNGLE:
+            grass_chance = 0.10;
+            flower_chance = 0.03;
+            tree_chance = 0.08;
+            break;
+        case BIOME_SAVANNA:
+            grass_chance = 0.10;
+            flower_chance = 0.015;
+            tree_chance = 0.01;
+            break;
+        case BIOME_ICE_PLAINS:
+        case BIOME_ICE_MOUNTAINS:
+            grass_chance = 0.0;
+            flower_chance = 0.0;
+            tree_chance = 0.001;
+            break;
+        default:
+            grass_chance = 0.02;
+            flower_chance = 0.005;
+            tree_chance = 0.005;
+    }
+}
+
+// Pass 0: Collect decoration locations using noise-based placement
+void passCollect() {
+    int localX = int(gl_GlobalInvocationID.x);
+    int localZ = int(gl_GlobalInvocationID.z);
+
+    if (localX >= CHUNK_SIZE_X || localZ >= CHUNK_SIZE_Z) return;
+
+    // World position
+    int worldX = params.chunk_pos.x * CHUNK_SIZE_X + localX;
+    int worldZ = params.chunk_pos.z * CHUNK_SIZE_Z + localZ;
+
+    // Get surface height and biome
+    uint hIdx = heightIndex(localX, localZ);
+    int surfaceY = height_cache.heightmap[hIdx];
+    uint biome = biome_in.biomes[hIdx];
+
+    // Skip underwater surfaces
+    if (surfaceY < SEA_LEVEL) return;
+
+    // Deterministic random based on world position and seed
+    uint posHash = hash3(uint(worldX + 100000), uint(surfaceY), uint(worldZ + 100000));
+    uint rng = hash2(posHash, uint(params.seed));
+
+    // Get biome-specific parameters
+    float grass_chance, flower_chance, tree_chance;
+    getBiomeDecorationParams(biome, grass_chance, flower_chance, tree_chance);
+
+    int placeY = surfaceY + 1;
+
+    // Taiga: Add snow cover
+    if (biome == BIOME_TAIGA || biome == BIOME_ICE_PLAINS || biome == BIOME_ICE_MOUNTAINS) {
+        int surface_block = getBlock(localX, surfaceY, localZ);
+        if (surface_block == GRASS_BLOCK || surface_block == DIRT || surface_block == STONE) {
+            setBlock(localX, placeY, localZ, SNOW_LAYER);
+            placeY++;
+        }
+    }
+
+    // Desert decorations
+    if (biome == BIOME_DESERT) {
+        float cactus_roll = rand(rng);
+        rng = hash(rng);
+        float dead_bush_roll = rand(rng);
+        rng = hash(rng);
+
+        // Cactus: ~1 per chunk (1/256 chance per block)
+        if (cactus_roll < 0.004) {
+            if (canPlacePlant(localX, placeY, localZ, biome)) {
+                int cactus_height = 1 + int(rand(hash(rng)) * 3.0); // 1-3 blocks
+                queueStructure(ivec3(localX, placeY, localZ), STRUCT_CACTUS, uint(cactus_height), 0);
+            }
+        }
+        // Dead bush: ~2 per chunk
+        else if (dead_bush_roll < 0.008) {
+            if (canPlacePlant(localX, placeY, localZ, biome)) {
+                setBlock(localX, placeY, localZ, DEAD_BUSH);
+            }
+        }
+        return;
+    }
+
+    // Trees
+    float tree_roll = rand(rng);
+    rng = hash(rng);
+
+    if (tree_roll < tree_chance) {
+        if (canPlacePlant(localX, placeY, localZ, biome)) {
+            // Determine tree type and height
+            uint tree_type = STRUCT_OAK_TREE;
+            int height = 4 + int(rand(hash(rng)) * 3.0); // 4-6 blocks
+
+            if (biome == BIOME_TAIGA || biome == BIOME_ICE_PLAINS) {
+                tree_type = STRUCT_SPRUCE_TREE;
+                height = 6 + int(rand(hash(rng + 1)) * 4.0); // 6-9 blocks
+            } else if (biome == BIOME_FOREST) {
+                // 50% oak, 50% birch in forest
+                if (rand(hash(rng + 2)) < 0.5) {
+                    tree_type = STRUCT_BIRCH_TREE;
+                    height = 5 + int(rand(hash(rng + 3)) * 2.0); // 5-6 blocks
+                }
+            }
+
+            if (canPlaceTree(localX, placeY, localZ, height)) {
+                queueStructure(ivec3(localX, placeY, localZ), tree_type, uint(height), 0);
+            }
+        }
+        return; // If we tried to place a tree, don't place grass/flowers here
+    }
+
+    // Grass
+    float grass_roll = rand(rng);
+    rng = hash(rng);
+
+    if (grass_roll < grass_chance) {
+        if (canPlacePlant(localX, placeY, localZ, biome)) {
+            setBlock(localX, placeY, localZ, TALLGRASS);
+            return;
+        }
+    }
+
+    // Flowers
+    float flower_roll = rand(rng);
+    rng = hash(rng);
+
+    if (flower_roll < flower_chance) {
+        if (canPlacePlant(localX, placeY, localZ, biome)) {
+            // 50% dandelion, 50% poppy
+            int flower_type = rand(hash(rng)) < 0.5 ? DANDELION : POPPY;
+            setBlock(localX, placeY, localZ, flower_type);
+        }
+    }
+}
+
+// Pass 1: Place queued structures (run with single workgroup)
+void passPlaceStructures() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= structure_queue.count || idx >= MAX_STRUCTURES) return;
+
+    StructurePlacement s = structure_queue.structures[idx];
+
+    switch (s.type) {
+        case STRUCT_OAK_TREE:
+            placeTree(s.pos.x, s.pos.y, s.pos.z, int(s.height), OAK_LOG, OAK_LEAVES);
+            break;
+        case STRUCT_BIRCH_TREE:
+            placeTree(s.pos.x, s.pos.y, s.pos.z, int(s.height), BIRCH_LOG, BIRCH_LEAVES);
+            break;
+        case STRUCT_SPRUCE_TREE:
+            placeSpruceTree(s.pos.x, s.pos.y, s.pos.z, int(s.height));
+            break;
+        case STRUCT_CACTUS:
+            placeCactus(s.pos.x, s.pos.y, s.pos.z, int(s.height));
+            break;
+    }
+}
+
+void main() {
+    if (params.pass == 0) {
+        // Pass 0: Collect and place simple decorations, queue structures
+        passCollect();
+    } else {
+        // Pass 1: Place complex structures from queue
+        passPlaceStructures();
+    }
+}

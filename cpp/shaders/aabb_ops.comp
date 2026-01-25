@@ -1,0 +1,157 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 AABB compute shader
+// Y is vertical (up positive), entity position at feet center
+// AABB extends width/2 in X and Z, full height in Y from position
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Operation types (must match C++ AABBOperation enum)
+const uint OP_CONSTRUCT = 0;
+const uint OP_OFFSET = 1;
+const uint OP_EXPAND = 2;
+const uint OP_INTERSECTS = 3;
+const uint OP_INTERSECTION_VOLUME = 4;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint count;      // Number of AABBs to process
+    uint operation;  // Operation type
+    uint pairwise;   // 1 for pairwise ops (A[i] vs B[i]), 0 for all-vs-one
+    uint _pad;
+} pc;
+
+// Buffer bindings (std430 layout)
+
+// Binding 0: min coordinates (vec4 per AABB, xyz used, w padding)
+layout(std430, set = 0, binding = 0) buffer AABBMin {
+    vec4 aabbMin[];
+};
+
+// Binding 1: max coordinates (vec4 per AABB, xyz used, w padding)
+layout(std430, set = 0, binding = 1) buffer AABBMax {
+    vec4 aabbMax[];
+};
+
+// Binding 2: position + width for construction (x, y, z, width)
+layout(std430, set = 0, binding = 2) buffer PosDim {
+    vec4 posDim[];
+};
+
+// Binding 3: additional parameters (height, flags, pad, pad)
+layout(std430, set = 0, binding = 3) buffer Params {
+    vec4 params[];
+};
+
+// Binding 4: offset/expand deltas (dx, dy, dz, unused)
+layout(std430, set = 0, binding = 4) buffer Deltas {
+    vec4 deltas[];
+};
+
+// Binding 5: output results (float per operation)
+layout(std430, set = 0, binding = 5) buffer Results {
+    float results[];
+};
+
+// Binding 6-7: second AABB set for pairwise operations
+layout(std430, set = 0, binding = 6) buffer OtherMin {
+    vec4 otherMin[];
+};
+
+layout(std430, set = 0, binding = 7) buffer OtherMax {
+    vec4 otherMax[];
+};
+
+// Construct AABB from position (feet center) and dimensions
+// Minecraft convention: width extends equally in X and Z from center
+// Height extends upward from Y position (feet)
+void constructAABB(uint idx) {
+    vec4 pd = posDim[idx];
+    float x = pd.x;
+    float y = pd.y;
+    float z = pd.z;
+    float width = pd.w;
+    float height = params[idx].x;
+
+    float halfWidth = width * 0.5;
+
+    aabbMin[idx] = vec4(x - halfWidth, y, z - halfWidth, 0.0);
+    aabbMax[idx] = vec4(x + halfWidth, y + height, z + halfWidth, 0.0);
+}
+
+// Offset AABB by delta values
+void offsetAABB(uint idx) {
+    vec4 delta = deltas[idx];
+    aabbMin[idx].xyz += delta.xyz;
+    aabbMax[idx].xyz += delta.xyz;
+}
+
+// Expand AABB outward by delta values
+void expandAABB(uint idx) {
+    vec4 delta = deltas[idx];
+    aabbMin[idx].xyz -= delta.xyz;
+    aabbMax[idx].xyz += delta.xyz;
+}
+
+// Check if two AABBs intersect
+// Returns 1.0 if intersecting, 0.0 if not
+bool aabbIntersects(vec3 minA, vec3 maxA, vec3 minB, vec3 maxB) {
+    return maxA.x > minB.x && minA.x < maxB.x &&
+           maxA.y > minB.y && minA.y < maxB.y &&
+           maxA.z > minB.z && minA.z < maxB.z;
+}
+
+void intersectsAABB(uint idx) {
+    vec3 minA = aabbMin[idx].xyz;
+    vec3 maxA = aabbMax[idx].xyz;
+    vec3 minB = otherMin[idx].xyz;
+    vec3 maxB = otherMax[idx].xyz;
+
+    results[idx] = aabbIntersects(minA, maxA, minB, maxB) ? 1.0 : 0.0;
+}
+
+// Calculate intersection volume between two AABBs
+// Returns 0.0 if no intersection
+void intersectionVolumeAABB(uint idx) {
+    vec3 minA = aabbMin[idx].xyz;
+    vec3 maxA = aabbMax[idx].xyz;
+    vec3 minB = otherMin[idx].xyz;
+    vec3 maxB = otherMax[idx].xyz;
+
+    float overlapX = min(maxA.x, maxB.x) - max(minA.x, minB.x);
+    float overlapY = min(maxA.y, maxB.y) - max(minA.y, minB.y);
+    float overlapZ = min(maxA.z, maxB.z) - max(minA.z, minB.z);
+
+    if (overlapX <= 0.0 || overlapY <= 0.0 || overlapZ <= 0.0) {
+        results[idx] = 0.0;
+    } else {
+        results[idx] = overlapX * overlapY * overlapZ;
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= pc.count) {
+        return;
+    }
+
+    switch (pc.operation) {
+        case OP_CONSTRUCT:
+            constructAABB(idx);
+            break;
+        case OP_OFFSET:
+            offsetAABB(idx);
+            break;
+        case OP_EXPAND:
+            expandAABB(idx);
+            break;
+        case OP_INTERSECTS:
+            intersectsAABB(idx);
+            break;
+        case OP_INTERSECTION_VOLUME:
+            intersectionVolumeAABB(idx);
+            break;
+    }
+}

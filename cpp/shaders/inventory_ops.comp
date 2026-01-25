@@ -1,0 +1,386 @@
+#version 450
+
+/*
+ * inventory_ops.comp - Vulkan compute shader for Minecraft 1.8.9 inventory operations
+ *
+ * Inventory buffer layout per agent:
+ *   uint16 item_ids[46]   - Item ID (0 = empty slot)
+ *   uint8  counts[46]     - Stack count per slot
+ *   uint16 damage[46]     - Durability remaining
+ *   uint8  selected_slot  - Currently selected hotbar slot (0-8)
+ *
+ * Memory layout (tightly packed, 231 bytes per inventory):
+ *   Offset 0-91:    item_ids   (46 * 2 bytes)
+ *   Offset 92-137:  counts     (46 * 1 byte)
+ *   Offset 138-229: damage     (46 * 2 bytes)
+ *   Offset 230:     selected_slot (1 byte)
+ *   Padded to 232 bytes for alignment
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Operation codes
+const uint OP_NOP = 0;
+const uint OP_MOVE_ITEM = 1;      // Move item from src_slot to dst_slot
+const uint OP_SWAP_ITEMS = 2;     // Swap items between src_slot and dst_slot
+const uint OP_DROP_ITEM = 3;      // Drop count items from src_slot
+const uint OP_STACK_ITEMS = 4;    // Stack items from src to dst (combine stacks)
+const uint OP_SPLIT_STACK = 5;    // Split stack: move half_val from src to dst
+const uint OP_SELECT_SLOT = 6;    // Change selected hotbar slot
+const uint OP_FIND_ITEM = 7;      // Find first slot containing item_id
+const uint OP_COUNT_ITEMS = 8;    // Count total of item_id across inventory
+const uint OP_CLEAR_SLOT = 9;     // Clear a slot (set to empty)
+const uint OP_SET_ITEM = 10;      // Set slot to specific item/count/damage
+
+// Slot indices
+const uint CRAFT_OUTPUT = 0;      // Crafting output slot
+const uint CRAFT_INPUT_START = 1; // Crafting grid 2x2 (slots 1-4)
+const uint CRAFT_INPUT_END = 4;
+const uint ARMOR_START = 5;       // Armor slots (5-8: helmet, chest, legs, boots)
+const uint ARMOR_END = 8;
+const uint MAIN_INV_START = 9;    // Main inventory (9-35)
+const uint MAIN_INV_END = 35;
+const uint HOTBAR_START = 36;     // Hotbar (36-44)
+const uint HOTBAR_END = 44;
+const uint OFFHAND = 45;          // Offhand slot (1.9+ but included for layout)
+
+const uint INV_SIZE = 46;
+const uint INV_STRIDE = 232;      // Bytes per inventory (padded)
+
+// Max stack sizes by item type category
+const uint STACK_SIZE_DEFAULT = 64;
+const uint STACK_SIZE_TOOLS = 1;
+const uint STACK_SIZE_16 = 16;    // Ender pearls, eggs, etc.
+
+// Inventory buffer (SSBO)
+layout(set = 0, binding = 0) buffer InventoryBuffer {
+    uint data[];  // Packed inventory data for all agents
+} inventories;
+
+// Operation requests
+layout(set = 0, binding = 1) buffer OperationBuffer {
+    uint operations[];  // Packed operation requests
+} ops;
+
+// Operation results
+layout(set = 0, binding = 2) buffer ResultBuffer {
+    uint results[];  // Success/failure and output values
+} results;
+
+// Item metadata (max stack sizes, categories)
+layout(set = 0, binding = 3) readonly buffer ItemMetadata {
+    uint max_stack_sizes[];  // Max stack size per item_id
+} item_meta;
+
+// Push constants for dispatch configuration
+layout(push_constant) uniform PushConstants {
+    uint num_agents;
+    uint num_operations;
+} push;
+
+// Helper functions for packed data access
+uint getInventoryOffset(uint agent_id) {
+    return agent_id * (INV_STRIDE / 4);  // Convert to uint offset
+}
+
+uint readItemId(uint base_offset, uint slot) {
+    uint word_offset = base_offset + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return uint((slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16));
+}
+
+void writeItemId(uint base_offset, uint slot, uint item_id) {
+    uint word_offset = base_offset + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | uint(item_id);
+    } else {
+        word = (word & 0x0000FFFF) | (uint(item_id) << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+uint readCount(uint base_offset, uint slot) {
+    uint count_base = base_offset + 23;  // 92 bytes / 4 = 23 uints
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    return uint((word >> shift) & 0xFF);
+}
+
+void writeCount(uint base_offset, uint slot, uint count) {
+    uint count_base = base_offset + 23;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    word = (word & ~(0xFF << shift)) | (uint(count) << shift);
+    inventories.data[word_offset] = word;
+}
+
+uint readDamage(uint base_offset, uint slot) {
+    uint damage_base = base_offset + 35;  // 138 bytes / 4 = 34.5, round to 35
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return uint((slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16));
+}
+
+void writeDamage(uint base_offset, uint slot, uint damage) {
+    uint damage_base = base_offset + 35;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | uint(damage);
+    } else {
+        word = (word & 0x0000FFFF) | (uint(damage) << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+uint readSelectedSlot(uint base_offset) {
+    uint word_offset = base_offset + 57;  // 230 bytes / 4 = 57.5
+    uint word = inventories.data[word_offset];
+    return uint((word >> 16) & 0xFF);  // Byte 230 within the word
+}
+
+void writeSelectedSlot(uint base_offset, uint slot) {
+    uint word_offset = base_offset + 57;
+    uint word = inventories.data[word_offset];
+    word = (word & 0xFF00FFFF) | (uint(slot) << 16);
+    inventories.data[word_offset] = word;
+}
+
+uint getMaxStackSize(uint item_id) {
+    if (item_id == 0) return 0;
+    if (item_id < item_meta.max_stack_sizes.length()) {
+        return item_meta.max_stack_sizes[item_id];
+    }
+    return STACK_SIZE_DEFAULT;
+}
+
+bool isValidSlot(uint slot) {
+    return slot < INV_SIZE;
+}
+
+bool isEmptySlot(uint base_offset, uint slot) {
+    return readItemId(base_offset, slot) == 0;
+}
+
+// Clear a slot to empty state
+void clearSlot(uint base_offset, uint slot) {
+    writeItemId(base_offset, slot, 0);
+    writeCount(base_offset, slot, 0);
+    writeDamage(base_offset, slot, 0);
+}
+
+// Copy slot data from src to dst
+void copySlot(uint base_offset, uint src, uint dst) {
+    writeItemId(base_offset, dst, readItemId(base_offset, src));
+    writeCount(base_offset, dst, readCount(base_offset, src));
+    writeDamage(base_offset, dst, readDamage(base_offset, src));
+}
+
+// Operation implementations
+uint opMoveItem(uint base_offset, uint src_slot, uint dst_slot) {
+    if (!isValidSlot(src_slot) || !isValidSlot(dst_slot)) return 0;
+    if (isEmptySlot(base_offset, src_slot)) return 0;
+    if (!isEmptySlot(base_offset, dst_slot)) return 0;
+
+    copySlot(base_offset, src_slot, dst_slot);
+    clearSlot(base_offset, src_slot);
+    return 1;
+}
+
+uint opSwapItems(uint base_offset, uint slot_a, uint slot_b) {
+    if (!isValidSlot(slot_a) || !isValidSlot(slot_b)) return 0;
+
+    uint temp_id = readItemId(base_offset, slot_a);
+    uint temp_count = readCount(base_offset, slot_a);
+    uint temp_damage = readDamage(base_offset, slot_a);
+
+    copySlot(base_offset, slot_b, slot_a);
+
+    writeItemId(base_offset, slot_b, temp_id);
+    writeCount(base_offset, slot_b, temp_count);
+    writeDamage(base_offset, slot_b, temp_damage);
+
+    return 1;
+}
+
+uint opDropItem(uint base_offset, uint slot, uint count) {
+    if (!isValidSlot(slot)) return 0;
+    if (isEmptySlot(base_offset, slot)) return 0;
+
+    uint current = uint(readCount(base_offset, slot));
+    if (count >= current) {
+        clearSlot(base_offset, slot);
+        return current;
+    } else {
+        writeCount(base_offset, slot, uint(current - count));
+        return count;
+    }
+}
+
+uint opStackItems(uint base_offset, uint src_slot, uint dst_slot) {
+    if (!isValidSlot(src_slot) || !isValidSlot(dst_slot)) return 0;
+    if (isEmptySlot(base_offset, src_slot)) return 0;
+
+    uint src_id = readItemId(base_offset, src_slot);
+    uint dst_id = readItemId(base_offset, dst_slot);
+
+    // If dst is empty, just move
+    if (dst_id == 0) {
+        return opMoveItem(base_offset, src_slot, dst_slot);
+    }
+
+    // Items must match to stack
+    if (src_id != dst_id) return 0;
+
+    // Damage must also match for stacking
+    if (readDamage(base_offset, src_slot) != readDamage(base_offset, dst_slot)) return 0;
+
+    uint max_stack = getMaxStackSize(dst_id);
+    uint src_count = uint(readCount(base_offset, src_slot));
+    uint dst_count = uint(readCount(base_offset, dst_slot));
+
+    uint space = max_stack - dst_count;
+    uint to_move = min(src_count, space);
+
+    if (to_move == 0) return 0;
+
+    writeCount(base_offset, dst_slot, uint(dst_count + to_move));
+
+    if (to_move == src_count) {
+        clearSlot(base_offset, src_slot);
+    } else {
+        writeCount(base_offset, src_slot, uint(src_count - to_move));
+    }
+
+    return to_move;
+}
+
+uint opSplitStack(uint base_offset, uint src_slot, uint dst_slot) {
+    if (!isValidSlot(src_slot) || !isValidSlot(dst_slot)) return 0;
+    if (isEmptySlot(base_offset, src_slot)) return 0;
+    if (!isEmptySlot(base_offset, dst_slot)) return 0;
+
+    uint count = uint(readCount(base_offset, src_slot));
+    if (count < 2) return 0;
+
+    uint half_val = count / 2;
+
+    writeItemId(base_offset, dst_slot, readItemId(base_offset, src_slot));
+    writeCount(base_offset, dst_slot, uint(half_val));
+    writeDamage(base_offset, dst_slot, readDamage(base_offset, src_slot));
+
+    writeCount(base_offset, src_slot, uint(count - half_val));
+
+    return half_val;
+}
+
+uint opSelectSlot(uint base_offset, uint slot) {
+    if (slot > 8) return 0;  // Hotbar is 0-8
+    writeSelectedSlot(base_offset, uint(slot));
+    return 1;
+}
+
+uint opFindItem(uint base_offset, uint item_id) {
+    for (uint i = 0; i < INV_SIZE; i++) {
+        if (readItemId(base_offset, i) == item_id) {
+            return i + 1;  // Return 1-indexed so 0 = not found
+        }
+    }
+    return 0;
+}
+
+uint opCountItems(uint base_offset, uint item_id) {
+    uint total = 0;
+    for (uint i = 0; i < INV_SIZE; i++) {
+        if (readItemId(base_offset, i) == item_id) {
+            total += uint(readCount(base_offset, i));
+        }
+    }
+    return total;
+}
+
+uint opClearSlot(uint base_offset, uint slot) {
+    if (!isValidSlot(slot)) return 0;
+    clearSlot(base_offset, slot);
+    return 1;
+}
+
+uint opSetItem(uint base_offset, uint slot, uint item_id, uint count, uint damage) {
+    if (!isValidSlot(slot)) return 0;
+    writeItemId(base_offset, slot, item_id);
+    writeCount(base_offset, slot, count);
+    writeDamage(base_offset, slot, damage);
+    return 1;
+}
+
+void main() {
+    uint op_idx = gl_GlobalInvocationID.x;
+
+    if (op_idx >= push.num_operations) return;
+
+    // Operation format (4 uints = 16 bytes):
+    //   [0]: agent_id
+    //   [1]: opcode | (arg0 << 8) | (arg1 << 16) | (arg2 << 24)
+    //   [2]: arg3 (extended arg, e.g., item_id for SET_ITEM)
+    //   [3]: arg4 (extended arg, e.g., damage for SET_ITEM)
+
+    uint base = op_idx * 4;
+    uint agent_id = ops.operations[base];
+    uint packed_op = ops.operations[base + 1];
+    uint arg3 = ops.operations[base + 2];
+    uint arg4 = ops.operations[base + 3];
+
+    uint opcode = packed_op & 0xFF;
+    uint arg0 = (packed_op >> 8) & 0xFF;
+    uint arg1 = (packed_op >> 16) & 0xFF;
+    uint arg2 = (packed_op >> 24) & 0xFF;
+
+    if (agent_id >= push.num_agents) {
+        results.results[op_idx] = 0;
+        return;
+    }
+
+    uint inv_offset = getInventoryOffset(agent_id);
+    uint result = 0;
+
+    switch (opcode) {
+        case OP_NOP:
+            result = 1;
+            break;
+        case OP_MOVE_ITEM:
+            result = opMoveItem(inv_offset, arg0, arg1);
+            break;
+        case OP_SWAP_ITEMS:
+            result = opSwapItems(inv_offset, arg0, arg1);
+            break;
+        case OP_DROP_ITEM:
+            result = opDropItem(inv_offset, arg0, arg1);
+            break;
+        case OP_STACK_ITEMS:
+            result = opStackItems(inv_offset, arg0, arg1);
+            break;
+        case OP_SPLIT_STACK:
+            result = opSplitStack(inv_offset, arg0, arg1);
+            break;
+        case OP_SELECT_SLOT:
+            result = opSelectSlot(inv_offset, arg0);
+            break;
+        case OP_FIND_ITEM:
+            result = opFindItem(inv_offset, uint(arg3));
+            break;
+        case OP_COUNT_ITEMS:
+            result = opCountItems(inv_offset, uint(arg3));
+            break;
+        case OP_CLEAR_SLOT:
+            result = opClearSlot(inv_offset, arg0);
+            break;
+        case OP_SET_ITEM:
+            result = opSetItem(inv_offset, arg0, uint(arg3), uint(arg1), uint(arg4));
+            break;
+    }
+
+    results.results[op_idx] = result;
+}

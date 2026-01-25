@@ -1,0 +1,240 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 Eye of Ender Physics Shader
+// Simulates eye of ender flight toward strongholds
+//
+// Eye behavior (1.8.9):
+// - Thrown by player, flies toward nearest stronghold
+// - Rises initially, then floats toward target
+// - After ~40 ticks, drops to ground
+// - 20% chance to shatter, otherwise can be picked up
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Physics constants
+const float EYE_HORIZONTAL_SPEED = 0.2;
+const float EYE_INITIAL_UPWARD_SPEED = 0.25;
+const float EYE_GRAVITY = 0.03;
+const float EYE_DRAG = 0.99;
+const uint EYE_MAX_FLIGHT_TICKS = 40;
+
+// PI for angle calculations
+const float PI = 3.14159265359;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint eyeCount;        // Number of is_active eyes
+    float deltaTime;      // Time step (should be 0.05 for 20 TPS)
+    uint currentTick;     // Current game tick
+    uint _pad;
+} pc;
+
+// Eye of Ender state buffer
+// Layout per eye (48 bytes, 3x vec4):
+// vec4(x, y, z, 0)             - position
+// vec4(vx, vy, vz, 0)          - velocity
+// vec4(targetX, targetZ, targetDist, flags)  - target info
+//   flags: active(u8) | willShatter(u8) | ticksFlying(u8) | pad(u8)
+layout(std430, set = 0, binding = 0) buffer EyeState {
+    vec4 eyeData[];
+};
+
+// Stronghold positions (read-only)
+// vec4(x, z, portalX, portalZ) per stronghold
+// Max 128 strongholds is plenty for any MC world
+layout(std430, set = 0, binding = 1) readonly buffer StrongholdPositions {
+    vec4 strongholds[128];  // Positions (fixed size to allow indexing)
+};
+
+// Stronghold metadata (separate buffer)
+layout(std430, set = 0, binding = 4) readonly buffer StrongholdMeta {
+    uvec4 strongholdMeta[128];  // Metadata
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer StrongholdCount {
+    uint strongholdCount;
+};
+
+// Eye events output (drop, shatter, pickup-ready)
+// uvec4(eyeIdx, eventType, x_bits, y_bits), uvec4(z_bits, tick, pad, pad)
+layout(std430, set = 0, binding = 3) writeonly buffer EyeEvents {
+    uvec4 events[];
+};
+
+layout(std430, set = 0, binding = 4) buffer EventCount {
+    uint eventCount;
+};
+
+// Event types
+const uint EVENT_EYE_DROPPED = 0;
+const uint EVENT_EYE_SHATTERED = 1;
+const uint EVENT_EYE_LANDED = 2;
+
+// Read eye state
+void readEyeState(uint idx, out vec3 pos, out vec3 vel,
+                  out float targetX, out float targetZ, out float targetDist,
+                  out bool isActive, out bool willShatter, out uint ticksFlying) {
+    vec4 d0 = eyeData[idx * 3];
+    vec4 d1 = eyeData[idx * 3 + 1];
+    vec4 d2 = eyeData[idx * 3 + 2];
+
+    pos = d0.xyz;
+    vel = d1.xyz;
+    targetX = d2.x;
+    targetZ = d2.y;
+    targetDist = d2.z;
+
+    uint flags = floatBitsToUint(d2.w);
+    isActive = (flags & 0xFFu) != 0u;
+    willShatter = ((flags >> 8) & 0xFFu) != 0u;
+    ticksFlying = (flags >> 16) & 0xFFu;
+}
+
+// Write eye state
+void writeEyeState(uint idx, vec3 pos, vec3 vel,
+                   float targetX, float targetZ, float targetDist,
+                   bool is_active, bool willShatter, uint ticksFlying) {
+    eyeData[idx * 3] = vec4(pos, 0.0);
+    eyeData[idx * 3 + 1] = vec4(vel, 0.0);
+
+    uint flags = (is_active ? 1u : 0u) |
+                 (willShatter ? 0x100u : 0u) |
+                 ((ticksFlying & 0xFFu) << 16);
+
+    eyeData[idx * 3 + 2] = vec4(targetX, targetZ, targetDist, uintBitsToFloat(flags));
+}
+
+// Write eye event
+void writeEyeEvent(uint eyeIdx, uint eventType, vec3 pos) {
+    uint eventIdx = atomicAdd(eventCount, 1u);
+    uint maxEvents = 256u;
+
+    if (eventIdx < maxEvents) {
+        events[eventIdx * 2] = uvec4(eyeIdx, eventType, floatBitsToUint(pos.x), floatBitsToUint(pos.y));
+        events[eventIdx * 2 + 1] = uvec4(floatBitsToUint(pos.z), pc.currentTick, 0u, 0u);
+    }
+}
+
+// Find nearest stronghold to a position
+// Returns distance and sets targetX/targetZ
+float findNearestStronghold(vec3 pos, out float targetX, out float targetZ) {
+    float minDistSq = 1e30;
+    targetX = 0.0;
+    targetZ = 0.0;
+
+    for (uint i = 0; i < strongholdCount; i++) {
+        vec4 sh = strongholds[i];
+        float dx = sh.x - pos.x;
+        float dz = sh.y - pos.z;  // sh.y is z coordinate
+        float distSq = dx * dx + dz * dz;
+
+        if (distSq < minDistSq) {
+            minDistSq = distSq;
+            targetX = sh.x;
+            targetZ = sh.y;
+        }
+    }
+
+    return sqrt(minDistSq);
+}
+
+// Calculate direction to target
+vec2 getDirectionToTarget(vec3 pos, float targetX, float targetZ) {
+    float dx = targetX - pos.x;
+    float dz = targetZ - pos.z;
+    float dist = sqrt(dx * dx + dz * dz);
+
+    if (dist < 0.001) {
+        return vec2(0.0, 0.0);
+    }
+
+    return vec2(dx / dist, dz / dist);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.eyeCount) {
+        return;
+    }
+
+    // Read current state
+    vec3 pos, vel;
+    float targetX, targetZ, targetDist;
+    bool eye_active, willShatter;
+    uint ticksFlying;
+
+    readEyeState(idx, pos, vel, targetX, targetZ, targetDist, eye_active, willShatter, ticksFlying);
+
+    if (!eye_active) {
+        return;  // Eye is not active
+    }
+
+    // Update tick counter
+    ticksFlying++;
+
+    // Phase 1: Rising (first ~10 ticks)
+    // Phase 2: Level flight toward target (~10-40 ticks)
+    // Phase 3: Falling (after 40 ticks)
+
+    if (ticksFlying <= 10u) {
+        // Rising phase: maintain upward velocity, start horizontal movement
+        vel.y = EYE_INITIAL_UPWARD_SPEED;
+
+        // Get direction to stronghold
+        vec2 dir = getDirectionToTarget(pos, targetX, targetZ);
+        vel.x = dir.x * EYE_HORIZONTAL_SPEED;
+        vel.z = dir.y * EYE_HORIZONTAL_SPEED;
+    } else if (ticksFlying <= EYE_MAX_FLIGHT_TICKS) {
+        // Level flight phase
+        // Gradually reduce upward velocity
+        vel.y *= 0.9;
+
+        // Apply drag to horizontal
+        vel.x *= EYE_DRAG;
+        vel.z *= EYE_DRAG;
+
+        // Continue toward target
+        vec2 dir = getDirectionToTarget(pos, targetX, targetZ);
+        float currentSpeed = length(vel.xz);
+        float targetSpeed = EYE_HORIZONTAL_SPEED * 0.8;
+
+        if (currentSpeed < targetSpeed) {
+            vel.x += dir.x * 0.01;
+            vel.z += dir.y * 0.01;
+        }
+    } else {
+        // Falling phase
+        vel.y -= EYE_GRAVITY;
+        vel.x *= EYE_DRAG;
+        vel.z *= EYE_DRAG;
+
+        // Check if eye has landed (below starting height)
+        if (pos.y < 64.0 && vel.y < 0.0) {
+            // Eye has landed
+            eye_active = false;
+
+            if (willShatter) {
+                writeEyeEvent(idx, EVENT_EYE_SHATTERED, pos);
+            } else {
+                writeEyeEvent(idx, EVENT_EYE_LANDED, pos);
+            }
+        }
+    }
+
+    // Update position
+    pos += vel;
+
+    // Update target distance
+    float dx = targetX - pos.x;
+    float dz = targetZ - pos.z;
+    targetDist = sqrt(dx * dx + dz * dz);
+
+    // Write updated state
+    writeEyeState(idx, pos, vel, targetX, targetZ, targetDist, eye_active, willShatter, ticksFlying);
+
+    // Write drop event when transitioning to falling
+    if (ticksFlying == EYE_MAX_FLIGHT_TICKS + 1u) {
+        writeEyeEvent(idx, EVENT_EYE_DROPPED, pos);
+    }
+}

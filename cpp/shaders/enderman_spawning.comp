@@ -1,0 +1,550 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Enderman Spawning Mechanics - MC 1.8.9 focused for speedrun pearl farming
+//
+// Spawn rules per dimension:
+// - Overworld: Rare, night only, any biome, light <= 7
+// - Nether: Rare, not in 1.8.9 (warped forest is 1.16+)
+// - The End: Common! Primary source for speedruns
+//
+// For 1.8.9 speedrun pearl farming:
+// - Kill endermen in overworld at night OR
+// - Enter End and farm there (risky with dragon)
+// - Desert biomes optimal in overworld (flat terrain, easy spotting)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Dimensions
+const uint DIM_OVERWORLD = 0;
+const uint DIM_NETHER = 1;
+const uint DIM_END = 2;
+
+// Biome IDs
+const uint BIOME_PLAINS = 1;
+const uint BIOME_DESERT = 2;
+const uint BIOME_EXTREME_HILLS = 3;
+const uint BIOME_FOREST = 4;
+const uint BIOME_TAIGA = 5;
+const uint BIOME_SWAMP = 6;
+const uint BIOME_OCEAN = 0;
+const uint BIOME_NETHER = 8;
+const uint BIOME_END = 9;
+
+// Time of day (in ticks, 24000 = full day)
+const uint NIGHT_START = 13000;
+const uint NIGHT_END = 23000;
+
+// Light levels
+const uint MAX_HOSTILE_LIGHT_OVERWORLD = 7;
+const uint LIGHT_IRRELEVANT_END = 15; // Light doesn't matter in End
+
+// Spawn weights (out of 100, overworld only)
+// Enderman has low weight in overworld, ~10% of hostile spawns
+const float ENDERMAN_SPAWN_WEIGHT_OVERWORLD = 10.0;
+// In The End, endermen are 100% of hostile spawns
+const float ENDERMAN_SPAWN_WEIGHT_END = 100.0;
+// Desert bonus: +20% chance due to flat terrain (visibility bonus in observation)
+const float DESERT_SPAWN_BONUS = 1.2;
+
+// Spawn caps per chunk
+const uint MAX_ENDERMEN_PER_CHUNK_OVERWORLD = 1;
+const uint MAX_ENDERMEN_PER_CHUNK_END = 8;
+
+// Distance parameters
+const float MIN_SPAWN_DISTANCE = 24.0;  // Mobs don't spawn within 24 blocks
+const float MAX_SPAWN_DISTANCE = 128.0; // Despawn beyond 128 blocks
+const float IDEAL_SPAWN_DISTANCE = 28.0; // Sweet spot for spawning
+
+// Enderman specific
+const float ENDERMAN_HEIGHT = 2.9;      // Need 3 blocks clearance
+const uint ENDERMAN_MOB_TYPE = 2;
+
+// Mob states for aggro detection
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ANGRY = 6;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct SpawnCandidate {
+    vec3 position;
+    uint biome;
+    uint light_level;
+    uint chunk_x;
+    uint chunk_z;
+    float terrain_flatness; // 0-1, higher = flatter (better for farming)
+};
+
+struct SpawnedEnderman {
+    vec3 position;
+    float yaw;
+    uint chunk_idx;
+    uint flags;
+    float spawn_time;
+    uint _pad;
+};
+
+struct EndermanState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6]; // 0=held_block, 1=tp_cooldown, 2=screaming
+};
+
+// Observation data for RL agent - enderman specific
+struct EndermanObservation {
+    // Counts
+    int enderman_count;              // Visible endermen in range
+    int enderman_count_aggro;        // Aggro'd endermen count
+
+    // Nearest enderman
+    float nearest_enderman_distance; // Distance to nearest (MAX if none)
+    vec2 nearest_enderman_direction; // XZ direction unit vector
+    float nearest_enderman_health;   // [0, 1]
+    uint nearest_enderman_is_aggro;  // 0 or 1
+
+    // Farming context
+    float spawn_rate_modifier;       // Current spawn rate multiplier
+    uint is_night;                   // Overworld night time
+    uint in_end;                     // In End dimension
+    float time_until_night;          // Ticks until night (overworld)
+
+    // Per-enderman aggro flags (up to 8)
+    uint enderman_aggro_mask;        // Bitmask: bit i = enderman i is aggro
+
+    float _pad[2];
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+// Input: potential spawn positions
+layout(set = 0, binding = 0) buffer readonly CandidateBuffer {
+    uint candidate_count;
+    SpawnCandidate candidates[];
+};
+
+// Output: spawned endermen this tick
+layout(set = 0, binding = 1) buffer SpawnResultBuffer {
+    uint spawn_count;
+    SpawnedEnderman spawns[];
+};
+
+// Existing endermen in world
+layout(set = 0, binding = 2) buffer EndermanBuffer {
+    uint enderman_count;
+    EndermanState endermen[];
+};
+
+// World block data for validation
+layout(set = 0, binding = 3) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+// Light data
+layout(set = 0, binding = 4) buffer readonly LightBuffer {
+    uint light_levels[];
+};
+
+// Per-chunk spawn counts
+layout(set = 0, binding = 5) buffer ChunkSpawnBuffer {
+    uint chunk_enderman_counts[];
+};
+
+// Output: observation data for RL
+layout(set = 0, binding = 6) buffer ObservationBuffer {
+    EndermanObservation obs;
+};
+
+layout(push_constant) uniform PushConstants {
+    vec3 player_pos;
+    float player_yaw;
+    uint dimension;
+    uint world_time;       // 0-24000 tick of day
+    uint random_seed;
+    uint tick;
+    float difficulty;      // 0-3 (peaceful, easy, normal, hard)
+    uint max_spawns_this_tick;
+    uint current_enderman_count;
+    uint mob_cap;
+    float spawn_radius;
+} pc;
+
+// ============================================================================
+// Shared memory
+// ============================================================================
+
+shared uint s_spawn_count;
+shared uint s_valid_indices[64];
+shared float s_nearest_dist;
+shared uint s_nearest_idx;
+
+// ============================================================================
+// Random
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+// ============================================================================
+// World Queries
+// ============================================================================
+
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = uint(pos.y) * 256u * 256u + uint(pos.z) * 256u + uint(pos.x);
+    return (world_blocks[idx >> 2] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+uint get_light_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 15u;
+    }
+    uint idx = uint(pos.y) * 256u * 256u + uint(pos.z) * 256u + uint(pos.x);
+    return (light_levels[idx >> 1] >> ((idx & 1u) * 4u)) & 0xFu;
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+bool is_end_stone(uint block_id) {
+    return block_id == 121; // End stone
+}
+
+bool is_spawnable_block(uint block_id) {
+    // Blocks mobs can spawn on
+    // End stone (121), grass (2), dirt (3), stone (1), sand (12), etc.
+    return block_id >= 1 && block_id <= 5 ||
+           block_id == 12 || block_id == 13 || // sand, gravel
+           block_id == 24 ||                    // sandstone
+           block_id == 121;                     // end stone
+}
+
+// ============================================================================
+// Spawn Validation - Enderman specific
+// ============================================================================
+
+bool is_valid_enderman_spawn(vec3 pos) {
+    ivec3 block_pos = world_to_block(pos);
+
+    // Block below must be spawnable
+    uint below = get_block_at(block_pos + ivec3(0, -1, 0));
+    if (!is_spawnable_block(below)) {
+        return false;
+    }
+
+    // Need 3 blocks of air (enderman is 2.9 blocks tall)
+    uint at_feet = get_block_at(block_pos);
+    uint at_body = get_block_at(block_pos + ivec3(0, 1, 0));
+    uint at_head = get_block_at(block_pos + ivec3(0, 2, 0));
+
+    if (is_solid(at_feet) || is_solid(at_body) || is_solid(at_head)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool check_light_requirement(vec3 pos, uint dimension) {
+    if (dimension == DIM_END) {
+        return true; // Light doesn't matter in End
+    }
+
+    ivec3 block_pos = world_to_block(pos);
+    uint light = get_light_at(block_pos);
+
+    return light <= MAX_HOSTILE_LIGHT_OVERWORLD;
+}
+
+bool check_time_requirement(uint dimension, uint world_time) {
+    if (dimension == DIM_END) {
+        return true; // Time doesn't matter in End
+    }
+    if (dimension == DIM_NETHER) {
+        return false; // No enderman spawns in Nether in 1.8.9
+    }
+
+    // Overworld: must be night
+    return world_time >= NIGHT_START || world_time <= (24000u - NIGHT_END);
+}
+
+bool check_distance_requirement(vec3 pos, vec3 player_pos) {
+    float dist = distance(pos, player_pos);
+    return dist >= MIN_SPAWN_DISTANCE && dist <= MAX_SPAWN_DISTANCE;
+}
+
+float get_spawn_weight(uint dimension, uint biome, float difficulty) {
+    if (dimension == DIM_END) {
+        return ENDERMAN_SPAWN_WEIGHT_END * (0.5 + difficulty * 0.25);
+    }
+
+    if (dimension == DIM_NETHER) {
+        return 0.0; // No endermen in Nether 1.8.9
+    }
+
+    // Overworld
+    float base_weight = ENDERMAN_SPAWN_WEIGHT_OVERWORLD;
+
+    // Desert bonus (easier to spot = better farming)
+    if (biome == BIOME_DESERT) {
+        base_weight *= DESERT_SPAWN_BONUS;
+    }
+
+    // Difficulty scaling
+    base_weight *= (0.5 + difficulty * 0.25);
+
+    return base_weight;
+}
+
+uint get_chunk_spawn_cap(uint dimension) {
+    if (dimension == DIM_END) {
+        return MAX_ENDERMEN_PER_CHUNK_END;
+    }
+    return MAX_ENDERMEN_PER_CHUNK_OVERWORLD;
+}
+
+// ============================================================================
+// Observation Computation
+// ============================================================================
+
+void compute_enderman_observation() {
+    // Initialize observation
+    obs.enderman_count = 0;
+    obs.enderman_count_aggro = 0;
+    obs.nearest_enderman_distance = 1000.0;
+    obs.nearest_enderman_direction = vec2(0.0);
+    obs.nearest_enderman_health = 0.0;
+    obs.nearest_enderman_is_aggro = 0;
+    obs.enderman_aggro_mask = 0;
+
+    // Spawn rate context
+    obs.in_end = pc.dimension == DIM_END ? 1u : 0u;
+    obs.is_night = check_time_requirement(pc.dimension, pc.world_time) ? 1u : 0u;
+
+    if (pc.dimension == DIM_OVERWORLD) {
+        if (pc.world_time < NIGHT_START) {
+            obs.time_until_night = float(NIGHT_START - pc.world_time);
+        } else {
+            obs.time_until_night = 0.0;
+        }
+    } else {
+        obs.time_until_night = 0.0;
+    }
+
+    // Calculate spawn rate modifier
+    float base_rate = 1.0;
+    if (pc.dimension == DIM_END) {
+        base_rate = 10.0; // End has much higher enderman density
+    } else if (pc.dimension == DIM_OVERWORLD && obs.is_night == 1u) {
+        base_rate = 1.0;
+    } else {
+        base_rate = 0.0; // Can't spawn
+    }
+    obs.spawn_rate_modifier = base_rate * (0.5 + pc.difficulty * 0.25);
+
+    // Find nearest enderman and count aggro
+    uint nearest_idx = 0xFFFFFFFF;
+    float nearest_dist = 1000.0;
+
+    for (uint i = 0; i < enderman_count && i < 64; i++) {
+        EndermanState e = endermen[i];
+
+        float dist = distance(e.position, pc.player_pos);
+
+        // Only count visible endermen (within spawn radius)
+        if (dist > pc.spawn_radius) {
+            continue;
+        }
+
+        obs.enderman_count++;
+
+        // Check aggro
+        bool is_aggro = e.ai_state == AI_STATE_CHASE ||
+                       e.ai_state == AI_STATE_ANGRY ||
+                       e.type_data[2] == 1; // screaming flag
+
+        if (is_aggro) {
+            obs.enderman_count_aggro++;
+            if (i < 8) {
+                obs.enderman_aggro_mask |= (1u << i);
+            }
+        }
+
+        // Track nearest
+        if (dist < nearest_dist) {
+            nearest_dist = dist;
+            nearest_idx = i;
+        }
+    }
+
+    // Fill in nearest enderman details
+    if (nearest_idx != 0xFFFFFFFF) {
+        EndermanState nearest = endermen[nearest_idx];
+
+        obs.nearest_enderman_distance = nearest_dist;
+
+        vec3 to_enderman = nearest.position - pc.player_pos;
+        vec2 dir_xz = normalize(to_enderman.xz);
+        obs.nearest_enderman_direction = dir_xz;
+
+        obs.nearest_enderman_health = nearest.health / nearest.max_health;
+
+        bool nearest_aggro = nearest.ai_state == AI_STATE_CHASE ||
+                            nearest.ai_state == AI_STATE_ANGRY ||
+                            nearest.type_data[2] == 1;
+        obs.nearest_enderman_is_aggro = nearest_aggro ? 1u : 0u;
+    }
+}
+
+// ============================================================================
+// Main Spawn Logic
+// ============================================================================
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint global_id = gl_GlobalInvocationID.x;
+
+    // Thread 0 computes observation
+    if (global_id == 0) {
+        compute_enderman_observation();
+    }
+
+    // Initialize shared memory
+    if (local_id == 0) {
+        s_spawn_count = 0;
+        s_nearest_dist = 1000.0;
+        s_nearest_idx = 0xFFFFFFFF;
+    }
+    barrier();
+
+    // Early exit conditions
+    if (!check_time_requirement(pc.dimension, pc.world_time)) {
+        return;
+    }
+
+    if (pc.current_enderman_count >= pc.mob_cap) {
+        return;
+    }
+
+    if (global_id >= candidate_count) {
+        return;
+    }
+
+    SpawnCandidate candidate = candidates[global_id];
+    uint seed = pc.random_seed ^ global_id ^ pc.tick;
+
+    // Validate spawn position
+    if (!is_valid_enderman_spawn(candidate.position)) {
+        return;
+    }
+
+    if (!check_light_requirement(candidate.position, pc.dimension)) {
+        return;
+    }
+
+    if (!check_distance_requirement(candidate.position, pc.player_pos)) {
+        return;
+    }
+
+    // Check chunk spawn cap
+    uint chunk_idx = candidate.chunk_x * 256u + candidate.chunk_z;
+    uint chunk_cap = get_chunk_spawn_cap(pc.dimension);
+
+    if (chunk_idx < 65536u && chunk_enderman_counts[chunk_idx] >= chunk_cap) {
+        return;
+    }
+
+    // Roll spawn chance
+    float spawn_weight = get_spawn_weight(pc.dimension, candidate.biome, pc.difficulty);
+    float roll = random_float(seed) * 100.0;
+
+    if (roll > spawn_weight) {
+        return;
+    }
+
+    // Additional random rejection based on mob cap fullness
+    float cap_ratio = float(pc.current_enderman_count) / float(pc.mob_cap);
+    if (random_float(seed) < cap_ratio * 0.5) {
+        return;
+    }
+
+    // Spawn successful - record it
+    uint idx = atomicAdd(s_spawn_count, 1);
+    if (idx < 64) {
+        s_valid_indices[idx] = global_id;
+    }
+
+    barrier();
+
+    // Thread 0 writes results
+    if (local_id == 0) {
+        uint count = min(s_spawn_count, min(64u, pc.max_spawns_this_tick));
+        uint base_idx = atomicAdd(spawn_count, count);
+
+        for (uint i = 0; i < count && (base_idx + i) < 256; i++) {
+            uint cand_idx = s_valid_indices[i];
+            SpawnCandidate c = candidates[cand_idx];
+
+            uint s = pc.random_seed ^ cand_idx ^ pc.tick;
+
+            SpawnedEnderman result;
+            result.position = c.position;
+            result.yaw = random_float(s) * 360.0;
+            result.chunk_idx = c.chunk_x * 256u + c.chunk_z;
+            result.flags = 0;
+            result.spawn_time = float(pc.tick);
+            result._pad = 0;
+
+            spawns[base_idx + i] = result;
+
+            // Increment chunk count
+            if (result.chunk_idx < 65536u) {
+                atomicAdd(chunk_enderman_counts[result.chunk_idx], 1);
+            }
+        }
+    }
+}

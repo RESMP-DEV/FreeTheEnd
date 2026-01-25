@@ -1,0 +1,538 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// Stronghold Generation Compute Shader
+// Implements Minecraft 1.8.9 stronghold spawning mechanics
+//
+// Key properties:
+// - 3 strongholds per world in a ring 1408-2688 blocks from origin
+// - Spaced 120 degrees apart
+// - Y level typically 10-40 (underground)
+// - Contains portal room with 12 end portal frames (10% chance each has eye)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// World seed for deterministic generation
+layout(push_constant) uniform PushConstants {
+    int64_t world_seed;
+    int stronghold_index;  // 0, 1, or 2
+    ivec3 chunk_offset;
+} pc;
+
+// Output structure buffer
+layout(std430, binding = 0) buffer StrongholdData {
+    ivec3 portal_room_pos;
+    int portal_frames[12];     // 1 = has eye, 0 = empty
+    int silverfish_spawner_pos[3];
+    int library_count;
+    ivec4 library_positions[2];  // Up to 2 libraries
+    int corridor_count;
+    ivec4 corridors[64];         // Start pos + length
+    int prison_count;
+    ivec4 prison_cells[8];
+    int fountain_count;
+    ivec4 fountains[4];
+    int total_rooms;
+    int generation_complete;
+} stronghold;
+
+// Block type output (chunk data)
+layout(std430, binding = 1) buffer BlockData {
+    uint blocks[];  // 16x256x16 chunk blocks, packed
+} chunk;
+
+// Constants
+const int RING_INNER_RADIUS = 1408;
+const int RING_OUTER_RADIUS = 2688;
+const int RING_MID_RADIUS = (RING_INNER_RADIUS + RING_OUTER_RADIUS) / 2;
+const int Y_MIN = 10;
+const int Y_MAX = 40;
+const float EYE_PROBABILITY = 0.1;  // 10% chance per frame
+const float PI = 3.14159265359;
+
+// Block IDs (MC 1.8.9)
+const uint AIR = 0;
+const uint STONE = 1;
+const uint STONE_BRICK = 98;
+const uint CRACKED_STONE_BRICK = 98 | (1 << 8);
+const uint MOSSY_STONE_BRICK = 98 | (2 << 8);
+const uint CHISELED_STONE_BRICK = 98 | (3 << 8);
+const uint END_PORTAL_FRAME = 120;
+const uint END_PORTAL_FRAME_WITH_EYE = 120 | (4 << 8);  // With eye of ender
+const uint BOOKSHELF = 47;
+const uint IRON_BARS = 101;
+const uint TORCH = 50;
+const uint CHEST = 54;
+const uint SPAWNER = 52;
+const uint LADDER = 65;
+const uint COBBLESTONE = 4;
+const uint MOSSY_COBBLESTONE = 48;
+const uint WATER = 9;
+const uint LAVA = 11;
+
+// LCG random number generator (Java's implementation)
+int64_t nextLong(inout int64_t seed) {
+    seed = (seed * 0x5DEECE66DL + 0xBL) & ((1L << 48) - 1);
+    return seed;
+}
+
+int nextInt(inout int64_t seed, int bound) {
+    if (bound <= 0) return 0;
+    int64_t r = nextLong(seed);
+    int m = bound - 1;
+    if ((bound & m) == 0) {
+        return int((bound * (r >> 17)) >> 31);
+    }
+    return int(abs(int(r >> 17)) % bound);
+}
+
+float nextFloat(inout int64_t seed) {
+    return float(nextInt(seed, 0x1000000)) / float(0x1000000);
+}
+
+// Calculate stronghold position for given index (0-2)
+ivec2 getStrongholdXZ(int64_t seed, int index) {
+    // Seed the RNG with world seed
+    int64_t rng = seed;
+
+    // Initial angle offset based on seed
+    float baseAngle = nextFloat(rng) * PI * 2.0;
+
+    // Each stronghold is 120 degrees (2*PI/3) apart
+    float angle = baseAngle + float(index) * (2.0 * PI / 3.0);
+
+    // Distance varies within the ring
+    int distance = RING_MID_RADIUS + nextInt(rng, RING_OUTER_RADIUS - RING_INNER_RADIUS) -
+                   (RING_OUTER_RADIUS - RING_INNER_RADIUS) / 2;
+
+    // Calculate position
+    int x = int(cos(angle) * float(distance));
+    int z = int(sin(angle) * float(distance));
+
+    // Snap to chunk boundary
+    x = (x >> 4) << 4;
+    z = (z >> 4) << 4;
+
+    return ivec2(x, z);
+}
+
+// Get Y level for stronghold entrance
+int getStrongholdY(int64_t seed) {
+    int64_t rng = seed;
+    return Y_MIN + nextInt(rng, Y_MAX - Y_MIN);
+}
+
+// Generate portal room structure
+// Portal room is 9x9x7 (WxLxH)
+void generatePortalRoom(ivec3 pos, inout int64_t rng) {
+    stronghold.portal_room_pos = pos;
+
+    // Generate 12 portal frames in a 5x5 ring pattern
+    // Frame positions relative to room center:
+    //     N N N
+    //   W       E
+    //   W       E
+    //   W       E
+    //     S S S
+
+    // Initialize eye placements (10% chance each)
+    for (int i = 0; i < 12; i++) {
+        stronghold.portal_frames[i] = (nextFloat(rng) < EYE_PROBABILITY) ? 1 : 0;
+    }
+
+    // Silverfish spawner at center, below portal level
+    stronghold.silverfish_spawner_pos[0] = pos.x;
+    stronghold.silverfish_spawner_pos[1] = pos.y;
+    stronghold.silverfish_spawner_pos[2] = pos.z;
+}
+
+// Generate library room (tall room with bookshelves)
+void generateLibrary(ivec3 pos, bool isTall, int index, inout int64_t rng) {
+    if (stronghold.library_count >= 2) return;
+
+    stronghold.library_positions[stronghold.library_count] = ivec4(
+        pos.x, pos.y, pos.z,
+        isTall ? 2 : 1  // 1 = normal, 2 = tall (2 floors)
+    );
+    stronghold.library_count++;
+}
+
+// Generate corridor segment
+void generateCorridor(ivec3 start, int length, int direction, inout int64_t rng) {
+    if (stronghold.corridor_count >= 64) return;
+
+    stronghold.corridors[stronghold.corridor_count] = ivec4(
+        start.x, start.y, start.z,
+        (direction << 16) | length
+    );
+    stronghold.corridor_count++;
+}
+
+// Generate prison cell
+void generatePrisonCell(ivec3 pos, inout int64_t rng) {
+    if (stronghold.prison_count >= 8) return;
+
+    stronghold.prison_cells[stronghold.prison_count] = ivec4(
+        pos.x, pos.y, pos.z,
+        nextInt(rng, 3)  // Variant
+    );
+    stronghold.prison_count++;
+}
+
+// Generate fountain room
+void generateFountain(ivec3 pos, inout int64_t rng) {
+    if (stronghold.fountain_count >= 4) return;
+
+    stronghold.fountains[stronghold.fountain_count] = ivec4(
+        pos.x, pos.y, pos.z,
+        nextInt(rng, 2)  // Has water (0) or lava (1)
+    );
+    stronghold.fountain_count++;
+}
+
+// Iterative room generator (GLSL does not support recursion)
+// Manual stack with max depth 7, up to 3 branches per node
+struct RoomTask {
+    ivec3 pos;
+    int depth;
+    int direction;
+};
+
+const int MAX_STACK = 128;
+
+void generateRooms(ivec3 startPos, int startDirection, inout int64_t rng) {
+    RoomTask stack[MAX_STACK];
+    int stackTop = 0;
+
+    stack[0].pos = startPos;
+    stack[0].depth = 0;
+    stack[0].direction = startDirection;
+    stackTop = 1;
+
+    while (stackTop > 0 && stronghold.total_rooms <= 50) {
+        stackTop--;
+        RoomTask current = stack[stackTop];
+
+        if (current.depth > 6) continue;
+
+        int roomType = nextInt(rng, 100);
+
+        if (current.depth == 0) {
+            generatePortalRoom(current.pos, rng);
+            stronghold.total_rooms++;
+        } else if (roomType < 5 && stronghold.library_count < 2) {
+            generateLibrary(current.pos, nextInt(rng, 2) == 0, stronghold.library_count, rng);
+            stronghold.total_rooms++;
+        } else if (roomType < 10 && stronghold.fountain_count < 4) {
+            generateFountain(current.pos, rng);
+            stronghold.total_rooms++;
+        } else if (roomType < 20 && stronghold.prison_count < 8) {
+            generatePrisonCell(current.pos, rng);
+            stronghold.total_rooms++;
+        } else {
+            int length = 3 + nextInt(rng, 5);
+            generateCorridor(current.pos, length, current.direction, rng);
+            stronghold.total_rooms++;
+        }
+
+        // Branch to adjacent rooms
+        int branches = 1 + nextInt(rng, 3);
+        for (int b = 0; b < branches && stronghold.total_rooms < 50 && stackTop < MAX_STACK; b++) {
+            int newDir = nextInt(rng, 4);
+            ivec3 offset = ivec3(0);
+
+            switch (newDir) {
+                case 0: offset = ivec3(5, 0, 0); break;
+                case 1: offset = ivec3(-5, 0, 0); break;
+                case 2: offset = ivec3(0, 0, 5); break;
+                case 3: offset = ivec3(0, 0, -5); break;
+            }
+
+            if (nextInt(rng, 4) == 0) {
+                offset.y = nextInt(rng, 2) == 0 ? 3 : -3;
+            }
+
+            stack[stackTop].pos = current.pos + offset;
+            stack[stackTop].depth = current.depth + 1;
+            stack[stackTop].direction = newDir;
+            stackTop++;
+        }
+    }
+}
+
+// Write a block to chunk data
+void setBlock(ivec3 localPos, uint blockId) {
+    if (localPos.x < 0 || localPos.x >= 16 ||
+        localPos.y < 0 || localPos.y >= 256 ||
+        localPos.z < 0 || localPos.z >= 16) return;
+
+    int idx = localPos.x + localPos.z * 16 + localPos.y * 256;
+    chunk.blocks[idx] = blockId;
+}
+
+// Fill region with block
+void fillRegion(ivec3 from, ivec3 to, uint blockId) {
+    for (int x = min(from.x, to.x); x <= max(from.x, to.x); x++) {
+        for (int y = min(from.y, to.y); y <= max(from.y, to.y); y++) {
+            for (int z = min(from.z, to.z); z <= max(from.z, to.z); z++) {
+                setBlock(ivec3(x, y, z), blockId);
+            }
+        }
+    }
+}
+
+// Render portal room to chunk blocks
+void renderPortalRoom(ivec3 worldPos) {
+    ivec3 localPos = worldPos - pc.chunk_offset;
+
+    // Room dimensions: 9x7x9
+    ivec3 roomMin = localPos - ivec3(4, 0, 4);
+    ivec3 roomMax = localPos + ivec3(4, 6, 4);
+
+    // Floor
+    fillRegion(roomMin, ivec3(roomMax.x, roomMin.y, roomMax.z), STONE_BRICK);
+
+    // Walls
+    fillRegion(roomMin, ivec3(roomMin.x, roomMax.y, roomMax.z), STONE_BRICK);
+    fillRegion(ivec3(roomMax.x, roomMin.y, roomMin.z), roomMax, STONE_BRICK);
+    fillRegion(roomMin, ivec3(roomMax.x, roomMax.y, roomMin.z), STONE_BRICK);
+    fillRegion(ivec3(roomMin.x, roomMin.y, roomMax.z), roomMax, STONE_BRICK);
+
+    // Ceiling
+    fillRegion(ivec3(roomMin.x, roomMax.y, roomMin.z), roomMax, STONE_BRICK);
+
+    // Interior air
+    fillRegion(roomMin + ivec3(1, 1, 1), roomMax - ivec3(1, 1, 1), AIR);
+
+    // Portal platform (raised 3 blocks)
+    ivec3 portalBase = localPos + ivec3(-2, 3, -2);
+    fillRegion(portalBase, portalBase + ivec3(4, 0, 4), STONE_BRICK);
+
+    // End portal frames (12 in a ring)
+    // North side (3 frames, facing south)
+    for (int i = 0; i < 3; i++) {
+        uint frameType = (stronghold.portal_frames[i] == 1) ?
+            END_PORTAL_FRAME_WITH_EYE : END_PORTAL_FRAME;
+        setBlock(localPos + ivec3(-1 + i, 4, -2), frameType);
+    }
+
+    // South side (3 frames, facing north)
+    for (int i = 0; i < 3; i++) {
+        uint frameType = (stronghold.portal_frames[3 + i] == 1) ?
+            END_PORTAL_FRAME_WITH_EYE : END_PORTAL_FRAME;
+        setBlock(localPos + ivec3(-1 + i, 4, 2), frameType);
+    }
+
+    // East side (3 frames, facing west)
+    for (int i = 0; i < 3; i++) {
+        uint frameType = (stronghold.portal_frames[6 + i] == 1) ?
+            END_PORTAL_FRAME_WITH_EYE : END_PORTAL_FRAME;
+        setBlock(localPos + ivec3(2, 4, -1 + i), frameType);
+    }
+
+    // West side (3 frames, facing east)
+    for (int i = 0; i < 3; i++) {
+        uint frameType = (stronghold.portal_frames[9 + i] == 1) ?
+            END_PORTAL_FRAME_WITH_EYE : END_PORTAL_FRAME;
+        setBlock(localPos + ivec3(-2, 4, -1 + i), frameType);
+    }
+
+    // Silverfish spawner below portal
+    setBlock(localPos + ivec3(0, 1, 0), SPAWNER);
+
+    // Lava pools under stairs
+    fillRegion(localPos + ivec3(-4, 1, -4), localPos + ivec3(-3, 1, -3), LAVA);
+    fillRegion(localPos + ivec3(3, 1, -4), localPos + ivec3(4, 1, -3), LAVA);
+    fillRegion(localPos + ivec3(-4, 1, 3), localPos + ivec3(-3, 1, 4), LAVA);
+    fillRegion(localPos + ivec3(3, 1, 3), localPos + ivec3(4, 1, 4), LAVA);
+
+    // Iron bars around lava
+    for (int corner = 0; corner < 4; corner++) {
+        ivec3 offset = ivec3(
+            (corner & 1) == 0 ? -3 : 3,
+            0,
+            (corner & 2) == 0 ? -3 : 3
+        );
+        for (int h = 2; h <= 4; h++) {
+            setBlock(localPos + offset + ivec3(0, h, 0), IRON_BARS);
+        }
+    }
+}
+
+// Render library to chunk blocks
+void renderLibrary(ivec4 libData) {
+    ivec3 worldPos = libData.xyz;
+    ivec3 localPos = worldPos - pc.chunk_offset;
+    bool isTall = libData.w == 2;
+
+    int height = isTall ? 12 : 7;
+
+    // Room shell
+    fillRegion(localPos - ivec3(4, 0, 4), localPos + ivec3(4, height, 4), STONE_BRICK);
+    fillRegion(localPos - ivec3(3, 1, 3), localPos + ivec3(3, height - 1, 3), AIR);
+
+    // Bookshelves along walls
+    for (int h = 1; h < height - 1; h++) {
+        if ((h - 1) % 3 == 0 || (h - 1) % 3 == 1) {  // Bookshelves every 2 out of 3 levels
+            // North and South walls
+            for (int x = -2; x <= 2; x++) {
+                setBlock(localPos + ivec3(x, h, -3), BOOKSHELF);
+                setBlock(localPos + ivec3(x, h, 3), BOOKSHELF);
+            }
+            // East and West walls
+            for (int z = -2; z <= 2; z++) {
+                setBlock(localPos + ivec3(-3, h, z), BOOKSHELF);
+                setBlock(localPos + ivec3(3, h, z), BOOKSHELF);
+            }
+        }
+    }
+
+    // Chests in corners
+    setBlock(localPos + ivec3(-2, 1, -2), CHEST);
+    setBlock(localPos + ivec3(2, 1, 2), CHEST);
+
+    // Torches
+    setBlock(localPos + ivec3(0, 3, -3), TORCH);
+    setBlock(localPos + ivec3(0, 3, 3), TORCH);
+
+    // Cobweb/chandelier center (represented as air for now)
+    if (isTall) {
+        // Second floor
+        fillRegion(localPos + ivec3(-3, 6, -3), localPos + ivec3(3, 6, 3), STONE_BRICK);
+        fillRegion(localPos + ivec3(-2, 6, -2), localPos + ivec3(2, 6, 2), AIR);
+
+        // Ladder to second floor
+        for (int h = 1; h <= 6; h++) {
+            setBlock(localPos + ivec3(3, h, 0), LADDER);
+        }
+    }
+}
+
+// Render corridor
+void renderCorridor(ivec4 corData) {
+    ivec3 worldPos = corData.xyz;
+    ivec3 localPos = worldPos - pc.chunk_offset;
+    int length = corData.w & 0xFFFF;
+    int direction = (corData.w >> 16) & 0xFFFF;
+
+    ivec3 dir = ivec3(0);
+    switch (direction) {
+        case 0: dir = ivec3(1, 0, 0); break;
+        case 1: dir = ivec3(-1, 0, 0); break;
+        case 2: dir = ivec3(0, 0, 1); break;
+        case 3: dir = ivec3(0, 0, -1); break;
+    }
+
+    for (int i = 0; i < length; i++) {
+        ivec3 pos = localPos + dir * i;
+
+        // 3x3 corridor cross-section
+        // Floor
+        fillRegion(pos + ivec3(-1, 0, -1), pos + ivec3(1, 0, 1), STONE_BRICK);
+
+        // Walls
+        setBlock(pos + ivec3(-1, 1, -1), STONE_BRICK);
+        setBlock(pos + ivec3(-1, 2, -1), STONE_BRICK);
+        setBlock(pos + ivec3(1, 1, -1), STONE_BRICK);
+        setBlock(pos + ivec3(1, 2, -1), STONE_BRICK);
+        setBlock(pos + ivec3(-1, 1, 1), STONE_BRICK);
+        setBlock(pos + ivec3(-1, 2, 1), STONE_BRICK);
+        setBlock(pos + ivec3(1, 1, 1), STONE_BRICK);
+        setBlock(pos + ivec3(1, 2, 1), STONE_BRICK);
+
+        // Ceiling
+        fillRegion(pos + ivec3(-1, 3, -1), pos + ivec3(1, 3, 1), STONE_BRICK);
+
+        // Interior air
+        setBlock(pos + ivec3(0, 1, 0), AIR);
+        setBlock(pos + ivec3(0, 2, 0), AIR);
+
+        // Occasional torch
+        if (i % 4 == 0) {
+            setBlock(pos + ivec3(1, 2, 0), TORCH);
+        }
+
+        // Random cracked/mossy bricks
+        // (Would use RNG but keeping simple for GPU)
+        if (i % 3 == 1) {
+            setBlock(pos + ivec3(-1, 1, 0), CRACKED_STONE_BRICK);
+        }
+        if (i % 5 == 2) {
+            setBlock(pos + ivec3(1, 0, 0), MOSSY_STONE_BRICK);
+        }
+    }
+}
+
+// Render prison cell
+void renderPrisonCell(ivec4 cellData) {
+    ivec3 worldPos = cellData.xyz;
+    ivec3 localPos = worldPos - pc.chunk_offset;
+
+    // Small 3x3x3 cell with iron bars
+    fillRegion(localPos - ivec3(1, 0, 1), localPos + ivec3(1, 3, 1), STONE_BRICK);
+    fillRegion(localPos, localPos + ivec3(0, 2, 0), AIR);
+
+    // Iron bar door
+    setBlock(localPos + ivec3(0, 1, -1), IRON_BARS);
+    setBlock(localPos + ivec3(0, 2, -1), IRON_BARS);
+}
+
+// Render fountain room
+void renderFountain(ivec4 fountainData) {
+    ivec3 worldPos = fountainData.xyz;
+    ivec3 localPos = worldPos - pc.chunk_offset;
+    bool hasLava = fountainData.w == 1;
+
+    // 5x5 room with central fountain
+    fillRegion(localPos - ivec3(2, 0, 2), localPos + ivec3(2, 4, 2), STONE_BRICK);
+    fillRegion(localPos - ivec3(1, 1, 1), localPos + ivec3(1, 3, 1), AIR);
+
+    // Central pillar with water/lava
+    setBlock(localPos, hasLava ? LAVA : WATER);
+    setBlock(localPos + ivec3(0, 1, 0), AIR);
+}
+
+void main() {
+    // Only first thread does generation
+    if (gl_GlobalInvocationID.xyz != uvec3(0)) return;
+
+    // Initialize RNG from world seed and stronghold index
+    int64_t rng = pc.world_seed ^ (int64_t(pc.stronghold_index) * 341873128712L);
+
+    // Calculate stronghold position
+    ivec2 strongholdXZ = getStrongholdXZ(pc.world_seed, pc.stronghold_index);
+    int strongholdY = getStrongholdY(rng);
+    ivec3 strongholdPos = ivec3(strongholdXZ.x, strongholdY, strongholdXZ.y);
+
+    // Initialize counters
+    stronghold.library_count = 0;
+    stronghold.corridor_count = 0;
+    stronghold.prison_count = 0;
+    stronghold.fountain_count = 0;
+    stronghold.total_rooms = 0;
+    stronghold.generation_complete = 0;
+
+    // Generate room layout
+    generateRooms(strongholdPos, 0, rng);
+
+    // Render all components
+    renderPortalRoom(stronghold.portal_room_pos);
+
+    for (int i = 0; i < stronghold.library_count; i++) {
+        renderLibrary(stronghold.library_positions[i]);
+    }
+
+    for (int i = 0; i < stronghold.corridor_count; i++) {
+        renderCorridor(stronghold.corridors[i]);
+    }
+
+    for (int i = 0; i < stronghold.prison_count; i++) {
+        renderPrisonCell(stronghold.prison_cells[i]);
+    }
+
+    for (int i = 0; i < stronghold.fountain_count; i++) {
+        renderFountain(stronghold.fountains[i]);
+    }
+
+    stronghold.generation_complete = 1;
+}

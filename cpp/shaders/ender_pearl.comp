@@ -1,0 +1,517 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+/*
+ * Minecraft 1.8.9 Ender Pearl Physics and Teleportation Shader
+ *
+ * Pearl mechanics (1.8.9):
+ * - Thrown with use item (right click) when pearl selected
+ * - Projectile follows gravity-affected arc
+ * - Teleports player to impact location
+ * - Deals 5 fall damage on teleport (2.5 hearts)
+ * - 1 second cooldown (20 ticks) between throws
+ *
+ * Speedrun applications:
+ * - Fast travel: throw forward while running for momentum preservation
+ * - MLG saves: throw at ground before dying to teleport out of danger
+ * - Stasis chambers: pearls in portals for advanced setups (not implemented)
+ *
+ * Pearl physics (1.8.9):
+ * - Initial velocity: based on player look direction + player velocity
+ * - Gravity: 0.03 blocks/tick^2
+ * - Drag: 0.99 per tick (air resistance)
+ * - Initial speed: 1.5 blocks/tick
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Physics constants (Minecraft 1.8.9 exact values)
+const float PEARL_INITIAL_SPEED = 1.5;       // Blocks per tick
+const float PEARL_GRAVITY = 0.03;             // Blocks per tick^2
+const float PEARL_DRAG = 0.99;                // Air resistance multiplier
+const float PEARL_WATER_DRAG = 0.8;           // Water resistance multiplier
+const uint PEARL_MAX_LIFETIME = 1200;         // 60 seconds max flight time
+const uint PEARL_COOLDOWN_TICKS = 20;         // 1 second cooldown
+const float PEARL_TELEPORT_DAMAGE = 5.0;      // 2.5 hearts of damage
+const float PI = 3.14159265359;
+
+// Block types for collision detection
+const uint BLOCK_AIR = 0;
+const uint BLOCK_WATER = 6;
+const uint BLOCK_LAVA = 7;
+
+// Pearl event types
+const uint EVENT_PEARL_THROWN = 0;
+const uint EVENT_PEARL_IMPACT = 1;
+const uint EVENT_PEARL_TELEPORT = 2;
+const uint EVENT_PEARL_EXPIRED = 3;
+const uint EVENT_PEARL_COOLDOWN = 4;  // Throw attempted during cooldown
+
+// Push constants for dispatch configuration
+layout(push_constant) uniform PushConstants {
+    uint pearlCount;         // Number of active pearls to process
+    float deltaTime;         // Time step (0.05 for 20 TPS)
+    uint currentTick;        // Current game tick for cooldown tracking
+    uint stage;              // 0=tick pearls, 1=handle throw requests
+} pc;
+
+// Pearl state buffer
+// Each pearl occupies 64 bytes (4x vec4):
+//   vec4(pos.x, pos.y, pos.z, lifetime)           - Position and ticks alive
+//   vec4(vel.x, vel.y, vel.z, ownerId)            - Velocity and owner player
+//   vec4(startPos.x, startPos.y, startPos.z, 0)   - Starting position (for teleport)
+//   vec4(flags, throwTick, 0, 0)                  - State flags and timing
+//
+// Flags (uint packed in float):
+//   bit 0: active
+//   bit 1: has_hit (impact detected)
+//   bit 2: in_water
+//   bit 3: teleport_pending
+layout(std430, set = 0, binding = 0) buffer PearlState {
+    vec4 pearlData[];
+};
+
+// Player state buffer (read-write for teleportation)
+// Matches game_tick.comp Player struct layout
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint dimension;
+    uint gamemode;
+    uint activeSlot;
+    uint flags;
+    ivec3 targetBlock;
+    uint targetBlockFace;
+    vec4 statusEffects[8];
+};
+
+layout(std430, set = 0, binding = 1) buffer PlayerBuffer {
+    Player players[];
+};
+
+// Throw request buffer
+// Each request: uvec4(playerId, requestTick, itemSlot, flags)
+layout(std430, set = 0, binding = 2) buffer ThrowRequestBuffer {
+    uint throwRequestCount;
+    uint throwRequestPadding[3];
+    uvec4 throwRequests[];
+};
+
+// Pearl cooldown buffer (per player)
+// Stores the tick when the player can next throw a pearl
+layout(std430, set = 0, binding = 3) buffer CooldownBuffer {
+    uint nextThrowTick[];  // Per-player cooldown
+};
+
+// Pearl event output buffer
+// uvec4(pearlIdx, eventType, playerId, tick)
+// vec4(pos.x, pos.y, pos.z, damage)
+layout(std430, set = 0, binding = 4) writeonly buffer PearlEvents {
+    uvec4 events[];
+};
+
+layout(std430, set = 0, binding = 5) buffer EventCount {
+    uint pearlEventCount;
+};
+
+// World blocks for collision (simplified - actual implementation would use chunk buffer)
+layout(std430, set = 0, binding = 6) readonly buffer WorldBlocks {
+    uint loadedChunkCount;
+    ivec4 loadedChunks[1024];
+    uint blocks[];
+};
+
+// Inventory buffer for consuming pearls
+layout(std430, set = 0, binding = 7) buffer InventoryBuffer {
+    uint inventoryData[];
+};
+
+// Item IDs
+const uint ITEM_ENDER_PEARL = 368;  // Minecraft ender pearl item ID
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float randomFloat(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+// Read pearl state from buffer
+void readPearlState(uint idx, out vec3 pos, out float lifetime,
+                    out vec3 vel, out uint ownerId,
+                    out vec3 startPos, out uint flags, out uint throwTick) {
+    vec4 d0 = pearlData[idx * 4];
+    vec4 d1 = pearlData[idx * 4 + 1];
+    vec4 d2 = pearlData[idx * 4 + 2];
+    vec4 d3 = pearlData[idx * 4 + 3];
+
+    pos = d0.xyz;
+    lifetime = d0.w;
+    vel = d1.xyz;
+    ownerId = floatBitsToUint(d1.w);
+    startPos = d2.xyz;
+    flags = floatBitsToUint(d3.x);
+    throwTick = floatBitsToUint(d3.y);
+}
+
+// Write pearl state to buffer
+void writePearlState(uint idx, vec3 pos, float lifetime,
+                     vec3 vel, uint ownerId,
+                     vec3 startPos, uint flags, uint throwTick) {
+    pearlData[idx * 4] = vec4(pos, lifetime);
+    pearlData[idx * 4 + 1] = vec4(vel, uintBitsToFloat(ownerId));
+    pearlData[idx * 4 + 2] = vec4(startPos, 0.0);
+    pearlData[idx * 4 + 3] = vec4(uintBitsToFloat(flags), uintBitsToFloat(throwTick), 0.0, 0.0);
+}
+
+// Write pearl event
+void writePearlEvent(uint pearlIdx, uint eventType, uint playerId, vec3 pos, float damage) {
+    uint eventIdx = atomicAdd(pearlEventCount, 1u);
+    uint maxEvents = 1024u;
+
+    if (eventIdx < maxEvents) {
+        events[eventIdx * 2] = uvec4(pearlIdx, eventType, playerId, pc.currentTick);
+        events[eventIdx * 2 + 1] = uvec4(
+            floatBitsToUint(pos.x),
+            floatBitsToUint(pos.y),
+            floatBitsToUint(pos.z),
+            floatBitsToUint(damage)
+        );
+    }
+}
+
+// Simplified block lookup (actual implementation uses chunk system)
+uint getBlockAt(ivec3 worldPos) {
+    // For now, simple boundary check - blocks below y=0 and above y=256 are considered solid
+    if (worldPos.y < 0 || worldPos.y > 255) {
+        return 1;  // Solid
+    }
+
+    // Check loaded chunks
+    ivec3 chunkPos = worldPos >> 4;
+
+    for (uint i = 0; i < loadedChunkCount; i++) {
+        if (loadedChunks[i].xyz == chunkPos) {
+            ivec3 localPos = worldPos & 15;
+            uint idx = i * 16 * 16 * 256 +
+                       localPos.y * 16 * 16 +
+                       localPos.z * 16 +
+                       localPos.x;
+            return blocks[idx];
+        }
+    }
+
+    return BLOCK_AIR;
+}
+
+bool isBlockSolid(uint blockType) {
+    return blockType != BLOCK_AIR &&
+           blockType != BLOCK_WATER &&
+           blockType != BLOCK_LAVA;
+}
+
+bool isBlockWater(uint blockType) {
+    return blockType == BLOCK_WATER;
+}
+
+// ============================================================================
+// PEARL PHYSICS
+// ============================================================================
+
+// Calculate look direction from yaw and pitch
+vec3 getLookDirection(float yaw, float pitch) {
+    float yawRad = radians(yaw);
+    float pitchRad = radians(pitch);
+
+    return vec3(
+        -sin(yawRad) * cos(pitchRad),
+        -sin(pitchRad),
+        cos(yawRad) * cos(pitchRad)
+    );
+}
+
+// Calculate initial pearl velocity
+vec3 calculateThrowVelocity(vec3 lookDir, vec3 playerVel) {
+    // Base velocity from look direction
+    vec3 baseVel = lookDir * PEARL_INITIAL_SPEED;
+
+    // Add a portion of player velocity for momentum
+    // In 1.8.9, about 50% of player horizontal velocity transfers
+    vec3 momentumBonus = vec3(playerVel.x * 0.5, 0.0, playerVel.z * 0.5);
+
+    // Add slight upward component for the "toss" animation feel
+    vec3 upwardBoost = vec3(0.0, 0.1, 0.0);
+
+    return baseVel + momentumBonus + upwardBoost;
+}
+
+// Ray-box intersection for block collision
+bool rayIntersectsBlock(vec3 rayOrigin, vec3 rayDir, ivec3 blockPos, out float t, out vec3 hitNormal) {
+    vec3 blockMin = vec3(blockPos);
+    vec3 blockMax = vec3(blockPos) + vec3(1.0);
+
+    vec3 invDir = 1.0 / rayDir;
+    vec3 t1 = (blockMin - rayOrigin) * invDir;
+    vec3 t2 = (blockMax - rayOrigin) * invDir;
+
+    vec3 tMin = min(t1, t2);
+    vec3 tMax = max(t1, t2);
+
+    float tNear = max(max(tMin.x, tMin.y), tMin.z);
+    float tFar = min(min(tMax.x, tMax.y), tMax.z);
+
+    if (tNear > tFar || tFar < 0.0) {
+        return false;
+    }
+
+    t = tNear > 0.0 ? tNear : tFar;
+
+    // Calculate hit normal
+    if (tMin.x > tMin.y && tMin.x > tMin.z) {
+        hitNormal = vec3(-sign(rayDir.x), 0.0, 0.0);
+    } else if (tMin.y > tMin.z) {
+        hitNormal = vec3(0.0, -sign(rayDir.y), 0.0);
+    } else {
+        hitNormal = vec3(0.0, 0.0, -sign(rayDir.z));
+    }
+
+    return true;
+}
+
+// Check for collision along pearl path
+bool checkCollision(vec3 pos, vec3 vel, out vec3 hitPos, out vec3 hitNormal) {
+    float moveLen = length(vel);
+    if (moveLen < 0.001) {
+        return false;
+    }
+
+    vec3 moveDir = vel / moveLen;
+
+    // Check blocks along the path using DDA-style traversal
+    ivec3 currentBlock = ivec3(floor(pos));
+    ivec3 endBlock = ivec3(floor(pos + vel));
+
+    // Check current and destination blocks
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                ivec3 checkBlock = currentBlock + ivec3(dx, dy, dz);
+                uint blockType = getBlockAt(checkBlock);
+
+                if (isBlockSolid(blockType)) {
+                    float t;
+                    vec3 normal;
+                    if (rayIntersectsBlock(pos, vel, checkBlock, t, normal)) {
+                        if (t >= 0.0 && t <= 1.0) {
+                            hitPos = pos + vel * t;
+                            hitNormal = normal;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// PEARL TICK (Stage 0)
+// ============================================================================
+
+void tickPearl(uint pearlIdx) {
+    // Read pearl state
+    vec3 pos, startPos, vel;
+    float lifetime;
+    uint ownerId, flags, throwTick;
+
+    readPearlState(pearlIdx, pos, lifetime, vel, ownerId, startPos, flags, throwTick);
+
+    // Check if pearl is active
+    bool is_active = (flags & 1u) != 0;
+    if (!is_active) {
+        return;
+    }
+
+    // Check for expiration
+    lifetime += 1.0;
+    if (lifetime >= float(PEARL_MAX_LIFETIME)) {
+        flags &= ~1u;  // Deactivate
+        writePearlEvent(pearlIdx, EVENT_PEARL_EXPIRED, ownerId, pos, 0.0);
+        writePearlState(pearlIdx, pos, lifetime, vel, ownerId, startPos, flags, throwTick);
+        return;
+    }
+
+    // Check if in water
+    uint blockAtPearl = getBlockAt(ivec3(floor(pos)));
+    bool inWater = isBlockWater(blockAtPearl);
+    if (inWater) {
+        flags |= 4u;
+    } else {
+        flags &= ~4u;
+    }
+
+    // Apply gravity
+    vel.y -= PEARL_GRAVITY;
+
+    // Apply drag (different in water vs air)
+    float drag = inWater ? PEARL_WATER_DRAG : PEARL_DRAG;
+    vel *= drag;
+
+    // Check for collision before moving
+    vec3 hitPos, hitNormal;
+    if (checkCollision(pos, vel, hitPos, hitNormal)) {
+        // Pearl has hit something - trigger teleport
+        flags |= 2u;  // has_hit flag
+        flags |= 8u;  // teleport_pending flag
+        pos = hitPos + hitNormal * 0.1;  // Offset slightly from surface
+
+        writePearlEvent(pearlIdx, EVENT_PEARL_IMPACT, ownerId, pos, 0.0);
+
+        // Deactivate pearl
+        flags &= ~1u;
+    } else {
+        // Move pearl
+        pos += vel;
+    }
+
+    // Write updated state
+    writePearlState(pearlIdx, pos, lifetime, vel, ownerId, startPos, flags, throwTick);
+
+    // Handle teleportation if pending
+    if ((flags & 8u) != 0) {
+        // Teleport player to impact location
+        if (ownerId < players.length()) {
+            Player p = players[ownerId];
+
+            // Store old position for damage calculation
+            vec3 oldPos = p.position;
+
+            // Teleport player
+            p.position = pos;
+            p.velocity = vec3(0.0);  // Reset velocity on teleport
+
+            // Apply 5 fall damage (always, regardless of height)
+            // In 1.8.9, pearl damage bypasses armor but is affected by protection
+            float damage = PEARL_TELEPORT_DAMAGE;
+            p.health = max(0.0, p.health - damage);
+
+            players[ownerId] = p;
+
+            // Emit teleport event
+            writePearlEvent(pearlIdx, EVENT_PEARL_TELEPORT, ownerId, pos, damage);
+        }
+    }
+}
+
+// ============================================================================
+// THROW HANDLER (Stage 1)
+// ============================================================================
+
+// Find an inactive pearl slot to use
+uint findInactivePearlSlot() {
+    for (uint i = 0; i < pc.pearlCount; i++) {
+        vec4 d3 = pearlData[i * 4 + 3];
+        uint flags = floatBitsToUint(d3.x);
+        if ((flags & 1u) == 0) {  // Not active
+            return i;
+        }
+    }
+    return 0xFFFFFFFF;  // No slot available
+}
+
+// Consume one ender pearl from player inventory
+bool consumePearl(uint playerId, uint itemSlot) {
+    // Simplified - actual implementation would check inventory buffer
+    // For now, assume pearl is available and consume it
+    // This would integrate with inventory_ops.comp
+    return true;
+}
+
+void handleThrowRequest(uint requestIdx) {
+    uvec4 request = throwRequests[requestIdx];
+    uint playerId = request.x;
+    uint requestTick = request.y;
+    uint itemSlot = request.z;
+    uint requestFlags = request.w;
+
+    // Check cooldown
+    if (nextThrowTick[playerId] > pc.currentTick) {
+        writePearlEvent(0xFFFFFFFF, EVENT_PEARL_COOLDOWN, playerId, vec3(0.0), 0.0);
+        return;
+    }
+
+    // Check if player has ender pearl in selected slot
+    // (Simplified - actual implementation checks inventory)
+    if (!consumePearl(playerId, itemSlot)) {
+        return;
+    }
+
+    // Find available pearl slot
+    uint pearlIdx = findInactivePearlSlot();
+    if (pearlIdx == 0xFFFFFFFF) {
+        return;  // No available slots
+    }
+
+    // Get player state for throw calculation
+    Player p = players[playerId];
+
+    // Calculate throw position (eye height)
+    vec3 throwPos = p.position + vec3(0.0, 1.62, 0.0);  // Eye height
+
+    // Calculate throw velocity
+    vec3 lookDir = getLookDirection(p.yaw, p.pitch);
+    vec3 throwVel = calculateThrowVelocity(lookDir, p.velocity);
+
+    // Initialize pearl state
+    uint flags = 1u;  // Active
+    writePearlState(pearlIdx, throwPos, 0.0, throwVel, playerId, throwPos, flags, pc.currentTick);
+
+    // Set cooldown for next throw
+    nextThrowTick[playerId] = pc.currentTick + PEARL_COOLDOWN_TICKS;
+
+    // Emit throw event
+    writePearlEvent(pearlIdx, EVENT_PEARL_THROWN, playerId, throwPos, 0.0);
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0:
+            // Stage 0: Tick all pearls
+            if (gid < pc.pearlCount) {
+                tickPearl(gid);
+            }
+            break;
+
+        case 1:
+            // Stage 1: Handle throw requests
+            if (gid < throwRequestCount) {
+                handleThrowRequest(gid);
+            }
+            break;
+    }
+}

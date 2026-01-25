@@ -1,0 +1,570 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 Portal Creation Shader
+// Handles nether portal frame validation, activation, and linking.
+//
+// Portal requirements (MC 1.8.9):
+// - Obsidian frame: minimum 4 wide x 5 tall (inside 2x3)
+// - Light with flint and steel (ACTION_LIGHT_PORTAL) on inside obsidian
+// - Creates purple nether portal blocks (ID 90) inside frame
+//
+// Portal linking (MC 1.8.9 algorithm):
+// - Overworld coords / 8 = Nether coords (and vice versa * 8)
+// - Search 128 block radius for existing portal in destination
+// - If none found, create new portal at safe location
+//
+// Portal cooldown:
+// - 80 tick (4 second) delay before teleport
+// - Agent must stay inside portal block
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Block IDs
+const uint BLOCK_AIR = 0;
+const uint BLOCK_OBSIDIAN = 49;
+const uint BLOCK_FIRE = 51;
+const uint BLOCK_NETHER_PORTAL = 90;
+
+// Dimension IDs
+const uint DIM_OVERWORLD = 0;
+const uint DIM_NETHER = 1;
+const uint DIM_END = 2;
+
+// Portal constants
+const int MIN_PORTAL_WIDTH = 2;   // Inside width
+const int MAX_PORTAL_WIDTH = 21;
+const int MIN_PORTAL_HEIGHT = 3;  // Inside height
+const int MAX_PORTAL_HEIGHT = 21;
+const int PORTAL_SEARCH_RADIUS = 128;
+
+// Coordinate scaling
+const float NETHER_SCALE = 8.0;
+const float NETHER_SCALE_INV = 0.125;
+
+// Nether ceiling
+const int NETHER_CEILING = 127;
+const int WORLD_HEIGHT = 256;
+
+// Portal axis (orientation)
+const uint AXIS_X = 0;  // Portal plane is perpendicular to X (runs along Z)
+const uint AXIS_Z = 1;  // Portal plane is perpendicular to Z (runs along X)
+
+// Result codes
+const uint RESULT_SUCCESS = 0;
+const uint RESULT_NO_FRAME = 1;
+const uint RESULT_WRONG_BLOCK = 2;
+const uint RESULT_ALREADY_LIT = 3;
+const uint RESULT_INVALID_DIM = 4;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint agentCount;
+    uint maxEvents;
+    float gameTime;
+    uint _pad;
+} pc;
+
+// Agent light_portal input: uvec4(agentIdx, targetX, targetY, targetZ),
+//                           uvec4(targetFace, dimension, pad, pad)
+layout(std430, set = 0, binding = 0) readonly buffer LightPortalInput {
+    uvec4 inputs[];
+};
+
+// Input count
+layout(std430, set = 0, binding = 1) readonly buffer InputCount {
+    uint inputCount;
+};
+
+// Portal creation results: uvec4(agentIdx, result, axis, pad),
+//                          ivec4(portalMinX, portalMinY, portalMinZ, portalMaxX),
+//                          ivec4(portalMaxY, portalMaxZ, linkedX, linkedY),
+//                          ivec4(linkedZ, linkedDim, pad, pad)
+layout(std430, set = 0, binding = 2) writeonly buffer PortalResults {
+    uvec4 results[];
+};
+
+layout(std430, set = 0, binding = 3) buffer ResultCount {
+    uint resultCount;
+};
+
+// Dimension extents
+layout(std430, set = 0, binding = 4) readonly buffer DimensionExtents {
+    ivec4 extentsOverworld[2];
+    ivec4 extentsNether[2];
+    ivec4 extentsEnd[2];
+};
+
+// Voxel buffers (read/write for portal creation)
+layout(std430, set = 0, binding = 5) buffer OverworldVoxels {
+    uint overworldBlocks[];
+};
+
+layout(std430, set = 0, binding = 6) buffer NetherVoxels {
+    uint netherBlocks[];
+};
+
+// Portal links table (read/write for adding new links)
+// Header: uvec4(overworldCount, netherCount, capacity, pad)
+// Each link: uvec4(srcX, srcY, srcZ, srcDim|valid<<8),
+//            uvec4(dstX, dstY, dstZ, dstDim)
+layout(std430, set = 0, binding = 7) buffer PortalLinks {
+    uvec4 linkHeader;
+    uvec4 links[];
+};
+
+// World modification events for downstream processing
+// uvec4(modType|dim<<8, blockX, blockY, blockZ),
+// uvec4(newBlockId, metadata, agentIdx, timestamp)
+layout(std430, set = 0, binding = 8) writeonly buffer WorldModifications {
+    uvec4 worldMods[];
+};
+
+layout(std430, set = 0, binding = 9) buffer WorldModCount {
+    uint worldModCount;
+};
+
+// Get dimension extents
+void getDimensionExtents(uint dim, out ivec4 ext0, out ivec4 ext1) {
+    if (dim == DIM_OVERWORLD) {
+        ext0 = extentsOverworld[0];
+        ext1 = extentsOverworld[1];
+    } else if (dim == DIM_NETHER) {
+        ext0 = extentsNether[0];
+        ext1 = extentsNether[1];
+    } else {
+        ext0 = extentsEnd[0];
+        ext1 = extentsEnd[1];
+    }
+}
+
+// Check if position is in bounds
+bool inBounds(ivec3 pos, uint dim) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(dim, ext0, ext1);
+    return pos.x >= ext0.x && pos.x < ext0.z &&
+           pos.z >= ext0.y && pos.z < ext0.w &&
+           pos.y >= 0 && pos.y < ext1.x;
+}
+
+// Get linear index for voxel access
+uint getLinearIndex(ivec3 pos, uint dim) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(dim, ext0, ext1);
+    int localX = pos.x - ext0.x;
+    int localZ = pos.z - ext0.y;
+    return uint(pos.y) * uint(ext1.y) * uint(ext1.z) + uint(localX) * uint(ext1.z) + uint(localZ);
+}
+
+// Sample block at position
+uint sampleBlock(ivec3 pos, uint dim) {
+    if (!inBounds(pos, dim)) return BLOCK_AIR;
+
+    uint linearIdx = getLinearIndex(pos, dim);
+    uint packedIdx = linearIdx / 2;
+    uint packed;
+    if (dim == DIM_OVERWORLD) {
+        packed = overworldBlocks[packedIdx];
+    } else if (dim == DIM_NETHER) {
+        packed = netherBlocks[packedIdx];
+    } else {
+        return BLOCK_AIR; // End doesn't have nether portals
+    }
+
+    if ((linearIdx & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    } else {
+        return packed >> 16;
+    }
+}
+
+// Set block at position
+void setBlock(ivec3 pos, uint blockId, uint dim) {
+    if (!inBounds(pos, dim)) return;
+
+    uint linearIdx = getLinearIndex(pos, dim);
+    uint packedIdx = linearIdx / 2;
+
+    if (dim == DIM_OVERWORLD) {
+        if ((linearIdx & 1u) == 0u) {
+            overworldBlocks[packedIdx] = (overworldBlocks[packedIdx] & 0xFFFF0000u) | (blockId & 0xFFFFu);
+        } else {
+            overworldBlocks[packedIdx] = (overworldBlocks[packedIdx] & 0x0000FFFFu) | ((blockId & 0xFFFFu) << 16);
+        }
+    } else if (dim == DIM_NETHER) {
+        if ((linearIdx & 1u) == 0u) {
+            netherBlocks[packedIdx] = (netherBlocks[packedIdx] & 0xFFFF0000u) | (blockId & 0xFFFFu);
+        } else {
+            netherBlocks[packedIdx] = (netherBlocks[packedIdx] & 0x0000FFFFu) | ((blockId & 0xFFFFu) << 16);
+        }
+    }
+}
+
+// Check if block is obsidian (frame material)
+bool isObsidian(uint blockId) {
+    return blockId == BLOCK_OBSIDIAN;
+}
+
+// Check if block can be inside portal (air, fire, or already portal)
+bool isPortalInterior(uint blockId) {
+    return blockId == BLOCK_AIR || blockId == BLOCK_FIRE || blockId == BLOCK_NETHER_PORTAL;
+}
+
+// Validate portal frame along one axis
+// Returns width (0 if invalid) and sets height
+// pos: position inside the frame where fire is lit
+// axis: AXIS_X or AXIS_Z
+bool validateFrame(ivec3 pos, uint axis, uint dim, out int width, out int height,
+                   out ivec3 frameMin, out ivec3 frameMax) {
+    // Direction vectors based on axis
+    ivec3 widthDir = (axis == AXIS_X) ? ivec3(0, 0, 1) : ivec3(1, 0, 0);
+    ivec3 depthDir = (axis == AXIS_X) ? ivec3(1, 0, 0) : ivec3(0, 0, 1);
+
+    // Find left edge of interior (negative width direction)
+    ivec3 leftEdge = pos;
+    while (true) {
+        ivec3 next = leftEdge - widthDir;
+        uint blockId = sampleBlock(next, dim);
+        if (isObsidian(blockId)) break;
+        if (!isPortalInterior(blockId)) return false;
+        leftEdge = next;
+        if (abs(leftEdge.x - pos.x) + abs(leftEdge.z - pos.z) > MAX_PORTAL_WIDTH) return false;
+    }
+
+    // Find right edge of interior (positive width direction)
+    ivec3 rightEdge = pos;
+    while (true) {
+        ivec3 next = rightEdge + widthDir;
+        uint blockId = sampleBlock(next, dim);
+        if (isObsidian(blockId)) break;
+        if (!isPortalInterior(blockId)) return false;
+        rightEdge = next;
+        if (abs(rightEdge.x - leftEdge.x) + abs(rightEdge.z - leftEdge.z) > MAX_PORTAL_WIDTH) return false;
+    }
+
+    // Calculate width
+    width = 1 + ((axis == AXIS_X) ? abs(rightEdge.z - leftEdge.z) : abs(rightEdge.x - leftEdge.x));
+    if (width < MIN_PORTAL_WIDTH || width > MAX_PORTAL_WIDTH) return false;
+
+    // Find bottom edge (search down)
+    ivec3 bottomLeft = leftEdge;
+    while (true) {
+        ivec3 next = bottomLeft - ivec3(0, 1, 0);
+        uint blockId = sampleBlock(next, dim);
+        if (isObsidian(blockId)) break;
+        if (!isPortalInterior(blockId)) return false;
+        bottomLeft = next;
+        if (pos.y - bottomLeft.y > MAX_PORTAL_HEIGHT) return false;
+    }
+
+    // Find top edge (search up)
+    ivec3 topLeft = leftEdge;
+    while (true) {
+        ivec3 next = topLeft + ivec3(0, 1, 0);
+        uint blockId = sampleBlock(next, dim);
+        if (isObsidian(blockId)) break;
+        if (!isPortalInterior(blockId)) return false;
+        topLeft = next;
+        if (topLeft.y - bottomLeft.y > MAX_PORTAL_HEIGHT) return false;
+    }
+
+    // Calculate height
+    height = topLeft.y - bottomLeft.y + 1;
+    if (height < MIN_PORTAL_HEIGHT || height > MAX_PORTAL_HEIGHT) return false;
+
+    // Set frame bounds (interior region)
+    frameMin = bottomLeft;
+    frameMax = ivec3((axis == AXIS_X) ? bottomLeft.x : rightEdge.x,
+                     topLeft.y,
+                     (axis == AXIS_X) ? rightEdge.z : bottomLeft.z);
+
+    // Validate complete obsidian frame
+    // Check bottom row of obsidian
+    for (int i = -1; i <= width; i++) {
+        ivec3 checkPos = bottomLeft + widthDir * i - ivec3(0, 1, 0);
+        if (!isObsidian(sampleBlock(checkPos, dim))) return false;
+    }
+
+    // Check top row of obsidian
+    for (int i = -1; i <= width; i++) {
+        ivec3 checkPos = topLeft + widthDir * i + ivec3(0, 1, 0);
+        if (!isObsidian(sampleBlock(checkPos, dim))) return false;
+    }
+
+    // Check left column of obsidian
+    for (int y = 0; y < height; y++) {
+        ivec3 checkPos = bottomLeft - widthDir + ivec3(0, y, 0);
+        if (!isObsidian(sampleBlock(checkPos, dim))) return false;
+    }
+
+    // Check right column of obsidian
+    for (int y = 0; y < height; y++) {
+        ivec3 checkPos = bottomLeft + widthDir * width + ivec3(0, y, 0);
+        if (!isObsidian(sampleBlock(checkPos, dim))) return false;
+    }
+
+    // Validate interior is all air/fire/portal
+    for (int y = 0; y < height; y++) {
+        for (int w = 0; w < width; w++) {
+            ivec3 interior = bottomLeft + widthDir * w + ivec3(0, y, 0);
+            if (!isPortalInterior(sampleBlock(interior, dim))) return false;
+        }
+    }
+
+    return true;
+}
+
+// Fill portal interior with nether portal blocks
+void fillPortal(ivec3 frameMin, ivec3 frameMax, uint axis, uint dim, uint agentIdx) {
+    ivec3 widthDir = (axis == AXIS_X) ? ivec3(0, 0, 1) : ivec3(1, 0, 0);
+
+    int width = (axis == AXIS_X) ? (frameMax.z - frameMin.z + 1) : (frameMax.x - frameMin.x + 1);
+    int height = frameMax.y - frameMin.y + 1;
+
+    for (int y = 0; y <= height - 1; y++) {
+        for (int w = 0; w < width; w++) {
+            ivec3 pos = frameMin + widthDir * w + ivec3(0, y, 0);
+            setBlock(pos, BLOCK_NETHER_PORTAL, dim);
+
+            // Record world modification event
+            uint modIdx = atomicAdd(worldModCount, 1u);
+            if (modIdx < pc.maxEvents) {
+                worldMods[modIdx * 2] = uvec4(1u | (dim << 8), uint(pos.x), uint(pos.y), uint(pos.z));
+                worldMods[modIdx * 2 + 1] = uvec4(BLOCK_NETHER_PORTAL, axis, agentIdx, floatBitsToUint(pc.gameTime));
+            }
+        }
+    }
+}
+
+// Scale coordinates between dimensions
+ivec3 scaleCoordinates(ivec3 pos, uint fromDim, uint toDim) {
+    if (fromDim == DIM_OVERWORLD && toDim == DIM_NETHER) {
+        return ivec3(int(floor(float(pos.x) * NETHER_SCALE_INV)),
+                     pos.y,
+                     int(floor(float(pos.z) * NETHER_SCALE_INV)));
+    } else if (fromDim == DIM_NETHER && toDim == DIM_OVERWORLD) {
+        return ivec3(int(floor(float(pos.x) * NETHER_SCALE)),
+                     pos.y,
+                     int(floor(float(pos.z) * NETHER_SCALE)));
+    }
+    return pos;
+}
+
+// Search for existing portal in destination dimension
+bool findExistingPortal(ivec3 searchCenter, uint destDim, out ivec3 portalPos) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(destDim, ext0, ext1);
+
+    int maxY = (destDim == DIM_NETHER) ? NETHER_CEILING : WORLD_HEIGHT;
+
+    // Spiral search pattern within 128 block radius
+    for (int radius = 0; radius <= PORTAL_SEARCH_RADIUS; radius++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                // Only check perimeter for radius > 0
+                if (radius > 0 && abs(dx) != radius && abs(dz) != radius) continue;
+
+                int searchX = searchCenter.x + dx;
+                int searchZ = searchCenter.z + dz;
+
+                // Check bounds
+                if (searchX < ext0.x || searchX >= ext0.z ||
+                    searchZ < ext0.y || searchZ >= ext0.w) continue;
+
+                // Search Y levels
+                for (int y = 1; y < maxY - 1; y++) {
+                    ivec3 checkPos = ivec3(searchX, y, searchZ);
+                    if (sampleBlock(checkPos, destDim) == BLOCK_NETHER_PORTAL) {
+                        portalPos = checkPos;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Find safe position for portal creation in destination
+ivec3 findSafePortalPosition(ivec3 targetPos, uint destDim) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(destDim, ext0, ext1);
+
+    int maxY = (destDim == DIM_NETHER) ? NETHER_CEILING - 5 : WORLD_HEIGHT - 5;
+
+    // Clamp to world bounds
+    int x = clamp(targetPos.x, ext0.x + 2, ext0.z - 3);
+    int z = clamp(targetPos.z, ext0.y + 2, ext0.w - 3);
+    int startY = clamp(targetPos.y, 4, maxY);
+
+    // Search for 2-wide, 3-tall air space with solid floor
+    for (int dy = 0; dy < 64; dy++) {
+        int y = startY + (((dy & 1) == 0) ? (dy / 2) : -(dy / 2 + 1));
+        if (y < 4 || y > maxY) continue;
+
+        ivec3 checkPos = ivec3(x, y, z);
+
+        // Check for solid ground below
+        bool hasFloor = true;
+        for (int fx = 0; fx < 2; fx++) {
+            uint floorBlock = sampleBlock(checkPos + ivec3(fx, -1, 0), destDim);
+            if (floorBlock == BLOCK_AIR || floorBlock == BLOCK_NETHER_PORTAL) {
+                hasFloor = false;
+                break;
+            }
+        }
+        if (!hasFloor) continue;
+
+        // Check for air space (2x3x1)
+        bool hasSpace = true;
+        for (int fy = 0; fy < 3; fy++) {
+            for (int fx = 0; fx < 2; fx++) {
+                uint spaceBlock = sampleBlock(checkPos + ivec3(fx, fy, 0), destDim);
+                if (spaceBlock != BLOCK_AIR) {
+                    hasSpace = false;
+                    break;
+                }
+            }
+            if (!hasSpace) break;
+        }
+        if (hasSpace) {
+            return checkPos;
+        }
+    }
+
+    // Fallback: just use the target position clamped to valid range
+    return ivec3(x, clamp(startY, 4, maxY), z);
+}
+
+// Add portal link to the links table
+void addPortalLink(ivec3 srcPos, uint srcDim, ivec3 dstPos, uint dstDim) {
+    uint overworldCount = linkHeader.x;
+    uint netherCount = linkHeader.y;
+    uint capacity = linkHeader.z;
+
+    uint linkIdx;
+    if (srcDim == DIM_OVERWORLD) {
+        linkIdx = atomicAdd(linkHeader.x, 1u);
+    } else {
+        linkIdx = overworldCount + atomicAdd(linkHeader.y, 1u);
+    }
+
+    if (linkIdx < capacity) {
+        links[linkIdx * 2] = uvec4(uint(srcPos.x), uint(srcPos.y), uint(srcPos.z), srcDim | (1u << 8));
+        links[linkIdx * 2 + 1] = uvec4(uint(dstPos.x), uint(dstPos.y), uint(dstPos.z), dstDim);
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= inputCount) return;
+
+    // Read input
+    uvec4 in0 = inputs[idx * 2];
+    uvec4 in1 = inputs[idx * 2 + 1];
+
+    uint agentIdx = in0.x;
+    ivec3 targetPos = ivec3(int(in0.y), int(in0.z), int(in0.w));
+    uint targetFace = in1.x;
+    uint dimension = in1.y;
+
+    // Can't create nether portals in the End
+    if (dimension == DIM_END) {
+        uint resultIdx = atomicAdd(resultCount, 1u);
+        if (resultIdx < pc.maxEvents) {
+            results[resultIdx * 4] = uvec4(agentIdx, RESULT_INVALID_DIM, 0u, 0u);
+            results[resultIdx * 4 + 1] = ivec4(0);
+            results[resultIdx * 4 + 2] = ivec4(0);
+            results[resultIdx * 4 + 3] = ivec4(0);
+        }
+        return;
+    }
+
+    // Check if target block is obsidian (frame block)
+    uint targetBlock = sampleBlock(targetPos, dimension);
+    if (!isObsidian(targetBlock)) {
+        uint resultIdx = atomicAdd(resultCount, 1u);
+        if (resultIdx < pc.maxEvents) {
+            results[resultIdx * 4] = uvec4(agentIdx, RESULT_WRONG_BLOCK, 0u, 0u);
+            results[resultIdx * 4 + 1] = ivec4(0);
+            results[resultIdx * 4 + 2] = ivec4(0);
+            results[resultIdx * 4 + 3] = ivec4(0);
+        }
+        return;
+    }
+
+    // Get the position inside the frame (offset from clicked face)
+    ivec3 interiorPos = targetPos;
+    if (targetFace == 0) interiorPos.y -= 1;      // DOWN
+    else if (targetFace == 1) interiorPos.y += 1; // UP
+    else if (targetFace == 2) interiorPos.z -= 1; // NORTH
+    else if (targetFace == 3) interiorPos.z += 1; // SOUTH
+    else if (targetFace == 4) interiorPos.x -= 1; // WEST
+    else if (targetFace == 5) interiorPos.x += 1; // EAST
+
+    // Check if interior position is already a portal
+    if (sampleBlock(interiorPos, dimension) == BLOCK_NETHER_PORTAL) {
+        uint resultIdx = atomicAdd(resultCount, 1u);
+        if (resultIdx < pc.maxEvents) {
+            results[resultIdx * 4] = uvec4(agentIdx, RESULT_ALREADY_LIT, 0u, 0u);
+            results[resultIdx * 4 + 1] = ivec4(0);
+            results[resultIdx * 4 + 2] = ivec4(0);
+            results[resultIdx * 4 + 3] = ivec4(0);
+        }
+        return;
+    }
+
+    // Try both axes to find valid frame
+    int width, height;
+    ivec3 frameMin, frameMax;
+    uint validAxis = 0xFFFFFFFFu;
+
+    // Try X-axis portal (runs along Z)
+    if (validateFrame(interiorPos, AXIS_X, dimension, width, height, frameMin, frameMax)) {
+        validAxis = AXIS_X;
+    }
+    // Try Z-axis portal (runs along X)
+    else if (validateFrame(interiorPos, AXIS_Z, dimension, width, height, frameMin, frameMax)) {
+        validAxis = AXIS_Z;
+    }
+
+    if (validAxis == 0xFFFFFFFFu) {
+        uint resultIdx = atomicAdd(resultCount, 1u);
+        if (resultIdx < pc.maxEvents) {
+            results[resultIdx * 4] = uvec4(agentIdx, RESULT_NO_FRAME, 0u, 0u);
+            results[resultIdx * 4 + 1] = ivec4(0);
+            results[resultIdx * 4 + 2] = ivec4(0);
+            results[resultIdx * 4 + 3] = ivec4(0);
+        }
+        return;
+    }
+
+    // Fill portal with nether portal blocks
+    fillPortal(frameMin, frameMax, validAxis, dimension, agentIdx);
+
+    // Calculate destination dimension and coordinates
+    uint destDim = (dimension == DIM_OVERWORLD) ? DIM_NETHER : DIM_OVERWORLD;
+    ivec3 portalCenter = (frameMin + frameMax) / 2;
+    ivec3 scaledPos = scaleCoordinates(portalCenter, dimension, destDim);
+
+    // Search for existing portal in destination
+    ivec3 linkedPos;
+    bool foundExisting = findExistingPortal(scaledPos, destDim, linkedPos);
+
+    if (!foundExisting) {
+        // Find safe position for new portal (will be created when first used)
+        linkedPos = findSafePortalPosition(scaledPos, destDim);
+    }
+
+    // Add portal link
+    addPortalLink(portalCenter, dimension, linkedPos, destDim);
+
+    // Write success result
+    uint resultIdx = atomicAdd(resultCount, 1u);
+    if (resultIdx < pc.maxEvents) {
+        results[resultIdx * 4] = uvec4(agentIdx, RESULT_SUCCESS, validAxis, 0u);
+        results[resultIdx * 4 + 1] = ivec4(frameMin.x, frameMin.y, frameMin.z, frameMax.x);
+        results[resultIdx * 4 + 2] = ivec4(frameMax.y, frameMax.z, linkedPos.x, linkedPos.y);
+        results[resultIdx * 4 + 3] = ivec4(linkedPos.z, destDim, foundExisting ? 1 : 0, 0);
+    }
+}

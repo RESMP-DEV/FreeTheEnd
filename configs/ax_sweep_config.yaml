@@ -1,0 +1,80 @@
+# Hyperparameter sweep configuration using Ax/BoTorch
+# Local Bayesian optimization - no external service dependency
+
+experiment:
+  name: minecraft_speedrun_ppo
+  objective: eval/success_rate
+  minimize: false
+
+parameters:
+  # Learning rate: log-scale exploration
+  - name: learning_rate
+    type: range
+    bounds: [1e-5, 1e-3]
+    log_scale: true
+    value_type: float
+
+  # Rollout steps per update
+  - name: n_steps
+    type: choice
+    values: [64, 128, 256, 512]
+    value_type: int
+
+  # Minibatch size
+  - name: batch_size
+    type: choice
+    values: [64, 128, 256, 512]
+    value_type: int
+
+  # PPO epochs per update
+  - name: n_epochs
+    type: choice
+    values: [3, 4, 5, 10]
+    value_type: int
+
+  # Discount factor
+  - name: gamma
+    type: range
+    bounds: [0.95, 0.999]
+    value_type: float
+
+  # GAE lambda
+  - name: gae_lambda
+    type: range
+    bounds: [0.9, 0.99]
+    value_type: float
+
+  # Entropy coefficient (log-scale for exploration)
+  - name: ent_coef
+    type: range
+    bounds: [1e-4, 1e-1]
+    log_scale: true
+    value_type: float
+
+  # PPO clip range
+  - name: clip_range
+    type: choice
+    values: [0.1, 0.2, 0.3]
+    value_type: float
+
+# Generation strategy: Sobol quasi-random for initial exploration, then GP/BoTorch
+generation_strategy:
+  steps:
+    - model: SOBOL
+      num_trials: 10 # Initial quasi-random exploration
+    - model: BOTORCH_MODULAR
+      num_trials: -1 # Bayesian optimization until budget exhausted
+
+# Early stopping via scheduler
+scheduler:
+  # Total trial budget
+  total_trials: 50
+  # Max parallel trials (set to num GPUs or leave 1 for sequential)
+  max_pending_trials: 1
+
+# Fixed values (not swept)
+defaults:
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  normalize_advantage: true
+  target_kl: null

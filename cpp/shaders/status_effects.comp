@@ -1,0 +1,279 @@
+#version 450
+
+// Minecraft 1.8.9 status effect processing
+// Handles duration tick-down and periodic effect application
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Status effect IDs (MC 1.8.9)
+const uint EFFECT_NONE = 0;
+const uint EFFECT_SPEED = 1;
+const uint EFFECT_SLOWNESS = 2;
+const uint EFFECT_HASTE = 3;
+const uint EFFECT_MINING_FATIGUE = 4;
+const uint EFFECT_STRENGTH = 5;
+const uint EFFECT_INSTANT_HEALTH = 6;
+const uint EFFECT_INSTANT_DAMAGE = 7;
+const uint EFFECT_JUMP_BOOST = 8;
+const uint EFFECT_NAUSEA = 9;
+const uint EFFECT_REGENERATION = 10;
+const uint EFFECT_RESISTANCE = 11;
+const uint EFFECT_FIRE_RESISTANCE = 12;
+const uint EFFECT_WATER_BREATHING = 13;
+const uint EFFECT_INVISIBILITY = 14;
+const uint EFFECT_BLINDNESS = 15;
+const uint EFFECT_NIGHT_VISION = 16;
+const uint EFFECT_HUNGER = 17;
+const uint EFFECT_WEAKNESS = 18;
+const uint EFFECT_POISON = 19;
+const uint EFFECT_WITHER = 20;
+const uint EFFECT_HEALTH_BOOST = 21;
+const uint EFFECT_ABSORPTION = 22;
+const uint EFFECT_SATURATION = 23;
+
+// Max concurrent effects per player
+const uint MAX_EFFECTS = 8;
+
+// StatusEffect struct: packed for GPU efficiency
+// Layout: [effect_id:8][amplifier:8][flags:8][reserved:8][duration:32]
+// flags: bit 0 = show_particles, bit 1 = ambient
+struct StatusEffect {
+    uint packed_data;    // effect_id | (amplifier << 8) | (flags << 16)
+    float duration;      // Remaining duration in ticks
+};
+
+layout(std430, set = 0, binding = 0) buffer StatusEffectsBuffer {
+    StatusEffect effects[];  // [player_count * MAX_EFFECTS]
+} effects_buf;
+
+// Health buffer for instant effects
+layout(std430, set = 0, binding = 1) buffer HealthBuffer {
+    float health[];
+} health_buf;
+
+layout(std430, set = 0, binding = 2) buffer MaxHealthBuffer {
+    float max_health[];
+} max_health_buf;
+
+// Regen accumulator (for regeneration effect timing)
+layout(std430, set = 0, binding = 3) buffer RegenAccumBuffer {
+    float regen_accum[];
+} regen_buf;
+
+// Poison accumulator
+layout(std430, set = 0, binding = 4) buffer PoisonAccumBuffer {
+    float poison_accum[];
+} poison_buf;
+
+// Wither accumulator
+layout(std430, set = 0, binding = 5) buffer WitherAccumBuffer {
+    float wither_accum[];
+} wither_buf;
+
+// Hunger effect accumulator (adds exhaustion)
+layout(std430, set = 0, binding = 6) buffer HungerExhaustionBuffer {
+    float hunger_exhaustion[];
+} hunger_exhaust_buf;
+
+// Food/saturation for saturation effect
+layout(std430, set = 0, binding = 7) buffer FoodBuffer {
+    float food_level[];
+} food_buf;
+
+layout(std430, set = 0, binding = 8) buffer SaturationBuffer {
+    float saturation[];
+} saturation_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint player_count;
+    float tick_delta;
+} pc;
+
+// Unpack effect ID from packed data
+uint get_effect_id(uint packed) {
+    return packed & 0xFF;
+}
+
+// Unpack amplifier (level - 1, so amplifier 0 = level 1)
+uint get_amplifier(uint packed) {
+    return (packed >> 8) & 0xFF;
+}
+
+// Unpack flags
+uint get_flags(uint packed) {
+    return (packed >> 16) & 0xFF;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.player_count) return;
+
+    uint base_effect_idx = idx * MAX_EFFECTS;
+    float current_health = health_buf.health[idx];
+    float current_max_health = max_health_buf.max_health[idx];
+
+    // Accumulators for timed effects
+    float regen_accum = regen_buf.regen_accum[idx];
+    float poison_accum = poison_buf.poison_accum[idx];
+    float wither_accum = wither_buf.wither_accum[idx];
+    float hunger_exhaustion = 0.0;
+
+    // Track is_active regen/poison/wither amplifier for this tick
+    int active_regen_amp = -1;
+    int active_poison_amp = -1;
+    int active_wither_amp = -1;
+    bool has_hunger_effect = false;
+    int hunger_amp = 0;
+
+    // Process each effect slot
+    for (uint i = 0; i < MAX_EFFECTS; i++) {
+        uint eff_idx = base_effect_idx + i;
+        StatusEffect eff = effects_buf.effects[eff_idx];
+        uint effect_id = get_effect_id(eff.packed_data);
+
+        if (effect_id == EFFECT_NONE || eff.duration <= 0.0) continue;
+
+        uint amplifier = get_amplifier(eff.packed_data);
+
+        // Tick down duration
+        eff.duration -= pc.tick_delta * 20.0;  // Convert seconds to ticks
+
+        // Handle effect application
+        switch (effect_id) {
+            case EFFECT_INSTANT_HEALTH:
+                // Instant: apply immediately, clear effect
+                current_health = min(current_max_health,
+                    current_health + 4.0 * float(amplifier + 1));
+                eff.duration = 0.0;
+                eff.packed_data = 0;
+                break;
+
+            case EFFECT_INSTANT_DAMAGE:
+                // Instant damage
+                current_health = max(0.0,
+                    current_health - 6.0 * float(amplifier + 1));
+                eff.duration = 0.0;
+                eff.packed_data = 0;
+                break;
+
+            case EFFECT_REGENERATION:
+                // Track highest amplifier regen active
+                if (int(amplifier) > active_regen_amp) {
+                    active_regen_amp = int(amplifier);
+                }
+                break;
+
+            case EFFECT_POISON:
+                // Track highest amplifier poison active
+                if (int(amplifier) > active_poison_amp) {
+                    active_poison_amp = int(amplifier);
+                }
+                break;
+
+            case EFFECT_WITHER:
+                // Track highest amplifier wither active
+                if (int(amplifier) > active_wither_amp) {
+                    active_wither_amp = int(amplifier);
+                }
+                break;
+
+            case EFFECT_HUNGER:
+                has_hunger_effect = true;
+                if (int(amplifier) > hunger_amp) {
+                    hunger_amp = int(amplifier);
+                }
+                break;
+
+            case EFFECT_SATURATION:
+                // Instantly restores food and saturation each tick
+                {
+                    float restore = float(amplifier + 1) * pc.tick_delta * 20.0;
+                    float food = food_buf.food_level[idx];
+                    float sat = saturation_buf.saturation[idx];
+                    food = min(20.0, food + restore);
+                    sat = min(food, sat + restore * 2.0);
+                    food_buf.food_level[idx] = food;
+                    saturation_buf.saturation[idx] = sat;
+                }
+                break;
+
+            // Effects handled by other systems (movement, rendering, etc.)
+            case EFFECT_SPEED:
+            case EFFECT_SLOWNESS:
+            case EFFECT_HASTE:
+            case EFFECT_MINING_FATIGUE:
+            case EFFECT_STRENGTH:
+            case EFFECT_JUMP_BOOST:
+            case EFFECT_NAUSEA:
+            case EFFECT_RESISTANCE:
+            case EFFECT_FIRE_RESISTANCE:
+            case EFFECT_WATER_BREATHING:
+            case EFFECT_INVISIBILITY:
+            case EFFECT_BLINDNESS:
+            case EFFECT_NIGHT_VISION:
+            case EFFECT_WEAKNESS:
+            case EFFECT_HEALTH_BOOST:
+            case EFFECT_ABSORPTION:
+                // These modify other systems - flag still active
+                break;
+        }
+
+        // Clear expired effects
+        if (eff.duration <= 0.0) {
+            eff.packed_data = 0;
+            eff.duration = 0.0;
+        }
+
+        effects_buf.effects[eff_idx] = eff;
+    }
+
+    // Apply periodic regeneration (every 50 ticks at amp 0, faster at higher)
+    if (active_regen_amp >= 0) {
+        float regen_interval = 50.0 / float(active_regen_amp + 1);  // Ticks
+        regen_accum += pc.tick_delta * 20.0;
+        if (regen_accum >= regen_interval) {
+            regen_accum -= regen_interval;
+            current_health = min(current_max_health, current_health + 1.0);
+        }
+    } else {
+        regen_accum = 0.0;
+    }
+
+    // Apply periodic poison (every 25 ticks at amp 0)
+    if (active_poison_amp >= 0) {
+        float poison_interval = 25.0 / float(active_poison_amp + 1);
+        poison_accum += pc.tick_delta * 20.0;
+        if (poison_accum >= poison_interval) {
+            poison_accum -= poison_interval;
+            // Poison cannot kill - minimum 1 HP
+            current_health = max(1.0, current_health - 1.0);
+        }
+    } else {
+        poison_accum = 0.0;
+    }
+
+    // Apply periodic wither (every 40 ticks at amp 0)
+    if (active_wither_amp >= 0) {
+        float wither_interval = 40.0 / float(active_wither_amp + 1);
+        wither_accum += pc.tick_delta * 20.0;
+        if (wither_accum >= wither_interval) {
+            wither_accum -= wither_interval;
+            // Wither CAN kill
+            current_health = max(0.0, current_health - 1.0);
+        }
+    } else {
+        wither_accum = 0.0;
+    }
+
+    // Hunger effect adds exhaustion
+    if (has_hunger_effect) {
+        hunger_exhaustion = 0.005 * float(hunger_amp + 1) * pc.tick_delta * 20.0;
+    }
+
+    // Write back
+    health_buf.health[idx] = current_health;
+    regen_buf.regen_accum[idx] = regen_accum;
+    poison_buf.poison_accum[idx] = poison_accum;
+    wither_buf.wither_accum[idx] = wither_accum;
+    hunger_exhaust_buf.hunger_exhaustion[idx] = hunger_exhaustion;
+}

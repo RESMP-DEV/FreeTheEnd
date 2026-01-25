@@ -1,0 +1,688 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Mob Targeting and Aggro System
+//
+// Computes target selection for hostile mobs based on Minecraft 1.8.9 rules:
+// - Zombie/Skeleton/Creeper: 40 block aggro range (16 through walls), lose aggro after 30s
+// - Enderman: Passive until looked at, stays aggro until killed/teleports far
+// - Blaze: 48 block range, always hostile in fortress, targets highest threat
+// - Zombie Pigman: Neutral, group aggro when ANY in 32 blocks hit, calms after 40s
+//
+// Output per mob:
+//   target_entity_id: int (-1 if none)
+//   aggro_level: float (0-1)
+//   time_since_sight: uint (ticks)
+// ============================================================================
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const uint MOB_TYPE_ZOMBIE = 0;
+const uint MOB_TYPE_SKELETON = 1;
+const uint MOB_TYPE_ENDERMAN = 2;
+const uint MOB_TYPE_BLAZE = 3;
+const uint MOB_TYPE_ZOMBIE_PIGMAN = 4;
+const uint MOB_TYPE_CREEPER = 5;
+
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;
+const uint AI_STATE_FLEE = 4;
+const uint AI_STATE_TELEPORT = 5;
+const uint AI_STATE_ANGRY = 6;
+const uint AI_STATE_FIREBALL = 7;
+const uint AI_STATE_AGGRO = 8;
+const uint AI_STATE_DEAD = 9;
+
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_IN_WATER = 1 << 1;
+const uint MOB_FLAG_IN_LAVA = 1 << 2;
+const uint MOB_FLAG_NO_AI = 1 << 3;
+const uint MOB_FLAG_PERSISTENT = 1 << 4;
+const uint MOB_FLAG_BURNING = 1 << 6;
+
+// Targeting constants per mob type
+const float ZOMBIE_AGGRO_RANGE = 40.0;
+const float ZOMBIE_AGGRO_THROUGH_WALLS = 16.0;
+const uint ZOMBIE_LOSE_AGGRO_TICKS = 600;  // 30 seconds at 20 tps
+
+const float SKELETON_AGGRO_RANGE = 40.0;
+const float SKELETON_AGGRO_THROUGH_WALLS = 16.0;
+const uint SKELETON_LOSE_AGGRO_TICKS = 600;
+
+const float CREEPER_AGGRO_RANGE = 40.0;
+const float CREEPER_AGGRO_THROUGH_WALLS = 16.0;
+const uint CREEPER_LOSE_AGGRO_TICKS = 600;
+
+const float BLAZE_AGGRO_RANGE = 48.0;
+const float BLAZE_FORTRESS_BONUS = 1.5;  // More aggressive in fortress
+
+const float PIGMAN_NEUTRAL_RANGE = 32.0;
+const uint PIGMAN_CALM_TICKS = 800;  // 40 seconds at 20 tps
+
+const float ENDERMAN_DETECTION_RANGE = 64.0;
+const float ENDERMAN_STARE_ANGLE = 0.025;  // ~1.5 degrees
+
+// Line of sight constants
+const uint MAX_RAYCAST_STEPS = 64;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+    vec3 look_direction;  // For enderman stare detection
+    float threat_level;   // For blaze priority targeting
+};
+
+// Targeting output (separate buffer for CPU to read)
+struct TargetingResult {
+    int target_entity_id;   // -1 if no target
+    float aggro_level;      // 0-1 intensity
+    uint time_since_sight;  // Ticks since last line of sight
+    uint flags;             // Reserved for future use
+};
+
+// Pigman aggro events (shared between all pigmen)
+struct AggroEvent {
+    vec3 position;          // Where the attack occurred
+    uint attacker_entity;   // Who attacked
+    uint tick;              // When it happened
+    uint _pad[3];
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer TargetingBuffer {
+    TargetingResult targets[];
+};
+
+// Shared aggro events for pigmen group behavior
+layout(set = 0, binding = 4) buffer AggroEventBuffer {
+    uint aggro_event_count;
+    AggroEvent aggro_events[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+    uint in_fortress;      // 1 if in nether fortress (for blaze behavior)
+} pc;
+
+// ============================================================================
+// Shared Memory
+// ============================================================================
+
+shared uint s_pigman_aggro_target;
+shared uint s_pigman_has_aggro;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+// Block queries
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+bool is_solid(uint block_id) {
+    // Air (0), water (8,9), lava (10,11), glass (20), leaves (18) are not solid for LOS
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11 && block_id != 20 && block_id != 18;
+}
+
+bool is_transparent(uint block_id) {
+    return block_id == 0 || block_id == 20 || block_id == 18 ||
+           block_id == 8 || block_id == 9;  // Air, glass, leaves, water
+}
+
+// ============================================================================
+// Line of Sight Raycast (DDA algorithm)
+// ============================================================================
+
+bool has_line_of_sight(vec3 from, vec3 to) {
+    vec3 dir = to - from;
+    float max_dist = length(dir);
+    if (max_dist < 0.001) return true;
+
+    dir = dir / max_dist;
+
+    vec3 pos = from;
+    vec3 step_sign = sign(dir);
+    vec3 t_delta = abs(vec3(1.0) / max(abs(dir), vec3(0.0001)));
+
+    ivec3 block_pos = world_to_block(from);
+    ivec3 end_block = world_to_block(to);
+
+    vec3 t_max;
+    t_max.x = (step_sign.x > 0 ? (float(block_pos.x + 1) - from.x) : (from.x - float(block_pos.x))) * t_delta.x;
+    t_max.y = (step_sign.y > 0 ? (float(block_pos.y + 1) - from.y) : (from.y - float(block_pos.y))) * t_delta.y;
+    t_max.z = (step_sign.z > 0 ? (float(block_pos.z + 1) - from.z) : (from.z - float(block_pos.z))) * t_delta.z;
+
+    for (uint i = 0; i < MAX_RAYCAST_STEPS; i++) {
+        if (block_pos == end_block) {
+            return true;
+        }
+
+        uint block = get_block_at(block_pos);
+        if (is_solid(block)) {
+            return false;
+        }
+
+        // Step to next block
+        if (t_max.x < t_max.y) {
+            if (t_max.x < t_max.z) {
+                block_pos.x += int(step_sign.x);
+                t_max.x += t_delta.x;
+            } else {
+                block_pos.z += int(step_sign.z);
+                t_max.z += t_delta.z;
+            }
+        } else {
+            if (t_max.y < t_max.z) {
+                block_pos.y += int(step_sign.y);
+                t_max.y += t_delta.y;
+            } else {
+                block_pos.z += int(step_sign.z);
+                t_max.z += t_delta.z;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Entity Queries
+// ============================================================================
+
+vec3 get_entity_position(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool entity_exists(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Find nearest player with optional LOS requirement
+uint find_nearest_player(vec3 pos, float max_range, bool require_los, out float out_dist) {
+    uint nearest = 0xFFFFFFFF;
+    float nearest_dist_sq = max_range * max_range;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist_sq = distance_squared(pos, entities[i].position);
+        if (dist_sq < nearest_dist_sq) {
+            if (!require_los || has_line_of_sight(pos + vec3(0, 1.6, 0), entities[i].position + vec3(0, 1.6, 0))) {
+                nearest_dist_sq = dist_sq;
+                nearest = entities[i].entity_id;
+            }
+        }
+    }
+
+    out_dist = sqrt(nearest_dist_sq);
+    return nearest;
+}
+
+// Find highest threat player (for blaze targeting)
+uint find_highest_threat_player(vec3 pos, float max_range, out float out_dist) {
+    uint best_target = 0xFFFFFFFF;
+    float best_score = -1.0;
+    float best_dist = max_range;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist = distance(pos, entities[i].position);
+        if (dist > max_range) continue;
+
+        // Threat score: threat_level + proximity bonus + LOS bonus
+        float threat = entities[i].threat_level;
+        float proximity_bonus = 1.0 - (dist / max_range);
+        float los_bonus = has_line_of_sight(pos, entities[i].position) ? 0.5 : 0.0;
+
+        float score = threat + proximity_bonus * 0.5 + los_bonus;
+
+        if (score > best_score) {
+            best_score = score;
+            best_target = entities[i].entity_id;
+            best_dist = dist;
+        }
+    }
+
+    out_dist = best_dist;
+    return best_target;
+}
+
+// Check if player is looking at enderman head hitbox
+bool is_player_staring_at_enderman(vec3 enderman_pos, vec3 player_pos, vec3 player_look) {
+    // Enderman head hitbox: approximately at y+2.5 relative to feet
+    vec3 head_pos = enderman_pos + vec3(0.0, 2.5, 0.0);
+    vec3 to_head = normalize_safe(head_pos - player_pos);
+
+    float dot_product = dot(player_look, to_head);
+    return dot_product > cos(ENDERMAN_STARE_ANGLE);
+}
+
+// ============================================================================
+// Mob-Specific Targeting Logic
+// ============================================================================
+
+// Zombie/Skeleton/Creeper targeting: 40 blocks with LOS, 16 through walls
+void target_standard_hostile(inout MobState mob, inout TargetingResult result, float full_range, float wall_range, uint lose_aggro_ticks) {
+    // Already has target - check if still valid
+    if (mob.target_entity_id != 0xFFFFFFFF) {
+        if (!entity_exists(mob.target_entity_id)) {
+            mob.target_entity_id = 0xFFFFFFFF;
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            return;
+        }
+
+        vec3 target_pos = get_entity_position(mob.target_entity_id);
+        float dist = distance(mob.position, target_pos);
+        bool has_los = has_line_of_sight(mob.position + vec3(0, 1.6, 0), target_pos + vec3(0, 1.6, 0));
+
+        // Update time since sight
+        if (has_los) {
+            result.time_since_sight = 0;
+        } else {
+            result.time_since_sight++;
+        }
+
+        // Lose aggro conditions
+        if (dist > full_range * 1.5 || result.time_since_sight > lose_aggro_ticks) {
+            mob.target_entity_id = 0xFFFFFFFF;
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            result.time_since_sight = 0;
+            return;
+        }
+
+        // Still tracking
+        result.target_entity_id = int(mob.target_entity_id);
+        result.aggro_level = has_los ? 1.0 : 0.5;
+        return;
+    }
+
+    // No current target - look for one
+    float dist;
+
+    // First try with LOS at full range
+    uint target = find_nearest_player(mob.position, full_range, true, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        result.target_entity_id = int(target);
+        result.aggro_level = 1.0;
+        result.time_since_sight = 0;
+        return;
+    }
+
+    // Fall back to through-walls at reduced range
+    target = find_nearest_player(mob.position, wall_range, false, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        result.target_entity_id = int(target);
+        result.aggro_level = 0.5;  // Lower aggro without LOS
+        result.time_since_sight = 1;  // Start counting immediately
+        return;
+    }
+
+    // No target found
+    result.target_entity_id = -1;
+    result.aggro_level = 0.0;
+    result.time_since_sight = 0;
+}
+
+// Enderman targeting: passive until looked at
+void target_enderman(inout MobState mob, inout TargetingResult result, uint idx) {
+    // If already aggro, stay aggro until killed or teleports very far
+    if (mob.target_entity_id != 0xFFFFFFFF && mob.ai_state >= AI_STATE_ANGRY) {
+        if (!entity_exists(mob.target_entity_id)) {
+            mob.target_entity_id = 0xFFFFFFFF;
+            mob.ai_state = AI_STATE_IDLE;
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            return;
+        }
+
+        vec3 target_pos = get_entity_position(mob.target_entity_id);
+        float dist = distance(mob.position, target_pos);
+
+        // Only lose aggro if very far (teleported away)
+        if (dist > ENDERMAN_DETECTION_RANGE * 2.0) {
+            mob.target_entity_id = 0xFFFFFFFF;
+            mob.ai_state = AI_STATE_IDLE;
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            return;
+        }
+
+        bool has_los = has_line_of_sight(mob.position + vec3(0, 2.5, 0), target_pos + vec3(0, 1.6, 0));
+        result.time_since_sight = has_los ? 0 : result.time_since_sight + 1;
+        result.target_entity_id = int(mob.target_entity_id);
+        result.aggro_level = 1.0;
+        return;
+    }
+
+    // Passive - check if any player is looking at us
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist = distance(mob.position, entities[i].position);
+        if (dist > ENDERMAN_DETECTION_RANGE) continue;
+
+        // Check if player is staring at enderman's head
+        if (is_player_staring_at_enderman(mob.position, entities[i].position, entities[i].look_direction)) {
+            // Check LOS from player to enderman
+            if (has_line_of_sight(entities[i].position + vec3(0, 1.6, 0), mob.position + vec3(0, 2.5, 0))) {
+                mob.target_entity_id = entities[i].entity_id;
+                mob.ai_state = AI_STATE_ANGRY;
+                result.target_entity_id = int(entities[i].entity_id);
+                result.aggro_level = 1.0;
+                result.time_since_sight = 0;
+                return;
+            }
+        }
+    }
+
+    // Not aggro
+    result.target_entity_id = -1;
+    result.aggro_level = 0.0;
+    result.time_since_sight = 0;
+}
+
+// Blaze targeting: 48 blocks, always hostile in fortress, targets highest threat
+void target_blaze(inout MobState mob, inout TargetingResult result) {
+    float effective_range = BLAZE_AGGRO_RANGE;
+
+    // Blazes in fortress are more aggressive
+    if (pc.in_fortress != 0) {
+        effective_range *= BLAZE_FORTRESS_BONUS;
+    }
+
+    // Check current target
+    if (mob.target_entity_id != 0xFFFFFFFF) {
+        if (!entity_exists(mob.target_entity_id)) {
+            mob.target_entity_id = 0xFFFFFFFF;
+        } else {
+            vec3 target_pos = get_entity_position(mob.target_entity_id);
+            float dist = distance(mob.position, target_pos);
+
+            if (dist <= effective_range * 1.5) {
+                bool has_los = has_line_of_sight(mob.position, target_pos);
+                result.time_since_sight = has_los ? 0 : result.time_since_sight + 1;
+                result.target_entity_id = int(mob.target_entity_id);
+                result.aggro_level = has_los ? 1.0 : 0.7;
+
+                // Periodically re-evaluate for higher threat target
+                if ((pc.tick & 0x3F) == 0) {  // Every ~3 seconds
+                    float new_dist;
+                    uint better = find_highest_threat_player(mob.position, effective_range, new_dist);
+                    if (better != 0xFFFFFFFF && better != mob.target_entity_id) {
+                        // Switch if significantly better threat
+                        for (uint i = 0; i < pc.entity_count; i++) {
+                            if (entities[i].entity_id == better && entities[i].threat_level > 0.3) {
+                                mob.target_entity_id = better;
+                                result.target_entity_id = int(better);
+                                break;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    // Find highest threat target
+    float dist;
+    uint target = find_highest_threat_player(mob.position, effective_range, dist);
+
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        result.target_entity_id = int(target);
+        result.aggro_level = pc.in_fortress != 0 ? 1.0 : 0.8;
+        result.time_since_sight = 0;
+    } else {
+        mob.target_entity_id = 0xFFFFFFFF;
+        result.target_entity_id = -1;
+        result.aggro_level = 0.0;
+        result.time_since_sight = 0;
+    }
+}
+
+// Zombie Pigman targeting: neutral until group is attacked
+void target_pigman(inout MobState mob, inout TargetingResult result, uint idx) {
+    // Initialize shared memory
+    if (gl_LocalInvocationIndex == 0) {
+        s_pigman_aggro_target = 0xFFFFFFFF;
+        s_pigman_has_aggro = 0;
+    }
+    barrier();
+
+    // Check if we're already aggro
+    if (mob.target_entity_id != 0xFFFFFFFF) {
+        if (!entity_exists(mob.target_entity_id)) {
+            mob.target_entity_id = 0xFFFFFFFF;
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            result.time_since_sight = 0;
+            return;
+        }
+
+        // Calm down after 40 seconds
+        if (result.time_since_sight > PIGMAN_CALM_TICKS) {
+            mob.target_entity_id = 0xFFFFFFFF;
+            mob.ai_state = AI_STATE_IDLE;
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            result.time_since_sight = 0;
+            return;
+        }
+
+        // Continue aggro
+        vec3 target_pos = get_entity_position(mob.target_entity_id);
+        bool has_los = has_line_of_sight(mob.position + vec3(0, 1.6, 0), target_pos + vec3(0, 1.6, 0));
+
+        // time_since_sight doubles as aggro duration for pigmen
+        result.time_since_sight++;
+        result.target_entity_id = int(mob.target_entity_id);
+        result.aggro_level = has_los ? 1.0 : 0.8;
+
+        // Propagate aggro to nearby pigmen
+        atomicExchange(s_pigman_aggro_target, mob.target_entity_id);
+        atomicExchange(s_pigman_has_aggro, 1);
+        return;
+    }
+
+    // Check for recent aggro events in range
+    for (uint i = 0; i < min(aggro_event_count, 16u); i++) {
+        AggroEvent evt = aggro_events[i];
+
+        // Event must be recent (within 2 seconds)
+        if (pc.tick - evt.tick > 40) continue;
+
+        // Must be within 32 blocks of the attack
+        float dist = distance(mob.position, evt.position);
+        if (dist > PIGMAN_NEUTRAL_RANGE) continue;
+
+        // Become aggro
+        mob.target_entity_id = evt.attacker_entity;
+        mob.ai_state = AI_STATE_ANGRY;
+        result.target_entity_id = int(evt.attacker_entity);
+        result.aggro_level = 1.0;
+        result.time_since_sight = 0;
+
+        atomicExchange(s_pigman_aggro_target, evt.attacker_entity);
+        atomicExchange(s_pigman_has_aggro, 1);
+        return;
+    }
+
+    barrier();
+
+    // Check if another pigman in the workgroup became aggro
+    if (s_pigman_has_aggro != 0 && mob.target_entity_id == 0xFFFFFFFF) {
+        float dist = distance(mob.position, pc.player_pos);  // Approximate
+        if (dist < PIGMAN_NEUTRAL_RANGE) {
+            mob.target_entity_id = s_pigman_aggro_target;
+            mob.ai_state = AI_STATE_ANGRY;
+            result.target_entity_id = int(s_pigman_aggro_target);
+            result.aggro_level = 0.9;
+            result.time_since_sight = 0;
+            return;
+        }
+    }
+
+    // Neutral - no aggro
+    result.target_entity_id = -1;
+    result.aggro_level = 0.0;
+    result.time_since_sight = 0;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    // Skip dead or no-AI mobs
+    if (mob.ai_state == AI_STATE_DEAD || (mob.flags & MOB_FLAG_NO_AI) != 0) {
+        targets[idx].target_entity_id = -1;
+        targets[idx].aggro_level = 0.0;
+        targets[idx].time_since_sight = 0;
+        return;
+    }
+
+    // Load existing targeting state
+    TargetingResult result = targets[idx];
+
+    // Dispatch to mob-specific targeting logic
+    switch (mob.mob_type) {
+        case MOB_TYPE_ZOMBIE:
+            target_standard_hostile(mob, result, ZOMBIE_AGGRO_RANGE, ZOMBIE_AGGRO_THROUGH_WALLS, ZOMBIE_LOSE_AGGRO_TICKS);
+            break;
+
+        case MOB_TYPE_SKELETON:
+            target_standard_hostile(mob, result, SKELETON_AGGRO_RANGE, SKELETON_AGGRO_THROUGH_WALLS, SKELETON_LOSE_AGGRO_TICKS);
+            break;
+
+        case MOB_TYPE_CREEPER:
+            target_standard_hostile(mob, result, CREEPER_AGGRO_RANGE, CREEPER_AGGRO_THROUGH_WALLS, CREEPER_LOSE_AGGRO_TICKS);
+            break;
+
+        case MOB_TYPE_ENDERMAN:
+            target_enderman(mob, result, idx);
+            break;
+
+        case MOB_TYPE_BLAZE:
+            target_blaze(mob, result);
+            break;
+
+        case MOB_TYPE_ZOMBIE_PIGMAN:
+            target_pigman(mob, result, idx);
+            break;
+
+        default:
+            // Unknown mob type - no targeting
+            result.target_entity_id = -1;
+            result.aggro_level = 0.0;
+            result.time_since_sight = 0;
+            break;
+    }
+
+    // Write back results
+    mobs[idx] = mob;
+    targets[idx] = result;
+}

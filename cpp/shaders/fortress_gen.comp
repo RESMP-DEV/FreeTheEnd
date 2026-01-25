@@ -1,0 +1,587 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : require
+
+/*
+ * fortress_gen.comp - Minecraft 1.8.9 Nether Fortress Generator
+ *
+ * Nether fortresses are critical speedrun structures containing:
+ * - Blaze spawners (required for blaze rods -> eyes of ender)
+ * - Nether wart farms (brewing ingredient for potions)
+ * - Chest loot rooms
+ *
+ * Fortress generation in MC 1.8.9:
+ * - Grid-based placement: 432x432 block regions
+ * - One fortress per region, offset from region corner
+ * - Modular piece-based construction
+ *
+ * For speedrun AI, we track:
+ * - Fortress detection/direction from any point
+ * - Blaze spawner locations (need to kill blazes)
+ * - Safe pathfinding through the structure
+ */
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+#define CHUNK_SIZE_X 16
+#define CHUNK_SIZE_Y 128
+#define CHUNK_SIZE_Z 16
+
+// Block IDs
+#define AIR 0
+#define LAVA 11
+#define NETHERRACK 87
+#define SOUL_SAND 88
+#define NETHER_BRICK 112
+#define NETHER_BRICK_FENCE 113
+#define NETHER_BRICK_STAIRS 114
+#define NETHER_WART 115
+#define MOB_SPAWNER 52
+#define CHEST 54
+
+// Fortress region parameters (MC 1.8.9)
+#define FORTRESS_REGION_SIZE 432
+#define FORTRESS_SPAWN_CHANCE 0.4
+
+// Fortress structure dimensions
+#define CORRIDOR_WIDTH 3
+#define CORRIDOR_HEIGHT 4
+#define BRIDGE_WIDTH 3
+#define SPAWNER_ROOM_SIZE 7
+#define WART_ROOM_SIZE 5
+
+// Spawner types (stored in block metadata)
+#define SPAWNER_BLAZE 61    // Blaze entity ID
+
+// Java RNG constants for consistent world generation
+const int64_t JAVA_LCG_MULTIPLIER = 0x5DEECE66DL;
+const int64_t JAVA_LCG_ADDEND = 0xBL;
+const int64_t JAVA_LCG_MASK = (1L << 48) - 1;
+
+// ============================================================================
+// Push Constants
+// ============================================================================
+
+layout(push_constant) uniform FortressParams {
+    ivec3 chunk_pos;       // Chunk being generated
+    int world_seed;        // World seed for deterministic placement
+    int generation_flags;  // 1=generate structure, 2=generate spawners, 4=loot
+    float lod_level;       // Level of detail (0=full, 1+=simplified)
+    int player_chunk_x;    // Player chunk for distance calc
+    int player_chunk_z;
+} params;
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+// Output: voxel data for this chunk
+layout(std430, binding = 0) buffer ChunkData {
+    int voxels[];
+} chunk_out;
+
+// Output: fortress metadata for observation
+layout(std430, binding = 1) buffer FortressMetadata {
+    int fortress_detected;     // 1 if in/near fortress
+    float fortress_dir_x;      // Direction to nearest fortress (normalized)
+    float fortress_dir_z;
+    float fortress_distance;   // Distance in blocks (normalized 0-1, 1=256+ blocks)
+    int blaze_spawner_count;   // Number of spawners in range
+    float nearest_spawner_x;   // World coords of nearest spawner
+    float nearest_spawner_y;
+    float nearest_spawner_z;
+    float spawner_distance;    // Distance to nearest spawner (normalized)
+    int in_fortress;           // 1 if player is inside fortress bounds
+} metadata;
+
+// Permutation table for noise (same as nether_terrain.comp)
+layout(std430, binding = 2) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+// ============================================================================
+// Java Random Implementation
+// ============================================================================
+
+int64_t java_random_init(int64_t seed) {
+    return (seed ^ JAVA_LCG_MULTIPLIER) & JAVA_LCG_MASK;
+}
+
+int java_random_next(inout int64_t state, int bits) {
+    state = (state * JAVA_LCG_MULTIPLIER + JAVA_LCG_ADDEND) & JAVA_LCG_MASK;
+    return int(state >> (48 - bits));
+}
+
+int java_random_next_int(inout int64_t state, int bound) {
+    if ((bound & (bound - 1)) == 0) {
+        return int((int64_t(bound) * int64_t(java_random_next(state, 31))) >> 31);
+    }
+    int bits, val;
+    do {
+        bits = java_random_next(state, 31);
+        val = bits % bound;
+    } while (bits - val + (bound - 1) < 0);
+    return val;
+}
+
+float java_random_float(inout int64_t state) {
+    return float(java_random_next(state, 24)) / float(1 << 24);
+}
+
+// ============================================================================
+// Fortress Position Calculation (MC 1.8.9 accurate)
+// ============================================================================
+
+// Get fortress position for a given region
+// Returns block coordinates of fortress origin, or ivec2(-1) if no fortress
+ivec2 get_fortress_position(int region_x, int region_z, int seed) {
+    // Region seed combines world seed with region coords
+    int64_t region_seed = int64_t(region_x) * 341873128712L +
+                          int64_t(region_z) * 132897987541L +
+                          int64_t(seed);
+    int64_t rng = java_random_init(region_seed);
+
+    // Check if fortress spawns in this region
+    if (java_random_float(rng) > FORTRESS_SPAWN_CHANCE) {
+        return ivec2(-1, -1);
+    }
+
+    // Position within region (in chunks, then convert to blocks)
+    int chunk_offset_x = java_random_next_int(rng, FORTRESS_REGION_SIZE / 16 - 8) + 4;
+    int chunk_offset_z = java_random_next_int(rng, FORTRESS_REGION_SIZE / 16 - 8) + 4;
+
+    int block_x = region_x * FORTRESS_REGION_SIZE + chunk_offset_x * 16;
+    int block_z = region_z * FORTRESS_REGION_SIZE + chunk_offset_z * 16;
+
+    return ivec2(block_x, block_z);
+}
+
+// Find nearest fortress to a world position
+void find_nearest_fortress(vec3 world_pos, int seed, out ivec2 fortress_pos, out float distance) {
+    int player_region_x = int(floor(world_pos.x / float(FORTRESS_REGION_SIZE)));
+    int player_region_z = int(floor(world_pos.z / float(FORTRESS_REGION_SIZE)));
+
+    fortress_pos = ivec2(-1, -1);
+    distance = 1e10;
+
+    // Check 5x5 grid of regions around player
+    for (int rx = -2; rx <= 2; rx++) {
+        for (int rz = -2; rz <= 2; rz++) {
+            ivec2 fp = get_fortress_position(player_region_x + rx, player_region_z + rz, seed);
+            if (fp.x >= 0) {
+                float dx = float(fp.x) - world_pos.x;
+                float dz = float(fp.y) - world_pos.z;
+                float d = sqrt(dx * dx + dz * dz);
+                if (d < distance) {
+                    distance = d;
+                    fortress_pos = fp;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Fortress Structure Generation
+// ============================================================================
+
+// Piece types for modular fortress construction
+const uint PIECE_CORRIDOR = 0;
+const uint PIECE_CORRIDOR_CROSS = 1;
+const uint PIECE_CORRIDOR_TURN = 2;
+const uint PIECE_STAIRS = 3;
+const uint PIECE_BRIDGE = 4;
+const uint PIECE_SPAWNER_ROOM = 5;
+const uint PIECE_WART_ROOM = 6;
+const uint PIECE_CHEST_ROOM = 7;
+const uint PIECE_ENTRANCE = 8;
+
+struct FortressPiece {
+    ivec3 origin;      // World position of piece origin
+    uint piece_type;   // Type of piece
+    int rotation;      // 0-3 (0=north, 1=east, 2=south, 3=west)
+    int depth;         // Generation depth (for limiting size)
+};
+
+// Generate piece placement starting from fortress origin
+// This is a simplified version - full MC uses recursive room placement
+void get_fortress_pieces(ivec2 fortress_origin, int seed, out FortressPiece pieces[32], out int piece_count) {
+    int64_t rng = java_random_init(int64_t(seed) ^ int64_t(fortress_origin.x) ^ (int64_t(fortress_origin.y) << 16));
+
+    piece_count = 0;
+    int fortress_y = 64;  // Fortresses spawn at Y=64 in Nether
+
+    // Central entrance
+    pieces[piece_count].origin = ivec3(fortress_origin.x, fortress_y, fortress_origin.y);
+    pieces[piece_count].piece_type = PIECE_ENTRANCE;
+    pieces[piece_count].rotation = java_random_next_int(rng, 4);
+    pieces[piece_count].depth = 0;
+    piece_count++;
+
+    // Generate corridors branching from entrance
+    int max_depth = 12 + java_random_next_int(rng, 5);
+
+    // Queue-based generation (simplified from recursive)
+    int queue_start = 0;
+    while (queue_start < piece_count && piece_count < 30) {
+        FortressPiece parent = pieces[queue_start];
+        queue_start++;
+
+        if (parent.depth >= max_depth) continue;
+
+        // Direction vectors for each rotation
+        ivec3 forward_dirs[4] = ivec3[4](
+            ivec3(0, 0, -1),  // North
+            ivec3(1, 0, 0),   // East
+            ivec3(0, 0, 1),   // South
+            ivec3(-1, 0, 0)   // West
+        );
+
+        ivec3 forward = forward_dirs[parent.rotation];
+        ivec3 right = forward_dirs[(parent.rotation + 1) % 4];
+
+        // Corridor length varies
+        int corridor_len = 5 + java_random_next_int(rng, 8);
+
+        // Add corridor segment
+        if (piece_count < 30) {
+            pieces[piece_count].origin = parent.origin + forward * corridor_len;
+            pieces[piece_count].rotation = parent.rotation;
+            pieces[piece_count].depth = parent.depth + 1;
+
+            // Choose piece type based on RNG
+            float roll = java_random_float(rng);
+            if (roll < 0.1 && parent.depth > 2) {
+                pieces[piece_count].piece_type = PIECE_SPAWNER_ROOM;
+            } else if (roll < 0.15) {
+                pieces[piece_count].piece_type = PIECE_WART_ROOM;
+            } else if (roll < 0.2) {
+                pieces[piece_count].piece_type = PIECE_CHEST_ROOM;
+            } else if (roll < 0.35) {
+                pieces[piece_count].piece_type = PIECE_CORRIDOR_CROSS;
+            } else if (roll < 0.5) {
+                pieces[piece_count].piece_type = PIECE_CORRIDOR_TURN;
+            } else if (roll < 0.6 && parent.origin.y > 40) {
+                pieces[piece_count].piece_type = PIECE_BRIDGE;
+                pieces[piece_count].origin.y -= 8;  // Bridges go down
+            } else {
+                pieces[piece_count].piece_type = PIECE_CORRIDOR;
+            }
+            piece_count++;
+        }
+
+        // Branch left
+        if (java_random_float(rng) < 0.4 && piece_count < 30) {
+            pieces[piece_count].origin = parent.origin + forward * (corridor_len / 2) + right * 5;
+            pieces[piece_count].piece_type = PIECE_CORRIDOR;
+            pieces[piece_count].rotation = (parent.rotation + 1) % 4;
+            pieces[piece_count].depth = parent.depth + 1;
+            piece_count++;
+        }
+
+        // Branch right
+        if (java_random_float(rng) < 0.4 && piece_count < 30) {
+            pieces[piece_count].origin = parent.origin + forward * (corridor_len / 2) - right * 5;
+            pieces[piece_count].piece_type = PIECE_CORRIDOR;
+            pieces[piece_count].rotation = (parent.rotation + 3) % 4;
+            pieces[piece_count].depth = parent.depth + 1;
+            piece_count++;
+        }
+    }
+}
+
+// Check if a position is inside a fortress piece
+bool is_in_piece(ivec3 world_pos, FortressPiece piece, out int block_type) {
+    ivec3 local = world_pos - piece.origin;
+    block_type = AIR;
+
+    // Rotate local coords based on piece rotation
+    ivec3 rotated = local;
+    switch (piece.rotation) {
+        case 1: rotated = ivec3(-local.z, local.y, local.x); break;
+        case 2: rotated = ivec3(-local.x, local.y, -local.z); break;
+        case 3: rotated = ivec3(local.z, local.y, -local.x); break;
+    }
+
+    int x = rotated.x;
+    int y = rotated.y;
+    int z = rotated.z;
+
+    switch (piece.piece_type) {
+        case PIECE_CORRIDOR:
+        case PIECE_ENTRANCE:
+            // 3-wide corridor, 4 blocks tall, 5 blocks long
+            if (abs(x) <= 1 && y >= 0 && y < CORRIDOR_HEIGHT && z >= 0 && z < 5) {
+                if (y == 0 || y == CORRIDOR_HEIGHT - 1) {
+                    block_type = NETHER_BRICK;  // Floor/ceiling
+                } else if (abs(x) == 1) {
+                    block_type = NETHER_BRICK;  // Walls
+                } else {
+                    block_type = AIR;  // Interior
+                }
+                return true;
+            }
+            break;
+
+        case PIECE_CORRIDOR_CROSS:
+            // 4-way intersection
+            if ((abs(x) <= 1 || abs(z) <= 1) && y >= 0 && y < CORRIDOR_HEIGHT &&
+                abs(x) < 5 && abs(z) < 5) {
+                bool in_corridor = (abs(x) <= 1 && abs(z) < 5) || (abs(z) <= 1 && abs(x) < 5);
+                if (!in_corridor) return false;
+
+                if (y == 0 || y == CORRIDOR_HEIGHT - 1) {
+                    block_type = NETHER_BRICK;
+                } else if ((abs(x) == 1 && abs(z) > 1) || (abs(z) == 1 && abs(x) > 1)) {
+                    block_type = NETHER_BRICK;
+                } else {
+                    block_type = AIR;
+                }
+                return true;
+            }
+            break;
+
+        case PIECE_CORRIDOR_TURN:
+            // L-shaped turn
+            if (y >= 0 && y < CORRIDOR_HEIGHT) {
+                bool in_first = abs(x) <= 1 && z >= 0 && z < 3;
+                bool in_second = x >= 0 && x < 3 && abs(z - 2) <= 1;
+                if (in_first || in_second) {
+                    if (y == 0 || y == CORRIDOR_HEIGHT - 1) {
+                        block_type = NETHER_BRICK;
+                    } else {
+                        bool at_wall = (in_first && abs(x) == 1 && z < 2) ||
+                                       (in_second && abs(z - 2) == 1 && x > 0);
+                        block_type = at_wall ? NETHER_BRICK : AIR;
+                    }
+                    return true;
+                }
+            }
+            break;
+
+        case PIECE_BRIDGE:
+            // Bridge over lava - 3 wide, 1 thick floor with fence railings
+            if (abs(x) <= 1 && y >= -1 && y <= 1 && z >= 0 && z < 12) {
+                if (y == -1) {
+                    block_type = NETHER_BRICK;  // Bridge floor
+                } else if (y == 0 && abs(x) == 1) {
+                    block_type = NETHER_BRICK_FENCE;  // Railings
+                } else {
+                    block_type = AIR;
+                }
+                return true;
+            }
+            break;
+
+        case PIECE_SPAWNER_ROOM:
+            // 7x7 room with blaze spawner in center on raised platform
+            if (abs(x) < SPAWNER_ROOM_SIZE / 2 + 1 && abs(z) < SPAWNER_ROOM_SIZE / 2 + 1 &&
+                y >= 0 && y < 6) {
+                bool at_edge = abs(x) == SPAWNER_ROOM_SIZE / 2 || abs(z) == SPAWNER_ROOM_SIZE / 2;
+
+                if (y == 0) {
+                    block_type = NETHER_BRICK;  // Floor
+                } else if (y == 5) {
+                    block_type = NETHER_BRICK;  // Ceiling
+                } else if (at_edge && y < 5) {
+                    block_type = NETHER_BRICK;  // Walls
+                } else if (y == 1 && abs(x) <= 1 && abs(z) <= 1) {
+                    block_type = NETHER_BRICK;  // Raised platform
+                } else if (y == 2 && x == 0 && z == 0) {
+                    block_type = MOB_SPAWNER;  // BLAZE SPAWNER
+                } else if (y == 1 && abs(x) == 2 && abs(z) == 2) {
+                    block_type = NETHER_BRICK_STAIRS;  // Steps to platform
+                } else {
+                    block_type = AIR;
+                }
+                return true;
+            }
+            break;
+
+        case PIECE_WART_ROOM:
+            // Nether wart farm: soul sand with wart
+            if (abs(x) < WART_ROOM_SIZE / 2 + 1 && abs(z) < WART_ROOM_SIZE / 2 + 1 &&
+                y >= 0 && y < 4) {
+                bool at_edge = abs(x) == WART_ROOM_SIZE / 2 || abs(z) == WART_ROOM_SIZE / 2;
+
+                if (y == 0) {
+                    // Center is soul sand for farming
+                    if (abs(x) <= 1 && abs(z) <= 1) {
+                        block_type = SOUL_SAND;
+                    } else {
+                        block_type = NETHER_BRICK;
+                    }
+                } else if (y == 1 && abs(x) <= 1 && abs(z) <= 1) {
+                    block_type = NETHER_WART;  // Growing nether wart
+                } else if (y == 3) {
+                    block_type = NETHER_BRICK;  // Ceiling
+                } else if (at_edge && y < 3) {
+                    block_type = NETHER_BRICK;  // Walls
+                } else {
+                    block_type = AIR;
+                }
+                return true;
+            }
+            break;
+
+        case PIECE_CHEST_ROOM:
+            // Small room with loot chest
+            if (abs(x) < 3 && abs(z) < 3 && y >= 0 && y < 4) {
+                bool at_edge = abs(x) == 2 || abs(z) == 2;
+
+                if (y == 0 || y == 3) {
+                    block_type = NETHER_BRICK;  // Floor/ceiling
+                } else if (at_edge && y < 3) {
+                    block_type = NETHER_BRICK;  // Walls
+                } else if (y == 1 && x == 0 && z == -1) {
+                    block_type = CHEST;  // Loot chest against back wall
+                } else {
+                    block_type = AIR;
+                }
+                return true;
+            }
+            break;
+
+        case PIECE_STAIRS:
+            // Descending staircase
+            for (int step = 0; step < 8; step++) {
+                if (abs(x) <= 1 && z == step && y >= -step && y < CORRIDOR_HEIGHT - step) {
+                    if (y == -step) {
+                        block_type = NETHER_BRICK_STAIRS;
+                    } else if (y == -step - 1) {
+                        block_type = NETHER_BRICK;
+                    } else if (abs(x) == 1 && y < CORRIDOR_HEIGHT - step - 1) {
+                        block_type = NETHER_BRICK;
+                    } else {
+                        block_type = AIR;
+                    }
+                    return true;
+                }
+            }
+            break;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Voxel Indexing
+// ============================================================================
+
+uint voxel_index(uint x, uint y, uint z) {
+    return z * CHUNK_SIZE_X * CHUNK_SIZE_Y + y * CHUNK_SIZE_X + x;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+    uint local_x = gid.x % CHUNK_SIZE_X;
+    uint local_y = gid.y;
+    uint local_z = gid.z % CHUNK_SIZE_Z;
+
+    if (local_y >= CHUNK_SIZE_Y) return;
+
+    // World position of this voxel
+    ivec3 world_pos = ivec3(
+        params.chunk_pos.x * CHUNK_SIZE_X + int(local_x),
+        int(local_y),
+        params.chunk_pos.z * CHUNK_SIZE_Z + int(local_z)
+    );
+
+    // Find nearest fortress
+    ivec2 fortress_pos;
+    float fortress_dist;
+    find_nearest_fortress(vec3(world_pos), params.world_seed, fortress_pos, fortress_dist);
+
+    // Update metadata (only from first thread to avoid race conditions)
+    if (gid.x == 0 && gid.y == 0 && gid.z == 0) {
+        vec3 player_world = vec3(
+            params.player_chunk_x * CHUNK_SIZE_X + 8,
+            64,
+            params.player_chunk_z * CHUNK_SIZE_Z + 8
+        );
+
+        ivec2 player_fortress;
+        float player_fortress_dist;
+        find_nearest_fortress(player_world, params.world_seed, player_fortress, player_fortress_dist);
+
+        metadata.fortress_detected = (player_fortress_dist < 256.0) ? 1 : 0;
+
+        if (player_fortress.x >= 0) {
+            vec2 dir = normalize(vec2(player_fortress) - player_world.xz);
+            metadata.fortress_dir_x = dir.x;
+            metadata.fortress_dir_z = dir.y;
+            metadata.fortress_distance = clamp(player_fortress_dist / 256.0, 0.0, 1.0);
+        } else {
+            metadata.fortress_dir_x = 0.0;
+            metadata.fortress_dir_z = 0.0;
+            metadata.fortress_distance = 1.0;
+        }
+
+        // Check if player is inside fortress bounds
+        metadata.in_fortress = (player_fortress_dist < 64.0) ? 1 : 0;
+
+        // Find spawners (simplified: spawners at known positions relative to fortress)
+        // Full implementation would track all generated pieces
+        metadata.blaze_spawner_count = 0;
+        metadata.spawner_distance = 1.0;
+
+        if (player_fortress.x >= 0 && player_fortress_dist < 128.0) {
+            // Generate pieces to find spawners
+            FortressPiece pieces[32];
+            int piece_count;
+            get_fortress_pieces(player_fortress, params.world_seed, pieces, piece_count);
+
+            float nearest_spawner_dist = 1e10;
+            for (int i = 0; i < piece_count; i++) {
+                if (pieces[i].piece_type == PIECE_SPAWNER_ROOM) {
+                    metadata.blaze_spawner_count++;
+                    vec3 spawner_pos = vec3(pieces[i].origin) + vec3(0, 2, 0);
+                    float d = distance(player_world, spawner_pos);
+                    if (d < nearest_spawner_dist) {
+                        nearest_spawner_dist = d;
+                        metadata.nearest_spawner_x = spawner_pos.x;
+                        metadata.nearest_spawner_y = spawner_pos.y;
+                        metadata.nearest_spawner_z = spawner_pos.z;
+                    }
+                }
+            }
+            metadata.spawner_distance = clamp(nearest_spawner_dist / 64.0, 0.0, 1.0);
+        }
+    }
+
+    // Generate fortress blocks if in range
+    int block_type = AIR;
+
+    if (fortress_pos.x >= 0 && fortress_dist < 128.0) {
+        // Get all pieces for this fortress
+        FortressPiece pieces[32];
+        int piece_count;
+        get_fortress_pieces(fortress_pos, params.world_seed, pieces, piece_count);
+
+        // Check if this voxel is inside any piece
+        for (int i = 0; i < piece_count; i++) {
+            int piece_block;
+            if (is_in_piece(world_pos, pieces[i], piece_block)) {
+                if (piece_block != AIR) {
+                    block_type = piece_block;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Write to chunk buffer (only if we have a fortress block)
+    // Non-fortress blocks are handled by nether_terrain.comp
+    uint idx = voxel_index(local_x, local_y, local_z);
+    if (block_type != AIR) {
+        chunk_out.voxels[idx] = block_type;
+    }
+}

@@ -1,0 +1,654 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+/*
+ * Mob Combat System - Minecraft 1.8.9 Attack and Damage Mechanics
+ *
+ * Handles all mob attack types:
+ * - Melee attacks (zombie, spider, enderman, etc.)
+ * - Ranged attacks (skeleton arrow)
+ * - Area attacks (creeper explosion)
+ * - Special attacks (blaze fireball)
+ *
+ * This shader processes combat calculations in parallel across all mobs,
+ * outputting damage events and projectile spawns for the CPU to apply.
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Damage Calculation Functions (inlined from damage.glsl)
+// ============================================================================
+
+/*
+ * Calculate armor damage reduction.
+ * Each armor point = 4% reduction, max 80% (20 points).
+ */
+float calculate_armor_reduction(float raw_damage, float armor_points) {
+    float clamped_armor = clamp(armor_points, 0.0, 20.0);
+    float reduction_factor = 1.0 - (clamped_armor / 25.0);
+    return raw_damage * reduction_factor;
+}
+
+/*
+ * Calculate protection enchantment reduction.
+ * Each EPF point = 4% reduction, max 80%.
+ */
+float calculate_protection_reduction(float damage, int protection_level) {
+    float clamped_epf = clamp(float(protection_level), 0.0, 20.0);
+    float reduction_factor = 1.0 - (clamped_epf / 25.0);
+    return damage * reduction_factor;
+}
+
+/*
+ * Calculate resistance potion effect reduction.
+ * 20% per level (amplifier + 1), max 100%.
+ */
+float calculate_resistance_reduction(float damage, int resistance_amplifier) {
+    if (resistance_amplifier < 0) return damage;
+    int clamped_amp = min(resistance_amplifier, 4);
+    float reduction = 0.2 * float(clamped_amp + 1);
+    reduction = min(reduction, 1.0);
+    return damage * (1.0 - reduction);
+}
+
+/*
+ * Apply full damage calculation pipeline.
+ */
+float apply_damage(float raw_damage, int armor, int protection, int resistance) {
+    float after_armor = calculate_armor_reduction(raw_damage, float(armor));
+    float after_protection = calculate_protection_reduction(after_armor, protection);
+    float final_damage = calculate_resistance_reduction(after_protection, resistance);
+    return max(final_damage, 0.0);
+}
+
+struct EquipmentData {
+    int armor;
+    int protection;
+    int resistance;
+};
+
+EquipmentData unpack_equipment(uint equipment_packed) {
+    EquipmentData data;
+    data.armor = int(equipment_packed & 0x1Fu);
+    data.protection = int((equipment_packed >> 5) & 0x1Fu);
+    uint resistance_encoded = (equipment_packed >> 10) & 0xFu;
+    data.resistance = int(resistance_encoded) - 1;
+    return data;
+}
+
+float compute_damage_packed(float raw_damage, uint equipment_packed) {
+    EquipmentData eq = unpack_equipment(equipment_packed);
+    return apply_damage(raw_damage, eq.armor, eq.protection, eq.resistance);
+}
+
+// ============================================================================
+// Constants - Mob Types
+// ============================================================================
+
+const uint MOB_TYPE_ZOMBIE = 0;
+const uint MOB_TYPE_SKELETON = 1;
+const uint MOB_TYPE_ENDERMAN = 2;
+const uint MOB_TYPE_BLAZE = 3;
+const uint MOB_TYPE_ZOMBIE_PIGMAN = 4;
+const uint MOB_TYPE_SPIDER = 5;
+const uint MOB_TYPE_CAVE_SPIDER = 6;
+const uint MOB_TYPE_CREEPER = 7;
+const uint MOB_TYPE_SLIME = 8;
+const uint MOB_TYPE_GHAST = 9;
+const uint MOB_TYPE_WITHER_SKELETON = 10;
+const uint MOB_TYPE_SILVERFISH = 11;
+const uint MOB_TYPE_WITCH = 12;
+const uint MOB_TYPE_GUARDIAN = 13;
+const uint MOB_TYPE_IRON_GOLEM = 14;
+
+// ============================================================================
+// Constants - AI States
+// ============================================================================
+
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;
+const uint AI_STATE_FLEE = 4;
+const uint AI_STATE_TELEPORT = 5;
+const uint AI_STATE_ANGRY = 6;
+const uint AI_STATE_FIREBALL = 7;
+const uint AI_STATE_AGGRO = 8;
+const uint AI_STATE_DEAD = 9;
+
+// ============================================================================
+// Constants - Mob Flags
+// ============================================================================
+
+const uint MOB_FLAG_ON_GROUND = 1u << 0;
+const uint MOB_FLAG_IN_WATER = 1u << 1;
+const uint MOB_FLAG_IN_LAVA = 1u << 2;
+const uint MOB_FLAG_NO_AI = 1u << 3;
+const uint MOB_FLAG_PERSISTENT = 1u << 4;
+const uint MOB_FLAG_LEASHED = 1u << 5;
+const uint MOB_FLAG_BURNING = 1u << 6;
+const uint MOB_FLAG_INVISIBLE = 1u << 7;
+const uint MOB_FLAG_BABY = 1u << 8;
+const uint MOB_FLAG_CHARGED = 1u << 9;  // Creeper charged state
+
+// ============================================================================
+// Constants - Combat Parameters (Minecraft 1.8.9 values)
+// ============================================================================
+
+// Melee reach by mob type
+const float REACH_ZOMBIE = 2.0;
+const float REACH_SKELETON = 1.5;
+const float REACH_ENDERMAN = 2.5;
+const float REACH_SPIDER = 2.0;
+const float REACH_CAVE_SPIDER = 2.0;
+const float REACH_WITHER_SKELETON = 2.5;
+const float REACH_SILVERFISH = 1.5;
+const float REACH_IRON_GOLEM = 3.0;
+const float REACH_ZOMBIE_PIGMAN = 2.0;
+
+// Base damage by mob type
+const float DAMAGE_ZOMBIE = 3.0;
+const float DAMAGE_ZOMBIE_BABY = 3.0;
+const float DAMAGE_SKELETON_MELEE = 2.0;
+const float DAMAGE_ENDERMAN = 7.0;
+const float DAMAGE_SPIDER = 2.0;
+const float DAMAGE_CAVE_SPIDER = 2.0;
+const float DAMAGE_WITHER_SKELETON = 8.0;
+const float DAMAGE_SILVERFISH = 1.0;
+const float DAMAGE_IRON_GOLEM = 21.0;
+const float DAMAGE_ZOMBIE_PIGMAN = 8.0;
+
+// Skeleton ranged attack
+const float SKELETON_ARROW_RANGE = 15.0;
+const float SKELETON_ARROW_SPEED = 1.6;
+const float ARROW_DAMAGE_MIN = 2.0;
+const float ARROW_DAMAGE_MAX = 5.0;
+const uint SKELETON_SHOOT_COOLDOWN = 40u;
+
+// Creeper explosion
+const float CREEPER_EXPLOSION_RADIUS = 3.0;
+const float CREEPER_CHARGED_RADIUS = 6.0;
+const float CREEPER_FUSE_TIME = 30.0;
+const float CREEPER_EXPLOSION_POWER = 3.0;
+const float CREEPER_CHARGED_POWER = 6.0;
+
+// Knockback
+const float KNOCKBACK_BASE = 0.4;
+const float KNOCKBACK_VERTICAL = 0.4;
+const float KNOCKBACK_IRON_GOLEM_VERTICAL = 1.0;
+
+// Attack cooldowns (ticks at 20 TPS)
+const uint COOLDOWN_MELEE = 20u;
+const uint COOLDOWN_FAST = 10u;
+
+// ============================================================================
+// Structures - 128 byte aligned
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+
+    vec3 path_target;
+    uint path_state;
+
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    uint entity_id;
+    uint equipment_packed;
+    uint _pad[3];
+};
+
+struct DamageEvent {
+    uint target_entity_id;
+    uint source_entity_id;
+    float damage;
+    float knockback_x;
+    float knockback_y;
+    float knockback_z;
+    uint damage_type;
+    uint status_effect;
+};
+
+struct ProjectileSpawn {
+    vec3 position;
+    float speed;
+    vec3 direction;
+    uint source_entity_id;
+    uint target_entity_id;
+    float damage;
+    uint projectile_type;
+    uint _pad;
+};
+
+struct ExplosionEvent {
+    vec3 position;
+    float radius;
+    float power;
+    uint source_entity_id;
+    uint flags;
+    uint _pad;
+};
+
+// ============================================================================
+// Buffer Bindings
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer DamageBuffer {
+    uint damage_event_count;
+    DamageEvent damage_events[];
+};
+
+layout(set = 0, binding = 3) buffer ProjectileBuffer {
+    uint projectile_count;
+    ProjectileSpawn projectiles[];
+};
+
+layout(set = 0, binding = 4) buffer ExplosionBuffer {
+    uint explosion_count;
+    ExplosionEvent explosions[];
+};
+
+// ============================================================================
+// Push Constants
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+    uint difficulty;
+} pc;
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+float random_range(inout uint seed, float min_val, float max_val) {
+    return min_val + random_float(seed) * (max_val - min_val);
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float horizontal_distance(vec3 a, vec3 b) {
+    vec2 d = a.xz - b.xz;
+    return length(d);
+}
+
+vec3 get_entity_position(uint entity_id) {
+    for (uint i = 0u; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool get_entity(uint entity_id, out EntityRef entity) {
+    for (uint i = 0u; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            entity = entities[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+float get_difficulty_multiplier() {
+    if (pc.difficulty == 1u) return 0.5;
+    if (pc.difficulty == 2u) return 1.0;
+    if (pc.difficulty == 3u) return 1.5;
+    return 0.0;
+}
+
+// ============================================================================
+// Combat Output Functions
+// ============================================================================
+
+void emit_damage_event(uint target_id, uint source_id, float damage,
+                       vec3 knockback, uint damage_type, uint status_effect) {
+    uint idx = atomicAdd(damage_event_count, 1u);
+    if (idx < 256u) {
+        damage_events[idx].target_entity_id = target_id;
+        damage_events[idx].source_entity_id = source_id;
+        damage_events[idx].damage = damage;
+        damage_events[idx].knockback_x = knockback.x;
+        damage_events[idx].knockback_y = knockback.y;
+        damage_events[idx].knockback_z = knockback.z;
+        damage_events[idx].damage_type = damage_type;
+        damage_events[idx].status_effect = status_effect;
+    }
+}
+
+void emit_projectile(vec3 pos, vec3 dir, float speed, float damage,
+                     uint source_id, uint target_id, uint proj_type) {
+    uint idx = atomicAdd(projectile_count, 1u);
+    if (idx < 64u) {
+        projectiles[idx].position = pos;
+        projectiles[idx].direction = dir;
+        projectiles[idx].speed = speed;
+        projectiles[idx].damage = damage;
+        projectiles[idx].source_entity_id = source_id;
+        projectiles[idx].target_entity_id = target_id;
+        projectiles[idx].projectile_type = proj_type;
+    }
+}
+
+void emit_explosion(vec3 pos, float radius, float power, uint source_id, uint flags) {
+    uint idx = atomicAdd(explosion_count, 1u);
+    if (idx < 16u) {
+        explosions[idx].position = pos;
+        explosions[idx].radius = radius;
+        explosions[idx].power = power;
+        explosions[idx].source_entity_id = source_id;
+        explosions[idx].flags = flags;
+    }
+}
+
+// ============================================================================
+// Trajectory Calculation
+// ============================================================================
+
+vec3 calculate_trajectory(vec3 from, vec3 to, float speed) {
+    vec3 diff = to - from;
+    float horiz_dist = length(diff.xz);
+    float flight_time = horiz_dist / (speed * 20.0);
+    float gravity_drop = 0.5 * 0.05 * flight_time * flight_time * 400.0;
+    vec3 aim = diff;
+    aim.y += gravity_drop;
+    return normalize_safe(aim);
+}
+
+vec3 calculate_fireball_trajectory(vec3 from, vec3 to) {
+    return normalize_safe(to - from);
+}
+
+// ============================================================================
+// Melee Attack System
+// ============================================================================
+
+bool melee_attack(inout MobState attacker, EntityRef target, inout uint seed) {
+    float reach, base_damage;
+    uint cooldown = COOLDOWN_MELEE;
+    float kb_vertical = KNOCKBACK_VERTICAL;
+    uint status_effect = 0u;
+
+    if (attacker.mob_type == MOB_TYPE_ZOMBIE) {
+        reach = REACH_ZOMBIE;
+        base_damage = DAMAGE_ZOMBIE;
+    } else if (attacker.mob_type == MOB_TYPE_SKELETON) {
+        reach = REACH_SKELETON;
+        base_damage = DAMAGE_SKELETON_MELEE;
+    } else if (attacker.mob_type == MOB_TYPE_ENDERMAN) {
+        reach = REACH_ENDERMAN;
+        base_damage = DAMAGE_ENDERMAN;
+    } else if (attacker.mob_type == MOB_TYPE_SPIDER) {
+        reach = REACH_SPIDER;
+        base_damage = DAMAGE_SPIDER;
+        cooldown = COOLDOWN_FAST;
+    } else if (attacker.mob_type == MOB_TYPE_CAVE_SPIDER) {
+        reach = REACH_CAVE_SPIDER;
+        base_damage = DAMAGE_CAVE_SPIDER;
+        cooldown = COOLDOWN_FAST;
+        status_effect = (19u << 16) | (pc.difficulty == 3u ? 300u : 140u);
+    } else if (attacker.mob_type == MOB_TYPE_WITHER_SKELETON) {
+        reach = REACH_WITHER_SKELETON;
+        base_damage = DAMAGE_WITHER_SKELETON;
+        status_effect = (20u << 16) | 200u;
+    } else if (attacker.mob_type == MOB_TYPE_SILVERFISH) {
+        reach = REACH_SILVERFISH;
+        base_damage = DAMAGE_SILVERFISH;
+        cooldown = COOLDOWN_FAST;
+    } else if (attacker.mob_type == MOB_TYPE_IRON_GOLEM) {
+        reach = REACH_IRON_GOLEM;
+        base_damage = random_range(seed, 7.0, 21.0);
+        kb_vertical = KNOCKBACK_IRON_GOLEM_VERTICAL;
+    } else if (attacker.mob_type == MOB_TYPE_ZOMBIE_PIGMAN) {
+        reach = REACH_ZOMBIE_PIGMAN;
+        base_damage = DAMAGE_ZOMBIE_PIGMAN;
+    } else {
+        reach = 2.0;
+        base_damage = 2.0;
+    }
+
+    float dist = distance(attacker.position, target.position);
+    if (dist > reach) return false;
+    if (attacker.attack_cooldown > 0u) return false;
+
+    float damage = base_damage * get_difficulty_multiplier();
+    if (damage <= 0.0) return false;
+
+    float weapon_damage = uintBitsToFloat(attacker.type_data[0]);
+    damage += weapon_damage;
+
+    float final_damage = compute_damage_packed(damage, target.equipment_packed);
+
+    vec3 knockback_dir = normalize_safe(target.position - attacker.position);
+    knockback_dir.y = 0.0;
+
+    vec3 knockback = knockback_dir * KNOCKBACK_BASE;
+    knockback.y = kb_vertical;
+
+    emit_damage_event(
+        target.entity_id,
+        attacker.type_data[5],
+        final_damage,
+        knockback,
+        0u,
+        status_effect
+    );
+
+    attacker.attack_cooldown = cooldown;
+    return true;
+}
+
+// ============================================================================
+// Ranged Attack System (Skeleton)
+// ============================================================================
+
+bool shoot_arrow(inout MobState skeleton, EntityRef target, inout uint seed) {
+    if (skeleton.attack_cooldown > 0u) return false;
+
+    float dist = distance(skeleton.position, target.position);
+    if (dist > SKELETON_ARROW_RANGE) return false;
+
+    vec3 arrow_pos = skeleton.position + vec3(0.0, 1.5, 0.0);
+
+    vec3 target_pos = target.position;
+    float flight_time = dist / (SKELETON_ARROW_SPEED * 20.0);
+    target_pos += target.velocity * flight_time * 20.0;
+
+    vec3 trajectory = calculate_trajectory(arrow_pos, target_pos, SKELETON_ARROW_SPEED);
+
+    float spread = 0.05;
+    trajectory.x += (random_float(seed) - 0.5) * spread;
+    trajectory.y += (random_float(seed) - 0.5) * spread * 0.5;
+    trajectory.z += (random_float(seed) - 0.5) * spread;
+    trajectory = normalize_safe(trajectory);
+
+    float damage = random_range(seed, ARROW_DAMAGE_MIN, ARROW_DAMAGE_MAX);
+    damage *= get_difficulty_multiplier();
+
+    emit_projectile(
+        arrow_pos,
+        trajectory,
+        SKELETON_ARROW_SPEED,
+        damage,
+        skeleton.type_data[5],
+        target.entity_id,
+        0u
+    );
+
+    skeleton.attack_cooldown = SKELETON_SHOOT_COOLDOWN;
+    return true;
+}
+
+// ============================================================================
+// Creeper Explosion System
+// ============================================================================
+
+void creeper_tick(inout MobState creeper, inout uint seed) {
+    float fuse_timer = uintBitsToFloat(creeper.type_data[0]);
+    bool fuse_started = creeper.type_data[1] != 0u;
+
+    EntityRef target;
+    if (get_entity(creeper.target_entity_id, target)) {
+        float dist = distance(creeper.position, target.position);
+
+        if (dist < 3.0 && !fuse_started) {
+            fuse_started = true;
+            fuse_timer = 0.0;
+            creeper.type_data[1] = 1u;
+        }
+
+        if (dist > 7.0 && fuse_started && fuse_timer < CREEPER_FUSE_TIME * 0.5) {
+            fuse_started = false;
+            fuse_timer = 0.0;
+            creeper.type_data[1] = 0u;
+        }
+    }
+
+    if (fuse_started) {
+        fuse_timer += 1.0;
+        creeper.type_data[0] = floatBitsToUint(fuse_timer);
+
+        if (fuse_timer >= CREEPER_FUSE_TIME) {
+            bool charged = (creeper.flags & MOB_FLAG_CHARGED) != 0u;
+            float radius = charged ? CREEPER_CHARGED_RADIUS : CREEPER_EXPLOSION_RADIUS;
+            float power = charged ? CREEPER_CHARGED_POWER : CREEPER_EXPLOSION_POWER;
+
+            emit_explosion(
+                creeper.position,
+                radius,
+                power * get_difficulty_multiplier(),
+                creeper.type_data[5],
+                1u
+            );
+
+            creeper.health = 0.0;
+            creeper.ai_state = AI_STATE_DEAD;
+        }
+    }
+}
+
+// ============================================================================
+// Main Combat Processing
+// ============================================================================
+
+void process_combat(inout MobState mob, inout uint seed) {
+    if (mob.ai_state != AI_STATE_ATTACK && mob.ai_state != AI_STATE_FIREBALL) return;
+    if (mob.target_entity_id == 0xFFFFFFFFu) return;
+
+    EntityRef target;
+    if (!get_entity(mob.target_entity_id, target)) return;
+
+    if (target.health <= 0.0) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFFu;
+        return;
+    }
+
+    if (mob.mob_type == MOB_TYPE_SKELETON) {
+        if (!shoot_arrow(mob, target, seed)) {
+            if (distance(mob.position, target.position) < 3.0) {
+                melee_attack(mob, target, seed);
+            }
+        }
+    } else if (mob.mob_type == MOB_TYPE_CREEPER) {
+        creeper_tick(mob, seed);
+    } else if (mob.mob_type == MOB_TYPE_BLAZE) {
+        // Blaze fireballs handled in mob_ai_blaze.comp
+    } else if (mob.mob_type == MOB_TYPE_GHAST) {
+        // Ghast fireballs handled separately
+    } else {
+        melee_attack(mob, target, seed);
+    }
+}
+
+// ============================================================================
+// Entry Point
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    if (mob.ai_state == AI_STATE_DEAD || (mob.flags & MOB_FLAG_NO_AI) != 0u) return;
+    if (pc.difficulty == 0u) return;
+
+    uint seed = mob.random_seed ^ pc.random_seed ^ idx ^ pc.tick;
+
+    if (mob.attack_cooldown > 0u) {
+        mob.attack_cooldown = mob.attack_cooldown - 1u;
+    }
+
+    process_combat(mob, seed);
+
+    mob.random_seed = seed;
+    mobs[idx] = mob;
+}

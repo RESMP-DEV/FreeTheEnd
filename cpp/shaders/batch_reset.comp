@@ -1,0 +1,407 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+layout(local_size_x = 256) in;
+
+// Uniforms
+layout(push_constant) uniform PushConstants {
+    uint num_envs;
+    uint reset_flags;  // Bitmask: bit 0 = world, bit 1 = inventory, bit 2 = stats
+} pc;
+
+// Dimension constants
+const uint OVERWORLD = 0;
+const uint NETHER = 1;
+const uint END = 2;
+
+// Item IDs
+const uint IRON_SWORD = 267;
+const uint IRON_HELMET = 306;
+const uint IRON_CHESTPLATE = 307;
+const uint IRON_LEGGINGS = 308;
+const uint IRON_BOOTS = 309;
+const uint DIAMOND_SWORD = 276;
+const uint DIAMOND_HELMET = 310;
+const uint DIAMOND_CHESTPLATE = 311;
+const uint DIAMOND_LEGGINGS = 312;
+const uint DIAMOND_BOOTS = 313;
+const uint EYE_OF_ENDER = 381;
+const uint BED = 355;
+const uint OBSIDIAN = 49;
+const uint FLINT_AND_STEEL = 259;
+const uint GOLDEN_APPLE = 322;
+const uint ENDER_PEARL = 368;
+const uint BLAZE_ROD = 369;
+
+// Player state structure (64 bytes aligned)
+struct PlayerState {
+    vec3 pos;           // 12 bytes
+    float health;       // 4 bytes
+    vec3 velocity;      // 12 bytes
+    float hunger;       // 4 bytes
+    vec2 rotation;      // 8 bytes (yaw, pitch)
+    float armor;        // 4 bytes
+    uint dimension;     // 4 bytes
+    uint game_mode;     // 4 bytes
+    uint status_flags;  // 4 bytes (on_ground, sprinting, sneaking, swimming)
+    float oxygen;       // 4 bytes
+    float experience;   // 4 bytes
+};
+
+// Inventory slot (8 bytes)
+struct InventorySlot {
+    uint item_id;
+    uint count;
+};
+
+// Environment state (stored per-env)
+struct EnvState {
+    uint stage;         // Current training stage (1-6)
+    uint seed;          // World generation seed
+    uint tick;          // Current game tick
+    uint episode_tick;  // Ticks since episode start
+    uint episode_count; // Total episodes completed
+    float cumulative_reward;
+    uint death_count;
+    uint craft_count;
+};
+
+// SSBOs
+layout(std430, binding = 0) buffer PlayerStates {
+    PlayerState states[];
+};
+
+layout(std430, binding = 1) buffer Observations {
+    float observations[];  // 256 floats per env
+};
+
+layout(std430, binding = 2) buffer Inventories {
+    InventorySlot inventories[];  // 41 slots per env (36 main + 4 armor + 1 offhand)
+};
+
+layout(std430, binding = 3) buffer EnvStates {
+    EnvState env_states[];
+};
+
+layout(std430, binding = 4) buffer WorldSeeds {
+    uint world_seeds[];  // Pre-generated seeds for reproducibility
+};
+
+layout(std430, binding = 5) buffer StageConfigs {
+    uint stage_configs[];  // Stage assignment per env
+};
+
+// Pseudo-random number generator (xorshift)
+uint rand_state;
+
+uint xorshift() {
+    rand_state ^= rand_state << 13;
+    rand_state ^= rand_state >> 17;
+    rand_state ^= rand_state << 5;
+    return rand_state;
+}
+
+float rand_float() {
+    return float(xorshift()) / 4294967295.0;
+}
+
+float rand_range(float min_val, float max_val) {
+    return min_val + rand_float() * (max_val - min_val);
+}
+
+// Find valid spawn position in overworld
+vec3 find_overworld_spawn(uint seed) {
+    rand_state = seed;
+
+    // Spawn within 1000 blocks of origin, at y=64
+    float x = rand_range(-500.0, 500.0);
+    float z = rand_range(-500.0, 500.0);
+
+    // Simple terrain height approximation
+    float y = 64.0 + sin(x * 0.01) * 10.0 + cos(z * 0.01) * 8.0;
+    y = max(63.0, min(y, 100.0));
+
+    return vec3(x, y, z);
+}
+
+// Find valid spawn position in nether
+vec3 find_nether_spawn(uint seed) {
+    rand_state = seed + 0xDEADBEEF;
+
+    // Nether spawn near a fortress
+    float x = rand_range(-100.0, 100.0);
+    float z = rand_range(-100.0, 100.0);
+    float y = rand_range(32.0, 96.0);
+
+    return vec3(x, y, z);
+}
+
+// Find valid spawn position in end
+vec3 find_end_spawn(uint seed) {
+    rand_state = seed + 0xCAFEBABE;
+
+    // End spawn on obsidian platform
+    return vec3(100.0, 50.0, 0.0);
+}
+
+// Clear inventory for an environment
+void clear_inventory(uint env_id) {
+    uint base = env_id * 41;
+    for (uint i = 0; i < 41; i++) {
+        inventories[base + i].item_id = 0;
+        inventories[base + i].count = 0;
+    }
+}
+
+// Give item to player (finds first empty slot)
+void give_item(uint env_id, uint item_id, uint count) {
+    uint base = env_id * 41;
+
+    // Check if item already exists and stack
+    for (uint i = 0; i < 36; i++) {
+        if (inventories[base + i].item_id == item_id) {
+            inventories[base + i].count += count;
+            return;
+        }
+    }
+
+    // Find empty slot
+    for (uint i = 0; i < 36; i++) {
+        if (inventories[base + i].item_id == 0) {
+            inventories[base + i].item_id = item_id;
+            inventories[base + i].count = count;
+            return;
+        }
+    }
+}
+
+// Give armor set (uses armor slots 36-39)
+void give_iron_armor(uint env_id) {
+    uint base = env_id * 41;
+    inventories[base + 36].item_id = IRON_HELMET;
+    inventories[base + 36].count = 1;
+    inventories[base + 37].item_id = IRON_CHESTPLATE;
+    inventories[base + 37].count = 1;
+    inventories[base + 38].item_id = IRON_LEGGINGS;
+    inventories[base + 38].count = 1;
+    inventories[base + 39].item_id = IRON_BOOTS;
+    inventories[base + 39].count = 1;
+}
+
+void give_diamond_armor(uint env_id) {
+    uint base = env_id * 41;
+    inventories[base + 36].item_id = DIAMOND_HELMET;
+    inventories[base + 36].count = 1;
+    inventories[base + 37].item_id = DIAMOND_CHESTPLATE;
+    inventories[base + 37].count = 1;
+    inventories[base + 38].item_id = DIAMOND_LEGGINGS;
+    inventories[base + 38].count = 1;
+    inventories[base + 39].item_id = DIAMOND_BOOTS;
+    inventories[base + 39].count = 1;
+}
+
+// Stage-specific inventory setup
+void setup_stage_inventory(uint env_id, uint stage) {
+    clear_inventory(env_id);
+
+    switch (stage) {
+        case 1:  // Early game - nothing
+            break;
+
+        case 2:  // Wood/stone tools - basic food
+            give_item(env_id, GOLDEN_APPLE, 3);
+            break;
+
+        case 3:  // Nether entry - iron gear + obsidian
+            give_iron_armor(env_id);
+            give_item(env_id, IRON_SWORD, 1);
+            give_item(env_id, OBSIDIAN, 14);
+            give_item(env_id, FLINT_AND_STEEL, 1);
+            give_item(env_id, GOLDEN_APPLE, 5);
+            break;
+
+        case 4:  // Fortress hunting - iron gear
+            give_iron_armor(env_id);
+            give_item(env_id, IRON_SWORD, 1);
+            give_item(env_id, GOLDEN_APPLE, 10);
+            break;
+
+        case 5:  // Stronghold - eyes + gear
+            give_iron_armor(env_id);
+            give_item(env_id, IRON_SWORD, 1);
+            give_item(env_id, EYE_OF_ENDER, 12);
+            give_item(env_id, GOLDEN_APPLE, 10);
+            give_item(env_id, ENDER_PEARL, 8);
+            break;
+
+        case 6:  // Dragon fight - full gear + beds
+            give_diamond_armor(env_id);
+            give_item(env_id, DIAMOND_SWORD, 1);
+            give_item(env_id, BED, 10);
+            give_item(env_id, GOLDEN_APPLE, 20);
+            give_item(env_id, ENDER_PEARL, 16);
+            break;
+    }
+}
+
+// Compute armor value from equipped armor
+float compute_armor_value(uint env_id) {
+    uint base = env_id * 41;
+    float armor = 0.0;
+
+    for (uint i = 36; i < 40; i++) {
+        uint item = inventories[base + i].item_id;
+
+        // Iron armor values
+        if (item == IRON_HELMET) armor += 2.0;
+        else if (item == IRON_CHESTPLATE) armor += 6.0;
+        else if (item == IRON_LEGGINGS) armor += 5.0;
+        else if (item == IRON_BOOTS) armor += 2.0;
+
+        // Diamond armor values
+        else if (item == DIAMOND_HELMET) armor += 3.0;
+        else if (item == DIAMOND_CHESTPLATE) armor += 8.0;
+        else if (item == DIAMOND_LEGGINGS) armor += 6.0;
+        else if (item == DIAMOND_BOOTS) armor += 3.0;
+    }
+
+    return armor;
+}
+
+// Encode observation for this environment
+void encode_observation(uint env_id) {
+    PlayerState state = states[env_id];
+    EnvState env = env_states[env_id];
+    uint base = env_id * 256;
+    uint idx = 0;
+
+    // Player stats (8 floats)
+    observations[base + idx++] = state.health / 20.0;
+    observations[base + idx++] = state.hunger / 20.0;
+    observations[base + idx++] = state.armor / 20.0;
+    observations[base + idx++] = state.oxygen / 300.0;
+    observations[base + idx++] = state.experience;
+    observations[base + idx++] = float(state.dimension) / 2.0;
+    observations[base + idx++] = float(state.status_flags & 1);  // on_ground
+    observations[base + idx++] = float((state.status_flags >> 1) & 1);  // sprinting
+
+    // Position normalized (6 floats)
+    observations[base + idx++] = state.pos.x / 30000.0;
+    observations[base + idx++] = state.pos.y / 256.0;
+    observations[base + idx++] = state.pos.z / 30000.0;
+    observations[base + idx++] = state.velocity.x / 10.0;
+    observations[base + idx++] = state.velocity.y / 10.0;
+    observations[base + idx++] = state.velocity.z / 10.0;
+
+    // Rotation normalized (2 floats)
+    observations[base + idx++] = state.rotation.x / 360.0;
+    observations[base + idx++] = state.rotation.y / 180.0 + 0.5;
+
+    // Episode stats (4 floats)
+    observations[base + idx++] = float(env.tick) / 100000.0;
+    observations[base + idx++] = float(env.episode_tick) / 36000.0;  // 30 min max
+    observations[base + idx++] = float(env.stage) / 6.0;
+    observations[base + idx++] = env.cumulative_reward;
+
+    // Inventory encoding (82 floats - item presence and counts)
+    uint inv_base = env_id * 41;
+    for (uint i = 0; i < 41; i++) {
+        observations[base + idx++] = float(inventories[inv_base + i].item_id) / 512.0;
+        observations[base + idx++] = float(inventories[inv_base + i].count) / 64.0;
+    }
+
+    // Remaining slots zero-padded (visual features added by separate kernel)
+    for (; idx < 256; idx++) {
+        observations[base + idx] = 0.0;
+    }
+}
+
+// Reset world state for environment (triggers separate terrain gen)
+void reset_world_state(uint env_id, uint stage, uint seed) {
+    // Mark this env for terrain regeneration
+    // Actual terrain gen happens in separate pass
+    env_states[env_id].seed = seed;
+    env_states[env_id].tick = 0;
+    env_states[env_id].episode_tick = 0;
+    env_states[env_id].cumulative_reward = 0.0;
+}
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+    if (env_id >= pc.num_envs) return;
+
+    // Get stage and seed for this environment
+    uint stage = stage_configs[env_id];
+    uint seed = world_seeds[env_id];
+
+    // Initialize RNG with env-specific seed
+    rand_state = seed ^ (env_id * 0x9E3779B9);
+
+    // Reset player state
+    PlayerState state;
+    state.health = 20.0;
+    state.hunger = 20.0;
+    state.oxygen = 300.0;
+    state.experience = 0.0;
+    state.velocity = vec3(0.0);
+    state.rotation = vec2(0.0, 0.0);
+    state.game_mode = 0;  // Survival
+    state.status_flags = 1;  // on_ground
+
+    // Stage-specific spawn and dimension
+    switch (stage) {
+        case 1:  // Early game - overworld
+        case 2:  // Mining stage - overworld
+            state.pos = find_overworld_spawn(seed);
+            state.dimension = OVERWORLD;
+            break;
+
+        case 3:  // Nether entry - spawn in nether
+            state.pos = find_nether_spawn(seed);
+            state.dimension = NETHER;
+            break;
+
+        case 4:  // Fortress hunting - nether
+            state.pos = find_nether_spawn(seed);
+            state.dimension = NETHER;
+            break;
+
+        case 5:  // Stronghold hunting - overworld
+            state.pos = find_overworld_spawn(seed);
+            state.dimension = OVERWORLD;
+            break;
+
+        case 6:  // Dragon fight - end
+            state.pos = find_end_spawn(seed);
+            state.dimension = END;
+            break;
+
+        default:
+            state.pos = find_overworld_spawn(seed);
+            state.dimension = OVERWORLD;
+            break;
+    }
+
+    // Setup stage-specific inventory
+    if ((pc.reset_flags & 2) != 0) {
+        setup_stage_inventory(env_id, stage);
+    }
+
+    // Compute armor from equipped items
+    state.armor = compute_armor_value(env_id);
+
+    // Reset world state if requested
+    if ((pc.reset_flags & 1) != 0) {
+        reset_world_state(env_id, stage, seed);
+    }
+
+    // Update episode counter
+    env_states[env_id].episode_count++;
+    env_states[env_id].stage = stage;
+
+    // Write player state
+    states[env_id] = state;
+
+    // Encode initial observation
+    encode_observation(env_id);
+}

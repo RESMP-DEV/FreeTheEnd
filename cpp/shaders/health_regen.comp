@@ -1,0 +1,118 @@
+#version 450
+
+// Minecraft 1.8.9 natural health regeneration
+// Triggers when food >= 18 (or >= 20 for fast regen)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer HealthBuffer {
+    float health[];
+} health_buf;
+
+layout(std430, set = 0, binding = 1) buffer MaxHealthBuffer {
+    float max_health[];
+} max_health_buf;
+
+layout(std430, set = 0, binding = 2) buffer FoodLevelBuffer {
+    float food_level[];
+} food_buf;
+
+layout(std430, set = 0, binding = 3) buffer SaturationBuffer {
+    float saturation[];
+} saturation_buf;
+
+layout(std430, set = 0, binding = 4) buffer ExhaustionBuffer {
+    float exhaustion[];
+} exhaustion_buf;
+
+// Regen tick accumulator for natural healing
+layout(std430, set = 0, binding = 5) buffer NaturalRegenAccumBuffer {
+    float natural_regen_accum[];
+} regen_accum_buf;
+
+// Flag buffer: indicates if player has is_active regeneration potion effect
+// (If so, skip natural regen to avoid double-healing; potion regen handled in status_effects.comp)
+layout(std430, set = 0, binding = 6) readonly buffer HasRegenEffectBuffer {
+    uint has_regen_effect[];  // 0 = no, 1 = yes
+} has_regen_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint player_count;
+    float tick_delta;
+    uint game_difficulty;  // 0=peaceful, 1=easy, 2=normal, 3=hard
+} pc;
+
+// MC 1.8.9 natural regen constants
+const float SLOW_REGEN_FOOD_THRESHOLD = 18.0;   // Food >= 18 for slow regen
+const float FAST_REGEN_FOOD_THRESHOLD = 20.0;   // Food == 20 for fast regen (1.9+ but included)
+const float SLOW_REGEN_INTERVAL = 80.0;         // Ticks between slow regen (4 seconds)
+const float FAST_REGEN_INTERVAL = 10.0;         // Ticks between fast regen (0.5 seconds)
+const float REGEN_EXHAUSTION_COST = 6.0;        // Exhaustion added per heal
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.player_count) return;
+
+    float health = health_buf.health[idx];
+    float max_health = max_health_buf.max_health[idx];
+    float food = food_buf.food_level[idx];
+    float saturation = saturation_buf.saturation[idx];
+    float exhaustion = exhaustion_buf.exhaustion[idx];
+    float regen_accum = regen_accum_buf.natural_regen_accum[idx];
+    bool has_potion_regen = has_regen_buf.has_regen_effect[idx] != 0;
+
+    // Peaceful mode: instant full regen
+    if (pc.game_difficulty == 0) {
+        health_buf.health[idx] = max_health;
+        regen_accum_buf.natural_regen_accum[idx] = 0.0;
+        return;
+    }
+
+    // Skip if already at max health
+    if (health >= max_health) {
+        regen_accum_buf.natural_regen_accum[idx] = 0.0;
+        return;
+    }
+
+    // Skip if potion regen is is_active (handled elsewhere)
+    if (has_potion_regen) {
+        return;
+    }
+
+    // Determine regen rate based on food level
+    float regen_interval = 0.0;
+    bool can_regen = false;
+
+    if (food >= FAST_REGEN_FOOD_THRESHOLD && saturation > 0.0) {
+        // Fast regen when food full AND saturation > 0
+        regen_interval = FAST_REGEN_INTERVAL;
+        can_regen = true;
+    } else if (food >= SLOW_REGEN_FOOD_THRESHOLD) {
+        // Slow regen when food >= 18
+        regen_interval = SLOW_REGEN_INTERVAL;
+        can_regen = true;
+    }
+
+    if (!can_regen) {
+        regen_accum_buf.natural_regen_accum[idx] = 0.0;
+        return;
+    }
+
+    // Accumulate time and check for heal
+    regen_accum += pc.tick_delta * 20.0;  // Convert to ticks
+
+    if (regen_accum >= regen_interval) {
+        regen_accum -= regen_interval;
+
+        // Heal 1 HP
+        health = min(max_health, health + 1.0);
+
+        // Add exhaustion cost (causes food depletion over time)
+        exhaustion += REGEN_EXHAUSTION_COST;
+
+        health_buf.health[idx] = health;
+        exhaustion_buf.exhaustion[idx] = exhaustion;
+    }
+
+    regen_accum_buf.natural_regen_accum[idx] = regen_accum;
+}

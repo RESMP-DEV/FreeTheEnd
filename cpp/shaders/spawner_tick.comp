@@ -1,0 +1,342 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Spawner Block Mechanics
+// ============================================================================
+// Implements Minecraft 1.8.9 spawner behavior:
+// - Activates when player within 16 blocks
+// - 4 second spawn cycle (80 ticks)
+// - Max 4 mobs at once from a single spawner
+// - Spawns in 4x4x4 area centered on spawner
+// ============================================================================
+
+// Mob types
+const uint MOB_TYPE_ZOMBIE = 0;
+const uint MOB_TYPE_SKELETON = 1;
+const uint MOB_TYPE_ENDERMAN = 2;
+const uint MOB_TYPE_BLAZE = 3;
+const uint MOB_TYPE_ZOMBIE_PIGMAN = 4;
+const uint MOB_TYPE_CAVE_SPIDER = 5;
+const uint MOB_TYPE_SILVERFISH = 6;
+
+// Spawner constants
+const float SPAWNER_ACTIVATION_RANGE = 16.0;
+const uint SPAWNER_CYCLE_TICKS = 80;           // 4 seconds at 20 tps
+const uint SPAWNER_MIN_DELAY = 200;            // 10 seconds minimum
+const uint SPAWNER_MAX_DELAY = 800;            // 40 seconds maximum
+const uint SPAWNER_MAX_NEARBY_MOBS = 6;        // Max mobs in range to allow spawn
+const uint SPAWNER_SPAWN_RANGE = 4;            // Horizontal spawn range
+const uint SPAWNER_VERTICAL_RANGE = 1;         // Vertical spawn range
+const float SPAWNER_CHECK_RANGE = 8.0;         // Range to count nearby mobs
+
+// Per-spawner limits
+const uint BLAZE_SPAWNER_MAX = 4;              // Max blazes per blaze spawner
+const uint CAVE_SPIDER_SPAWNER_MAX = 4;
+const uint DEFAULT_SPAWNER_MAX = 4;
+
+// AI state for checking alive status
+const uint AI_STATE_DEAD = 9;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct SpawnerState {
+    vec3 position;           // Spawner block position
+    uint spawner_id;         // Unique spawner ID
+    uint mob_type;           // Type of mob to spawn
+    uint spawn_delay;        // Ticks until next spawn attempt
+    uint spawn_count;        // Mobs spawned by this spawner currently alive
+    uint total_spawned;      // Total spawns since placement
+    uint flags;              // State flags
+    uint _pad[2];
+};
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+};
+
+// Spawn request for CPU to process
+struct SpawnRequest {
+    vec3 position;
+    uint spawner_id;
+    uint mob_type;
+    float yaw;
+    uint flags;
+    uint _pad;
+};
+
+// Spawner flag bits
+const uint SPAWNER_FLAG_ACTIVE = 1 << 0;       // Currently active (player nearby)
+const uint SPAWNER_FLAG_SPINNING = 1 << 1;     // Visual spin effect active
+const uint SPAWNER_FLAG_DISABLED = 1 << 2;     // Disabled (e.g., by commands)
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer SpawnerBuffer {
+    SpawnerState spawners[];
+};
+
+layout(set = 0, binding = 1) buffer readonly MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 2) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 3) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 4) buffer SpawnRequestBuffer {
+    uint spawn_request_count;
+    SpawnRequest spawn_requests[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint spawner_count;
+    uint mob_count;
+    uint entity_count;
+    uint tick;
+    float delta_time;
+    uint random_seed;
+    vec3 player_pos;
+    float _pad;
+} pc;
+
+// ============================================================================
+// Random
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+// ============================================================================
+// World Queries
+// ============================================================================
+
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+bool is_air_or_passable(uint block_id) {
+    return block_id == 0 || block_id == 8 || block_id == 9 ||
+           block_id == 10 || block_id == 11;
+}
+
+// ============================================================================
+// Spawner Logic
+// ============================================================================
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+// Check if player is within activation range
+bool is_player_nearby(vec3 spawner_pos) {
+    float dist_sq = distance_squared(spawner_pos, pc.player_pos);
+    return dist_sq <= SPAWNER_ACTIVATION_RANGE * SPAWNER_ACTIVATION_RANGE;
+}
+
+// Count alive mobs from this spawner and nearby
+uint count_nearby_mobs(vec3 spawner_pos, uint target_mob_type, uint spawner_id) {
+    uint count = 0;
+    float range_sq = SPAWNER_CHECK_RANGE * SPAWNER_CHECK_RANGE;
+
+    for (uint i = 0; i < pc.mob_count; i++) {
+        MobState mob = mobs[i];
+
+        // Only count alive mobs of the same type
+        if (mob.ai_state == AI_STATE_DEAD) continue;
+        if (mob.mob_type != target_mob_type) continue;
+
+        float dist_sq = distance_squared(spawner_pos, mob.position);
+        if (dist_sq <= range_sq) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+// Get max mobs for a spawner type
+uint get_spawner_max(uint mob_type) {
+    switch (mob_type) {
+        case MOB_TYPE_BLAZE:
+            return BLAZE_SPAWNER_MAX;
+        case MOB_TYPE_CAVE_SPIDER:
+            return CAVE_SPIDER_SPAWNER_MAX;
+        default:
+            return DEFAULT_SPAWNER_MAX;
+    }
+}
+
+// Find a valid spawn position near the spawner
+bool find_spawn_position(vec3 spawner_pos, uint mob_type, inout uint seed, out vec3 spawn_pos) {
+    // Try several random positions
+    for (uint attempt = 0; attempt < 4; attempt++) {
+        float ox = (random_float(seed) - 0.5) * float(SPAWNER_SPAWN_RANGE) * 2.0;
+        float oy = (random_float(seed) - 0.5) * float(SPAWNER_VERTICAL_RANGE) * 2.0;
+        float oz = (random_float(seed) - 0.5) * float(SPAWNER_SPAWN_RANGE) * 2.0;
+
+        vec3 candidate = spawner_pos + vec3(ox, oy, oz);
+        ivec3 block_pos = world_to_block(candidate);
+
+        // Check spawn conditions
+        uint block_at = get_block_at(block_pos);
+        uint block_above = get_block_at(block_pos + ivec3(0, 1, 0));
+        uint block_below = get_block_at(block_pos + ivec3(0, -1, 0));
+
+        // Flying mobs (blaze) just need air
+        if (mob_type == MOB_TYPE_BLAZE) {
+            if (is_air_or_passable(block_at) && is_air_or_passable(block_above)) {
+                spawn_pos = candidate;
+                return true;
+            }
+        } else {
+            // Ground mobs need floor and clearance
+            if (is_air_or_passable(block_at) &&
+                is_air_or_passable(block_above) &&
+                is_solid(block_below)) {
+                spawn_pos = vec3(candidate.x, float(block_pos.y), candidate.z);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// Queue a spawn request
+void queue_spawn(uint spawner_id, vec3 position, uint mob_type, float yaw) {
+    uint idx = atomicAdd(spawn_request_count, 1);
+    if (idx < 64) {  // Max spawns per tick
+        spawn_requests[idx].position = position;
+        spawn_requests[idx].spawner_id = spawner_id;
+        spawn_requests[idx].mob_type = mob_type;
+        spawn_requests[idx].yaw = yaw;
+        spawn_requests[idx].flags = 0;
+        spawn_requests[idx]._pad = 0;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.spawner_count) return;
+
+    SpawnerState spawner = spawners[idx];
+
+    // Skip disabled spawners
+    if ((spawner.flags & SPAWNER_FLAG_DISABLED) != 0) return;
+
+    uint seed = spawner.spawner_id ^ pc.random_seed ^ pc.tick;
+
+    // Check if player is nearby to activate
+    bool player_nearby = is_player_nearby(spawner.position);
+
+    if (player_nearby) {
+        spawner.flags |= SPAWNER_FLAG_ACTIVE | SPAWNER_FLAG_SPINNING;
+    } else {
+        spawner.flags &= ~(SPAWNER_FLAG_ACTIVE | SPAWNER_FLAG_SPINNING);
+        spawners[idx] = spawner;
+        return;  // Inactive spawners don't tick
+    }
+
+    // Count nearby mobs
+    uint nearby_count = count_nearby_mobs(spawner.position, spawner.mob_type, spawner.spawner_id);
+    uint max_from_spawner = get_spawner_max(spawner.mob_type);
+
+    // Decrement spawn delay
+    if (spawner.spawn_delay > 0) {
+        spawner.spawn_delay--;
+    }
+
+    // Attempt spawn when delay reaches 0
+    if (spawner.spawn_delay == 0) {
+        // Check mob limits
+        if (nearby_count < SPAWNER_MAX_NEARBY_MOBS &&
+            spawner.spawn_count < max_from_spawner) {
+
+            // Find valid spawn position
+            vec3 spawn_pos;
+            if (find_spawn_position(spawner.position, spawner.mob_type, seed, spawn_pos)) {
+                float yaw = random_float(seed) * 6.28318530718;
+                queue_spawn(spawner.spawner_id, spawn_pos, spawner.mob_type, yaw);
+
+                spawner.spawn_count++;
+                spawner.total_spawned++;
+            }
+        }
+
+        // Reset delay (random between min and max)
+        // For blaze spawners in vanilla: 200-800 ticks but we use 80 for faster testing
+        uint delay_range = SPAWNER_MAX_DELAY - SPAWNER_MIN_DELAY;
+        spawner.spawn_delay = SPAWNER_MIN_DELAY + uint(random_float(seed) * float(delay_range));
+
+        // Override: Use fixed 4-second cycle for blaze spawners per spec
+        if (spawner.mob_type == MOB_TYPE_BLAZE) {
+            spawner.spawn_delay = SPAWNER_CYCLE_TICKS;
+        }
+    }
+
+    spawner.flags |= SPAWNER_FLAG_SPINNING;  // Keep spinning while active
+    spawners[idx] = spawner;
+}

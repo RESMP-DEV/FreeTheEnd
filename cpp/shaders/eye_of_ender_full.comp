@@ -1,0 +1,804 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+/*
+ * eye_of_ender_full.comp - Complete Eye of Ender System for Minecraft 1.8.9
+ *
+ * Features:
+ *   - Crafting: Blaze powder + Ender pearl = Eye of Ender
+ *   - Throwing: Use item to throw eye toward nearest stronghold
+ *   - Flight physics: Rises ~3 blocks, travels ~12 blocks toward stronghold, then drops
+ *   - Shatter chance: 20% destroyed, 80% drops as item
+ *   - Observation: Provides stronghold direction and distance estimates
+ *
+ * Minecraft 1.8.9 Eye Behavior:
+ *   1. Player throws eye (use item action)
+ *   2. Eye rises for ~10-20 ticks with upward velocity
+ *   3. Eye floats toward nearest stronghold at ~0.25 blocks/tick horizontal
+ *   4. After ~40 ticks, eye stops rising and begins falling
+ *   5. When landing: 20% chance to shatter (particles), 80% drops as item entity
+ *   6. If player is directly above stronghold (within ~4 blocks XZ), eye goes straight down
+ *
+ * Usage for speedrunning:
+ *   - Throw 2+ eyes from different positions to triangulate stronghold
+ *   - Eye direction gives XZ vector toward stronghold
+ *   - Distance can be estimated from flight angle
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS - Minecraft 1.8.9 accurate values
+// ============================================================================
+
+// Physics constants (per tick, 20 TPS)
+const float EYE_HORIZONTAL_SPEED = 0.25;       // Blocks per tick toward stronghold
+const float EYE_INITIAL_UPWARD_VEL = 0.5;      // Initial upward velocity
+const float EYE_UPWARD_DECAY = 0.99;           // Upward velocity decay per tick
+const float EYE_GRAVITY = 0.03;                // Gravity when falling
+const float EYE_DRAG = 0.99;                   // Air resistance
+const float EYE_MIN_RISE_HEIGHT = 3.0;         // Minimum rise before lateral movement
+const float EYE_TRAVEL_DISTANCE = 12.0;        // Approximate travel distance
+
+const uint EYE_RISE_TICKS = 15;                // Ticks of upward movement
+const uint EYE_FLIGHT_TICKS = 25;              // Ticks of horizontal flight
+const uint EYE_TOTAL_FLIGHT_TICKS = 40;        // Total ticks before falling
+const uint EYE_MAX_LIFETIME = 200;             // Max ticks before forced despawn
+
+const float EYE_SHATTER_CHANCE = 0.2;          // 20% chance to shatter
+const float EYE_ABOVE_STRONGHOLD_THRESHOLD = 4.0;  // XZ distance to detect "above"
+
+const float PI = 3.14159265359;
+
+// Item IDs (Minecraft 1.8.9)
+const uint ITEM_ENDER_PEARL = 368;
+const uint ITEM_BLAZE_POWDER = 377;
+const uint ITEM_BLAZE_ROD = 369;
+const uint ITEM_EYE_OF_ENDER = 381;
+
+// Eye states
+const uint EYE_STATE_INACTIVE = 0u;
+const uint EYE_STATE_RISING = 1u;
+const uint EYE_STATE_FLYING = 2u;
+const uint EYE_STATE_FALLING = 3u;
+const uint EYE_STATE_LANDED = 4u;
+const uint EYE_STATE_SHATTERED = 5u;
+
+// Event types
+const uint EVENT_EYE_THROWN = 0u;
+const uint EVENT_EYE_FLYING = 1u;
+const uint EVENT_EYE_DROPPED = 2u;
+const uint EVENT_EYE_SHATTERED = 3u;
+const uint EVENT_EYE_LANDED = 4u;
+const uint EVENT_EYE_PICKUP = 5u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct EyeOfEnder {
+    vec3 position;
+    float spawn_y;           // Y position when thrown (for height calculations)
+    vec3 velocity;
+    float target_dist;       // Distance to target stronghold
+    float target_x;          // Stronghold X coordinate
+    float target_z;          // Stronghold Z coordinate
+    uint state;              // Current state (rising/flying/falling/etc)
+    uint ticks_alive;        // Total ticks since thrown
+    uint will_shatter;       // Determined at throw time (1 = will shatter)
+    uint owner_env;          // Environment/player that threw this eye
+    float start_x;           // Starting X position (for direction calculation)
+    float start_z;           // Starting Z position
+    float travel_direction_x; // Normalized direction vector X
+    float travel_direction_z; // Normalized direction vector Z
+};
+
+struct Stronghold {
+    float x;
+    float z;
+    float portal_room_x;
+    float portal_room_z;
+    uint is_discovered;      // Has player found this one?
+    uint ring;               // Which ring (0-2)
+    uint padding[2];
+};
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint dimension;
+    uint reserved[2];
+};
+
+struct InputState {
+    float movement_x;
+    float movement_y;
+    float movement_z;
+    float look_delta_x;
+    float look_delta_y;
+    uint action;             // 0=none, 4=use_item (throw eye)
+    uint action_data;        // Selected slot
+    uint flags;
+};
+
+struct Inventory {
+    uint item_ids[46];
+    uint counts[46];
+    uint damage[46];
+    uint selected_slot;
+};
+
+struct EyeEvent {
+    uint eye_idx;
+    uint event_type;
+    float pos_x;
+    float pos_y;
+    float pos_z;
+    uint tick;
+    float direction_x;       // Direction eye traveled (for observation)
+    float direction_z;
+};
+
+struct EyeObservation {
+    // Eye flight data
+    float eye_active;            // 1.0 if eye is currently in flight
+    float eye_direction_x;       // Direction eye traveled (normalized X)
+    float eye_direction_y;       // Direction eye traveled (normalized Y) - usually small
+    float eye_direction_z;       // Direction eye traveled (normalized Z)
+
+    // Stronghold estimates (from triangulation)
+    float stronghold_direction_x; // Estimated direction to stronghold (X)
+    float stronghold_direction_z; // Estimated direction to stronghold (Z)
+    float stronghold_distance;    // Estimated distance (rough, from flight angle)
+    float stronghold_above;       // 1.0 if directly above stronghold (eye goes down)
+
+    // Last throw data
+    float last_throw_pos_x;
+    float last_throw_pos_z;
+    float last_eye_end_x;
+    float last_eye_end_z;
+
+    // Additional info
+    float eyes_in_inventory;     // Count of eyes available
+    float can_throw;             // 1.0 if player can throw an eye now
+    float reserved0;
+    float reserved1;
+};
+
+// ============================================================================
+// PUSH CONSTANTS
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    uint stage;              // 0=craft, 1=throw, 2=tick_physics, 3=land, 4=observe
+    uint num_envs;           // Number of parallel environments
+    uint tick;               // Current game tick
+    uint random_seed;        // RNG seed
+    uint num_eyes;           // Active eyes count
+    uint num_strongholds;    // Strongholds per world (usually 3 for ring 1)
+    uint padding[2];
+} pc;
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+// Set 0: Core state
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) buffer InputBuffer {
+    InputState inputs[];
+};
+
+layout(set = 0, binding = 2) buffer InventoryBuffer {
+    Inventory inventories[];
+};
+
+// Set 1: Eye of Ender system
+layout(set = 0, binding = 3) buffer EyeBuffer {
+    EyeOfEnder eyes[];       // Max eyes per env * num_envs
+};
+
+layout(set = 0, binding = 4) buffer StrongholdBuffer {
+    Stronghold strongholds[]; // num_strongholds per env
+};
+
+layout(set = 0, binding = 5) buffer EyeEventBuffer {
+    uint event_count;
+    uint max_events;
+    uint padding[2];
+    EyeEvent events[];
+};
+
+// Set 2: Observations
+layout(set = 0, binding = 6) buffer EyeObservationBuffer {
+    EyeObservation eye_observations[];
+};
+
+// Set 3: Crafting results (optional, for UI feedback)
+layout(set = 0, binding = 7) buffer CraftingResultBuffer {
+    uint craft_results[];    // Success/fail per request
+};
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+// Find nearest stronghold to position
+uint find_nearest_stronghold(uint env_id, vec3 pos, out float dist, out float target_x, out float target_z) {
+    uint base = env_id * pc.num_strongholds;
+    float min_dist_sq = 1e30;
+    uint nearest = 0u;
+    target_x = 0.0;
+    target_z = 0.0;
+
+    for (uint i = 0u; i < pc.num_strongholds; i++) {
+        Stronghold sh = strongholds[base + i];
+        float dx = sh.x - pos.x;
+        float dz = sh.z - pos.z;
+        float dist_sq = dx * dx + dz * dz;
+
+        if (dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+            nearest = i;
+            target_x = sh.x;
+            target_z = sh.z;
+        }
+    }
+
+    dist = sqrt(min_dist_sq);
+    return nearest;
+}
+
+// Get direction vector to target (2D, normalized)
+vec2 get_direction_to_target(vec3 pos, float target_x, float target_z) {
+    float dx = target_x - pos.x;
+    float dz = target_z - pos.z;
+    float len = sqrt(dx * dx + dz * dz);
+
+    if (len < 0.001) {
+        return vec2(0.0, 0.0);
+    }
+
+    return vec2(dx / len, dz / len);
+}
+
+// Write an eye event
+void write_eye_event(uint eye_idx, uint event_type, vec3 pos, uint tick_num, vec2 direction) {
+    uint idx = atomicAdd(event_count, 1u);
+    if (idx >= max_events) {
+        atomicAdd(event_count, 0xFFFFFFFFu);  // Subtract 1
+        return;
+    }
+
+    events[idx].eye_idx = eye_idx;
+    events[idx].event_type = event_type;
+    events[idx].pos_x = pos.x;
+    events[idx].pos_y = pos.y;
+    events[idx].pos_z = pos.z;
+    events[idx].tick = tick_num;
+    events[idx].direction_x = direction.x;
+    events[idx].direction_z = direction.y;
+}
+
+// ============================================================================
+// STAGE 0: CRAFTING
+// Handles blaze rod -> blaze powder, blaze powder + ender pearl -> eye of ender
+// ============================================================================
+
+void stage_crafting(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    InputState inp = inputs[env_id];
+    Inventory inv = inventories[env_id];
+
+    // Only process if action is craft (assume action_data specifies recipe)
+    // Recipe 0: Blaze Rod -> 2x Blaze Powder
+    // Recipe 1: Blaze Powder + Ender Pearl -> Eye of Ender
+
+    if (inp.action != 5u) return;  // 5 = craft action
+
+    uint recipe = inp.action_data;
+    bool success = false;
+
+    if (recipe == 0u) {
+        // Blaze Rod -> 2x Blaze Powder
+        // Find blaze rod in inventory
+        for (uint i = 0u; i < 46u; i++) {
+            if (inv.item_ids[i] == ITEM_BLAZE_ROD && inv.counts[i] >= 1u) {
+                // Consume blaze rod
+                inv.counts[i]--;
+                if (inv.counts[i] == 0u) inv.item_ids[i] = 0u;
+
+                // Add 2 blaze powder to first available slot
+                bool added = false;
+                for (uint j = 0u; j < 46u && !added; j++) {
+                    if (inv.item_ids[j] == ITEM_BLAZE_POWDER && inv.counts[j] < 64u) {
+                        inv.counts[j] = min(inv.counts[j] + 2u, 64u);
+                        added = true;
+                    } else if (inv.item_ids[j] == 0u) {
+                        inv.item_ids[j] = ITEM_BLAZE_POWDER;
+                        inv.counts[j] = 2u;
+                        added = true;
+                    }
+                }
+                success = added;
+                break;
+            }
+        }
+    } else if (recipe == 1u) {
+        // Blaze Powder + Ender Pearl -> Eye of Ender
+        int powder_slot = -1;
+        int pearl_slot = -1;
+
+        for (uint i = 0u; i < 46u; i++) {
+            if (inv.item_ids[i] == ITEM_BLAZE_POWDER && inv.counts[i] >= 1u && powder_slot < 0) {
+                powder_slot = int(i);
+            }
+            if (inv.item_ids[i] == ITEM_ENDER_PEARL && inv.counts[i] >= 1u && pearl_slot < 0) {
+                pearl_slot = int(i);
+            }
+        }
+
+        if (powder_slot >= 0 && pearl_slot >= 0) {
+            // Consume ingredients
+            inv.counts[powder_slot]--;
+            if (inv.counts[powder_slot] == 0u) inv.item_ids[powder_slot] = 0u;
+
+            inv.counts[pearl_slot]--;
+            if (inv.counts[pearl_slot] == 0u) inv.item_ids[pearl_slot] = 0u;
+
+            // Add eye of ender
+            bool added = false;
+            for (uint j = 0u; j < 46u && !added; j++) {
+                if (inv.item_ids[j] == ITEM_EYE_OF_ENDER && inv.counts[j] < 64u) {
+                    inv.counts[j]++;
+                    added = true;
+                } else if (inv.item_ids[j] == 0u) {
+                    inv.item_ids[j] = ITEM_EYE_OF_ENDER;
+                    inv.counts[j] = 1u;
+                    added = true;
+                }
+            }
+            success = added;
+        }
+    }
+
+    inventories[env_id] = inv;
+    craft_results[env_id] = success ? 1u : 0u;
+}
+
+// ============================================================================
+// STAGE 1: THROWING
+// Player uses eye of ender, spawns flying eye entity
+// ============================================================================
+
+void stage_throwing(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    Inventory inv = inventories[env_id];
+
+    // Check for use item action with eye of ender selected
+    if (inp.action != 4u) return;  // 4 = use item
+
+    uint slot = inv.selected_slot;
+    if (slot >= 46u) return;
+    if (inv.item_ids[slot] != ITEM_EYE_OF_ENDER) return;
+    if (inv.counts[slot] < 1u) return;
+
+    // Consume one eye from inventory
+    inv.counts[slot]--;
+    if (inv.counts[slot] == 0u) inv.item_ids[slot] = 0u;
+    inventories[env_id] = inv;
+
+    // Find available eye slot for this environment
+    uint eye_base = env_id * 16u;  // Max 16 eyes per env
+    int eye_slot = -1;
+
+    for (uint i = 0u; i < 16u; i++) {
+        if (eyes[eye_base + i].state == EYE_STATE_INACTIVE) {
+            eye_slot = int(i);
+            break;
+        }
+    }
+
+    if (eye_slot < 0) return;  // No available slots
+
+    uint eye_idx = eye_base + uint(eye_slot);
+    uint seed = hash(pc.random_seed ^ env_id ^ pc.tick ^ uint(eye_slot));
+
+    // Calculate spawn position (at player's eye level)
+    vec3 spawn_pos = p.position + vec3(0.0, 1.62, 0.0);
+
+    // Get look direction for initial velocity offset
+    float yaw_rad = radians(p.yaw);
+    float pitch_rad = radians(p.pitch);
+    vec3 look_dir = vec3(
+        -sin(yaw_rad) * cos(pitch_rad),
+        -sin(pitch_rad),
+        cos(yaw_rad) * cos(pitch_rad)
+    );
+
+    // Offset spawn slightly in look direction
+    spawn_pos += look_dir * 0.5;
+
+    // Find nearest stronghold
+    float target_dist, target_x, target_z;
+    find_nearest_stronghold(env_id, spawn_pos, target_dist, target_x, target_z);
+
+    // Get direction to stronghold
+    vec2 stronghold_dir = get_direction_to_target(spawn_pos, target_x, target_z);
+
+    // Check if player is directly above stronghold
+    float xz_dist = length(vec2(target_x - spawn_pos.x, target_z - spawn_pos.z));
+    bool above_stronghold = (xz_dist < EYE_ABOVE_STRONGHOLD_THRESHOLD);
+
+    // Initialize eye
+    EyeOfEnder eye;
+    eye.position = spawn_pos;
+    eye.spawn_y = spawn_pos.y;
+    eye.target_x = target_x;
+    eye.target_z = target_z;
+    eye.target_dist = target_dist;
+    eye.state = EYE_STATE_RISING;
+    eye.ticks_alive = 0u;
+    eye.owner_env = env_id;
+    eye.start_x = spawn_pos.x;
+    eye.start_z = spawn_pos.z;
+
+    // Determine if will shatter (20% chance)
+    eye.will_shatter = (rand(seed) < EYE_SHATTER_CHANCE) ? 1u : 0u;
+
+    // Set initial velocity
+    if (above_stronghold) {
+        // Eye goes straight down when above stronghold
+        eye.velocity = vec3(0.0, EYE_INITIAL_UPWARD_VEL * 0.5, 0.0);
+        eye.travel_direction_x = 0.0;
+        eye.travel_direction_z = 0.0;
+    } else {
+        // Eye rises then moves toward stronghold
+        eye.velocity = vec3(
+            stronghold_dir.x * EYE_HORIZONTAL_SPEED * 0.5,
+            EYE_INITIAL_UPWARD_VEL,
+            stronghold_dir.y * EYE_HORIZONTAL_SPEED * 0.5
+        );
+        eye.travel_direction_x = stronghold_dir.x;
+        eye.travel_direction_z = stronghold_dir.y;
+    }
+
+    eyes[eye_idx] = eye;
+
+    // Write throw event
+    write_eye_event(eye_idx, EVENT_EYE_THROWN, spawn_pos, pc.tick, stronghold_dir);
+}
+
+// ============================================================================
+// STAGE 2: PHYSICS TICK
+// Update all active eye positions and velocities
+// ============================================================================
+
+void stage_physics(uint eye_idx) {
+    if (eye_idx >= pc.num_eyes) return;
+
+    EyeOfEnder eye = eyes[eye_idx];
+
+    // Skip inactive eyes
+    if (eye.state == EYE_STATE_INACTIVE ||
+        eye.state == EYE_STATE_LANDED ||
+        eye.state == EYE_STATE_SHATTERED) {
+        return;
+    }
+
+    eye.ticks_alive++;
+
+    // Get direction to stronghold for steering
+    vec2 target_dir = get_direction_to_target(eye.position, eye.target_x, eye.target_z);
+    float dist_to_target = length(vec2(eye.target_x - eye.position.x, eye.target_z - eye.position.z));
+    bool above_stronghold = (dist_to_target < EYE_ABOVE_STRONGHOLD_THRESHOLD);
+
+    switch (eye.state) {
+        case EYE_STATE_RISING: {
+            // Rising phase: upward velocity, start horizontal movement
+            eye.velocity.y *= EYE_UPWARD_DECAY;
+
+            // Add horizontal movement toward stronghold
+            if (!above_stronghold) {
+                eye.velocity.x = target_dir.x * EYE_HORIZONTAL_SPEED;
+                eye.velocity.z = target_dir.y * EYE_HORIZONTAL_SPEED;
+            } else {
+                // Above stronghold - minimal horizontal
+                eye.velocity.x *= 0.9;
+                eye.velocity.z *= 0.9;
+            }
+
+            // Transition to flying after rise phase
+            if (eye.ticks_alive >= EYE_RISE_TICKS) {
+                eye.state = EYE_STATE_FLYING;
+            }
+            break;
+        }
+
+        case EYE_STATE_FLYING: {
+            // Level flight toward stronghold
+            // Gradually reduce upward velocity
+            eye.velocity.y *= 0.85;
+
+            // Continue toward target
+            if (!above_stronghold) {
+                // Steer toward stronghold
+                float current_speed = length(vec2(eye.velocity.x, eye.velocity.z));
+                float target_speed = EYE_HORIZONTAL_SPEED;
+
+                // Blend current direction toward target
+                eye.velocity.x = eye.velocity.x * 0.9 + target_dir.x * target_speed * 0.1;
+                eye.velocity.z = eye.velocity.z * 0.9 + target_dir.y * target_speed * 0.1;
+
+                // Maintain speed
+                float new_speed = length(vec2(eye.velocity.x, eye.velocity.z));
+                if (new_speed > 0.01) {
+                    float scale = target_speed / new_speed;
+                    eye.velocity.x *= scale;
+                    eye.velocity.z *= scale;
+                }
+            } else {
+                // Above stronghold - stop horizontal and drop
+                eye.velocity.x *= 0.5;
+                eye.velocity.z *= 0.5;
+            }
+
+            // Apply drag
+            eye.velocity.x *= EYE_DRAG;
+            eye.velocity.z *= EYE_DRAG;
+
+            // Transition to falling
+            if (eye.ticks_alive >= EYE_TOTAL_FLIGHT_TICKS || above_stronghold) {
+                eye.state = EYE_STATE_FALLING;
+                write_eye_event(eye_idx, EVENT_EYE_DROPPED, eye.position, pc.tick,
+                               vec2(eye.travel_direction_x, eye.travel_direction_z));
+            }
+            break;
+        }
+
+        case EYE_STATE_FALLING: {
+            // Falling phase: gravity pulls eye down
+            eye.velocity.y -= EYE_GRAVITY;
+            eye.velocity.x *= EYE_DRAG;
+            eye.velocity.z *= EYE_DRAG;
+
+            // Check for landing (simple ground check at y=64)
+            // In full sim, would need proper block collision
+            if (eye.position.y < 64.0 && eye.velocity.y < 0.0) {
+                if (eye.will_shatter == 1u) {
+                    eye.state = EYE_STATE_SHATTERED;
+                    write_eye_event(eye_idx, EVENT_EYE_SHATTERED, eye.position, pc.tick,
+                                   vec2(eye.travel_direction_x, eye.travel_direction_z));
+                } else {
+                    eye.state = EYE_STATE_LANDED;
+                    write_eye_event(eye_idx, EVENT_EYE_LANDED, eye.position, pc.tick,
+                                   vec2(eye.travel_direction_x, eye.travel_direction_z));
+                }
+            }
+            break;
+        }
+    }
+
+    // Update position
+    eye.position += eye.velocity;
+
+    // Despawn after max lifetime
+    if (eye.ticks_alive >= EYE_MAX_LIFETIME) {
+        eye.state = EYE_STATE_INACTIVE;
+    }
+
+    eyes[eye_idx] = eye;
+}
+
+// ============================================================================
+// STAGE 3: LANDING/PICKUP
+// Handle eye landing and player pickup
+// ============================================================================
+
+void stage_landing(uint eye_idx) {
+    if (eye_idx >= pc.num_eyes) return;
+
+    EyeOfEnder eye = eyes[eye_idx];
+
+    // Only process landed eyes
+    if (eye.state != EYE_STATE_LANDED) return;
+
+    uint env_id = eye.owner_env;
+    Player p = players[env_id];
+
+    // Check if player is close enough to pick up (4 blocks)
+    vec3 to_eye = eye.position - p.position;
+    float dist = length(to_eye);
+
+    if (dist < 4.0) {
+        // Add eye back to inventory
+        Inventory inv = inventories[env_id];
+        bool added = false;
+
+        for (uint j = 0u; j < 46u && !added; j++) {
+            if (inv.item_ids[j] == ITEM_EYE_OF_ENDER && inv.counts[j] < 64u) {
+                inv.counts[j]++;
+                added = true;
+            } else if (inv.item_ids[j] == 0u) {
+                inv.item_ids[j] = ITEM_EYE_OF_ENDER;
+                inv.counts[j] = 1u;
+                added = true;
+            }
+        }
+
+        if (added) {
+            inventories[env_id] = inv;
+            write_eye_event(eye_idx, EVENT_EYE_PICKUP, eye.position, pc.tick,
+                           vec2(eye.travel_direction_x, eye.travel_direction_z));
+        }
+
+        // Mark eye as inactive (picked up or shattered becomes inactive)
+        eye.state = EYE_STATE_INACTIVE;
+        eyes[eye_idx] = eye;
+    }
+
+    // Shattered eyes become inactive after a short time
+    // (Could add particle effect delay here)
+}
+
+// ============================================================================
+// STAGE 4: OBSERVATION EXTRACTION
+// Extract stronghold direction/distance for RL observation
+// ============================================================================
+
+void stage_observations(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    Player p = players[env_id];
+    Inventory inv = inventories[env_id];
+    EyeObservation obs;
+
+    // Find active flying eye for this environment
+    uint eye_base = env_id * 16u;
+    int active_eye = -1;
+    EyeOfEnder active_eye_data;
+
+    for (uint i = 0u; i < 16u; i++) {
+        EyeOfEnder eye = eyes[eye_base + i];
+        if (eye.state == EYE_STATE_RISING ||
+            eye.state == EYE_STATE_FLYING ||
+            eye.state == EYE_STATE_FALLING) {
+            active_eye = int(i);
+            active_eye_data = eye;
+            break;
+        }
+    }
+
+    if (active_eye >= 0) {
+        // Eye is in flight
+        obs.eye_active = 1.0;
+
+        // Calculate actual direction eye has traveled so far
+        vec3 travel = active_eye_data.position - vec3(active_eye_data.start_x, active_eye_data.spawn_y, active_eye_data.start_z);
+        float travel_len = length(travel);
+
+        if (travel_len > 0.1) {
+            obs.eye_direction_x = travel.x / travel_len;
+            obs.eye_direction_y = travel.y / travel_len;
+            obs.eye_direction_z = travel.z / travel_len;
+        } else {
+            obs.eye_direction_x = active_eye_data.travel_direction_x;
+            obs.eye_direction_y = 0.0;
+            obs.eye_direction_z = active_eye_data.travel_direction_z;
+        }
+
+        // Stronghold direction from eye's target
+        vec2 sh_dir = get_direction_to_target(p.position, active_eye_data.target_x, active_eye_data.target_z);
+        obs.stronghold_direction_x = sh_dir.x;
+        obs.stronghold_direction_z = sh_dir.y;
+        obs.stronghold_distance = active_eye_data.target_dist / 1000.0;  // Normalize
+
+        // Check if above stronghold
+        float xz_dist = length(vec2(active_eye_data.target_x - p.position.x,
+                                    active_eye_data.target_z - p.position.z));
+        obs.stronghold_above = (xz_dist < EYE_ABOVE_STRONGHOLD_THRESHOLD) ? 1.0 : 0.0;
+
+        // Last throw data
+        obs.last_throw_pos_x = active_eye_data.start_x / 1000.0;
+        obs.last_throw_pos_z = active_eye_data.start_z / 1000.0;
+        obs.last_eye_end_x = active_eye_data.position.x / 1000.0;
+        obs.last_eye_end_z = active_eye_data.position.z / 1000.0;
+    } else {
+        // No active eye - check for most recent landed/shattered eye data
+        obs.eye_active = 0.0;
+        obs.eye_direction_x = 0.0;
+        obs.eye_direction_y = 0.0;
+        obs.eye_direction_z = 0.0;
+
+        // Use nearest stronghold for direction even without eye
+        float dist, tx, tz;
+        find_nearest_stronghold(env_id, p.position, dist, tx, tz);
+        vec2 sh_dir = get_direction_to_target(p.position, tx, tz);
+
+        // These would be hidden from player (cheating) - set to 0
+        // In real gameplay, player needs to triangulate from multiple throws
+        obs.stronghold_direction_x = 0.0;
+        obs.stronghold_direction_z = 0.0;
+        obs.stronghold_distance = 0.0;
+        obs.stronghold_above = 0.0;
+
+        // Check most recently used eye for saved direction
+        for (uint i = 0u; i < 16u; i++) {
+            EyeOfEnder eye = eyes[eye_base + i];
+            if (eye.state == EYE_STATE_LANDED || eye.state == EYE_STATE_SHATTERED) {
+                obs.eye_direction_x = eye.travel_direction_x;
+                obs.eye_direction_z = eye.travel_direction_z;
+                obs.last_throw_pos_x = eye.start_x / 1000.0;
+                obs.last_throw_pos_z = eye.start_z / 1000.0;
+                obs.last_eye_end_x = eye.position.x / 1000.0;
+                obs.last_eye_end_z = eye.position.z / 1000.0;
+
+                // Player can estimate direction from eye flight
+                obs.stronghold_direction_x = eye.travel_direction_x;
+                obs.stronghold_direction_z = eye.travel_direction_z;
+                break;
+            }
+        }
+    }
+
+    // Count eyes in inventory
+    uint eye_count = 0u;
+    for (uint i = 0u; i < 46u; i++) {
+        if (inv.item_ids[i] == ITEM_EYE_OF_ENDER) {
+            eye_count += inv.counts[i];
+        }
+    }
+    obs.eyes_in_inventory = float(eye_count) / 16.0;  // Normalize (16 max for portal)
+
+    // Can throw if have eyes and no active eye in flight
+    obs.can_throw = (eye_count > 0u && active_eye < 0) ? 1.0 : 0.0;
+
+    obs.reserved0 = 0.0;
+    obs.reserved1 = 0.0;
+
+    eye_observations[env_id] = obs;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0u: stage_crafting(id); break;
+        case 1u: stage_throwing(id); break;
+        case 2u: stage_physics(id); break;
+        case 3u: stage_landing(id); break;
+        case 4u: stage_observations(id); break;
+    }
+}

@@ -1,0 +1,379 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Dragon Breath Attack - Lingering Damage Cloud
+// MC 1.8.9+ Ender Dragon breath attack mechanics
+//
+// When perched on the fountain, the dragon can perform a breath attack:
+// 1. Dragon faces nearest player
+// 2. Shoots purple dragon breath particles in a cone
+// 3. Creates a lingering area effect cloud on ground impact
+// 4. Cloud deals 3 damage per second (1.5 hearts)
+// 5. Cloud lasts 15 seconds (300 ticks)
+//
+// Players can collect Dragon's Breath by right-clicking the cloud with a glass bottle.
+
+#include "damage.glsl"
+
+layout(local_size_x = 64) in;
+
+// Dragon state buffer (read-only for breath attack)
+layout(std430, binding = 0) readonly buffer DragonState {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    uint phase;
+    mat4 body_transform;
+    uint target_player;
+    float perch_timer;
+    float strafe_timer;
+    vec3 target_position;
+    uint crystals_alive;
+} dragon;
+
+// Player state buffer
+layout(std430, binding = 1) buffer PlayerState {
+    vec4 positions[256];    // xyz = position, w = health
+    uint equipment[256];    // Packed equipment data for damage calculation
+    uint count;
+    uint pad[2];
+} players;
+
+// Area Effect Cloud buffer - lingering damage areas
+layout(std430, binding = 2) buffer AreaEffectClouds {
+    vec4 clouds[32];        // xyz = position, w = remaining_lifetime (ticks)
+    float radii[32];        // Current radius of each cloud
+    float damage_timers[32]; // Time since last damage tick
+    uint active_mask;       // Bitmask of active clouds
+    uint cloud_count;
+    uint pad[2];
+} area_clouds;
+
+// Particle buffer for breath visual effect
+layout(std430, binding = 3) buffer ParticleBuffer {
+    vec4 positions[512];    // xyz = position, w = lifetime
+    vec4 velocities[512];   // xyz = velocity, w = type (0 = none, 1 = dragon_breath)
+    uint particle_count;
+    uint max_particles;
+    uint pad[2];
+} particles;
+
+// Combat output for damage events
+layout(std430, binding = 4) buffer CombatOutput {
+    vec4 player_damage[256];    // xyz = knockback, w = damage
+    uint damage_flags[256];     // Damage source flags
+    uint pad[2];
+} combat_out;
+
+// Breath attack state
+layout(std430, binding = 5) buffer BreathState {
+    uint is_breathing;          // 1 if currently performing breath attack
+    float breath_timer;         // Current breath duration
+    vec3 breath_direction;      // Direction dragon is breathing
+    vec3 breath_target;         // Where the breath is aimed
+    uint bottle_collection[32]; // Bitmask of clouds being collected from
+} breath;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    float delta_time;
+    float total_time;
+    uint tick;
+    uint random_seed;
+} pc;
+
+// Constants matching MC behavior
+const float BREATH_CONE_ANGLE = 0.3;        // ~17 degree half-angle cone
+const float BREATH_RANGE = 12.0;            // Max breath range
+const float BREATH_DURATION = 3.0;          // Seconds of breathing
+const float PARTICLE_SPEED = 0.8;           // Particle velocity
+const uint PARTICLES_PER_TICK = 8;          // Particles spawned per tick
+const float CLOUD_INITIAL_RADIUS = 3.0;     // Starting cloud radius
+const float CLOUD_MAX_RADIUS = 4.0;         // Maximum cloud expansion
+const float CLOUD_SHRINK_RATE = 0.005;      // Radius shrink per tick
+const float CLOUD_LIFETIME = 300.0;         // 15 seconds in ticks
+const float CLOUD_DAMAGE_PER_SECOND = 3.0;  // 1.5 hearts per second
+const float CLOUD_DAMAGE_INTERVAL = 0.5;    // Damage every 10 ticks (0.5 sec)
+const float DRAGON_HEAD_OFFSET_Z = 8.0;     // Head position relative to body center
+
+// PCG random number generator
+uint pcg_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+// Generate random direction within cone
+vec3 random_in_cone(vec3 direction, float half_angle, inout uint seed) {
+    // Generate random point on unit sphere cap
+    float cos_angle = 1.0 - random_float(seed) * (1.0 - cos(half_angle));
+    float sin_angle = sqrt(1.0 - cos_angle * cos_angle);
+    float phi = random_float(seed) * 6.28318530718;
+
+    // Local coordinates (z = direction)
+    vec3 local = vec3(sin_angle * cos(phi), sin_angle * sin(phi), cos_angle);
+
+    // Build rotation matrix to align z with direction
+    vec3 up = abs(direction.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 right = normalize(cross(up, direction));
+    up = cross(direction, right);
+
+    return right * local.x + up * local.y + direction * local.z;
+}
+
+// Get dragon head position in world space
+vec3 get_head_position() {
+    vec4 head_local = vec4(0.0, 0.0, DRAGON_HEAD_OFFSET_Z, 1.0);
+    vec4 head_world = dragon.body_transform * head_local;
+    return head_world.xyz;
+}
+
+// Find first available cloud slot
+int find_free_cloud_slot() {
+    for (int i = 0; i < 32; i++) {
+        if ((area_clouds.active_mask & (1u << i)) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Spawn a new lingering damage cloud
+void spawn_area_cloud(vec3 position) {
+    int slot = find_free_cloud_slot();
+    if (slot < 0) return;
+
+    area_clouds.clouds[slot] = vec4(position, CLOUD_LIFETIME);
+    area_clouds.radii[slot] = CLOUD_INITIAL_RADIUS;
+    area_clouds.damage_timers[slot] = 0.0;
+    atomicOr(area_clouds.active_mask, 1u << slot);
+    atomicAdd(area_clouds.cloud_count, 1);
+}
+
+// Spawn breath particle
+void spawn_breath_particle(vec3 pos, vec3 vel, inout uint seed) {
+    uint idx = atomicAdd(particles.particle_count, 1);
+    if (idx >= particles.max_particles) {
+        atomicAdd(particles.particle_count, uint(-1));
+        return;
+    }
+
+    particles.positions[idx] = vec4(pos, 20.0 + random_float(seed) * 10.0);
+    particles.velocities[idx] = vec4(vel, 1.0); // type 1 = dragon_breath
+}
+
+shared uint local_seed;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Initialize shared random seed
+    if (gl_LocalInvocationID.x == 0) {
+        local_seed = pc.random_seed + pc.tick;
+    }
+    barrier();
+
+    // Thread 0: Handle breath attack initiation and particle spawning
+    if (idx == 0) {
+        // Only breathe while perched (phase 3) and has target
+        if (dragon.phase == 3 && players.count > 0 && dragon.health > 0.0) {
+            // Start breath attack if not already breathing
+            if (breath.is_breathing == 0 && dragon.perch_timer > 0.5) {
+                // Check if player is in range
+                uint target = dragon.target_player;
+                if (target < players.count) {
+                    vec3 target_pos = players.positions[target].xyz;
+                    vec3 head_pos = get_head_position();
+                    float dist = distance(head_pos, target_pos);
+
+                    if (dist < BREATH_RANGE * 1.5) {
+                        breath.is_breathing = 1;
+                        breath.breath_timer = 0.0;
+                        breath.breath_target = target_pos;
+                        breath.breath_direction = normalize(target_pos - head_pos);
+                    }
+                }
+            }
+
+            // Continue breath attack
+            if (breath.is_breathing == 1) {
+                breath.breath_timer += pc.delta_time;
+
+                if (breath.breath_timer >= BREATH_DURATION) {
+                    // End breath attack, spawn cloud at target
+                    breath.is_breathing = 0;
+
+                    // Raycast to find ground position
+                    vec3 cloud_pos = breath.breath_target;
+                    cloud_pos.y = max(0.0, cloud_pos.y); // Clamp to ground
+
+                    spawn_area_cloud(cloud_pos);
+                } else {
+                    // Spawn breath particles
+                    vec3 head_pos = get_head_position();
+                    uint seed = local_seed;
+
+                    for (uint i = 0; i < PARTICLES_PER_TICK; i++) {
+                        vec3 particle_dir = random_in_cone(breath.breath_direction,
+                                                           BREATH_CONE_ANGLE, seed);
+                        vec3 particle_vel = particle_dir * PARTICLE_SPEED;
+
+                        // Add slight downward curve
+                        particle_vel.y -= 0.02;
+
+                        spawn_breath_particle(head_pos, particle_vel, seed);
+                    }
+
+                    local_seed = seed;
+                }
+            }
+        } else {
+            // Cancel breath if not perched
+            breath.is_breathing = 0;
+        }
+    }
+
+    barrier();
+
+    // All threads: Process area effect clouds for damage
+    if (idx < 32) {
+        uint cloud_idx = idx;
+        uint mask = 1u << cloud_idx;
+
+        if ((area_clouds.active_mask & mask) == 0) return;
+
+        vec4 cloud = area_clouds.clouds[cloud_idx];
+        float radius = area_clouds.radii[cloud_idx];
+        float damage_timer = area_clouds.damage_timers[cloud_idx];
+
+        // Check lifetime
+        cloud.w -= pc.delta_time * 20.0; // Convert to ticks
+        if (cloud.w <= 0.0) {
+            // Cloud expired
+            atomicAnd(area_clouds.active_mask, ~mask);
+            atomicAdd(area_clouds.cloud_count, uint(-1));
+            return;
+        }
+
+        // Shrink radius over time
+        radius = max(0.5, radius - CLOUD_SHRINK_RATE * pc.delta_time * 20.0);
+
+        // Check for bottle collection (reduces lifetime faster)
+        if ((breath.bottle_collection[cloud_idx] & 0xFF) > 0) {
+            // Someone is collecting - reduce lifetime faster
+            cloud.w -= 20.0; // Extra 1 second reduction per collection
+            breath.bottle_collection[cloud_idx] = 0;
+        }
+
+        // Damage timer
+        damage_timer += pc.delta_time;
+
+        // Apply damage to players in cloud
+        if (damage_timer >= CLOUD_DAMAGE_INTERVAL) {
+            damage_timer = 0.0;
+
+            vec3 cloud_pos = cloud.xyz;
+
+            for (uint p = 0; p < players.count && p < 256; p++) {
+                vec3 player_pos = players.positions[p].xyz;
+                float player_health = players.positions[p].w;
+
+                if (player_health <= 0.0) continue;
+
+                // Check if player is in cloud (horizontal distance only for lingering)
+                vec2 horizontal_diff = player_pos.xz - cloud_pos.xz;
+                float horiz_dist = length(horizontal_diff);
+
+                // Also check vertical - cloud is about 1 block tall
+                float vert_diff = abs(player_pos.y - cloud_pos.y);
+
+                if (horiz_dist < radius && vert_diff < 1.5) {
+                    // Player in cloud - apply damage
+                    float raw_damage = CLOUD_DAMAGE_PER_SECOND * CLOUD_DAMAGE_INTERVAL;
+
+                    // Calculate final damage with armor/protection
+                    float final_damage = compute_damage_packed(raw_damage, players.equipment[p]);
+
+                    // Apply damage
+                    combat_out.player_damage[p].w += final_damage;
+
+                    // Set damage flag for dragon breath (for death message)
+                    combat_out.damage_flags[p] |= 0x10; // DRAGON_BREATH flag
+                }
+            }
+        }
+
+        // Write back cloud state
+        area_clouds.clouds[cloud_idx] = cloud;
+        area_clouds.radii[cloud_idx] = radius;
+        area_clouds.damage_timers[cloud_idx] = damage_timer;
+    }
+
+    barrier();
+
+    // Update particles (threads 32-63 handle particle movement)
+    if (idx >= 32 && idx < 64) {
+        uint particle_batch = idx - 32;
+        uint particles_per_thread = (particles.particle_count + 31) / 32;
+        uint start_particle = particle_batch * particles_per_thread;
+        uint end_particle = min(start_particle + particles_per_thread, particles.particle_count);
+
+        for (uint p = start_particle; p < end_particle; p++) {
+            vec4 pos = particles.positions[p];
+            vec4 vel = particles.velocities[p];
+
+            if (pos.w <= 0.0 || vel.w != 1.0) continue; // Skip dead or non-breath particles
+
+            // Update position
+            pos.xyz += vel.xyz * pc.delta_time * 20.0;
+
+            // Apply gravity to velocity
+            vel.y -= 0.04 * pc.delta_time * 20.0;
+
+            // Decrease lifetime
+            pos.w -= 1.0;
+
+            // Check ground collision - spawn mini cloud on impact
+            if (pos.y <= 0.0 && pos.w > 0.0) {
+                pos.y = 0.0;
+                pos.w = 0.0; // Kill particle
+
+                // Small chance to spawn additional small cloud
+                uint seed = pc.random_seed + p;
+                if (random_float(seed) < 0.05) {
+                    // This would need atomic coordination for actual cloud spawning
+                    // In practice, main cloud is spawned at end of breath
+                }
+            }
+
+            particles.positions[p] = pos;
+            particles.velocities[p] = vel;
+        }
+    }
+}
+
+// Bottle collection handler - called from inventory system
+// Returns true if collection successful
+// Usage: When player right-clicks cloud with glass bottle
+//
+// void try_collect_dragon_breath(uint player_idx, vec3 player_pos) {
+//     for (uint i = 0; i < 32; i++) {
+//         if ((area_clouds.active_mask & (1u << i)) == 0) continue;
+//
+//         vec3 cloud_pos = area_clouds.clouds[i].xyz;
+//         float radius = area_clouds.radii[i];
+//
+//         if (distance(player_pos.xz, cloud_pos.xz) < radius &&
+//             abs(player_pos.y - cloud_pos.y) < 1.5) {
+//             // Mark for collection
+//             breath.bottle_collection[i] |= (1u << (player_idx & 7));
+//             // Add Dragon's Breath item to player inventory
+//             // (handled by inventory system)
+//         }
+//     }
+// }

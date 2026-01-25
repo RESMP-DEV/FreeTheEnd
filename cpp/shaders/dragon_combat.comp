@@ -1,0 +1,257 @@
+#version 450
+
+// Dragon Combat - Player damage, crystal healing, hitbox detection
+// MC 1.8.9 Ender Dragon combat mechanics
+
+layout(local_size_x = 64) in;
+
+// Dragon state buffer
+layout(std430, binding = 0) buffer DragonState {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    uint phase;
+    mat4 body_transform;
+    uint target_player;
+    float perch_timer;
+    float strafe_timer;
+    vec3 target_position;
+    uint crystals_alive;
+} dragon;
+
+// Crystal state buffer
+layout(std430, binding = 1) buffer CrystalState {
+    vec4 positions[10];
+    uint alive_mask;
+    uint cage_mask;
+    float beam_timers[10];
+} crystals;
+
+// Player state buffer
+layout(std430, binding = 2) buffer PlayerState {
+    vec4 positions[256];    // xyz = position, w = health
+    uint count;
+    uint pad[3];
+} players;
+
+// Player attack buffer - attacks pending this tick
+layout(std430, binding = 3) buffer AttackBuffer {
+    vec4 attacks[256];      // xyz = position, w = damage (positive = crystal, negative = dragon)
+    uint attack_count;
+    uint pad[3];
+} attacks;
+
+// Combat output - damage events to process
+layout(std430, binding = 4) buffer CombatOutput {
+    vec4 player_damage[256];    // xyz = knockback, w = damage amount
+    uint dragon_damage_total;
+    uint crystal_destroyed;     // Bitmask of crystals destroyed this tick
+    uint pad[2];
+} combat_out;
+
+layout(push_constant) uniform PushConstants {
+    float delta_time;
+    float total_time;
+    uint tick;
+} pc;
+
+// Dragon hitbox parts (body-local coordinates)
+const vec3 HEAD_CENTER = vec3(0.0, 0.0, 8.0);
+const float HEAD_RADIUS = 3.0;
+const vec3 BODY_CENTER = vec3(0.0, 0.0, 0.0);
+const float BODY_RADIUS = 5.0;
+const vec3 TAIL_SEGMENTS[4] = vec3[4](
+    vec3(0.0, 0.0, -4.0),
+    vec3(0.0, 0.0, -8.0),
+    vec3(0.0, 0.0, -12.0),
+    vec3(0.0, 0.0, -16.0)
+);
+const float TAIL_RADIUS = 2.0;
+
+// Damage constants
+const float HEAD_MULTIPLIER = 4.0;      // Head takes 4x damage
+const float BODY_MULTIPLIER = 1.0;
+const float TAIL_MULTIPLIER = 0.25;     // Tail takes reduced damage
+const float DRAGON_CONTACT_DAMAGE = 5.0;
+const float WING_KNOCKBACK = 10.0;
+const float CRYSTAL_HEAL_AMOUNT = 1.0;
+const float CRYSTAL_EXPLOSION_DAMAGE = 10.0;
+const float CRYSTAL_EXPLOSION_RADIUS = 6.0;
+
+// Transform point from body-local to world space
+vec3 body_to_world(vec3 local_pos) {
+    vec4 world = dragon.body_transform * vec4(local_pos, 1.0);
+    return world.xyz;
+}
+
+// Check if point hits dragon, returns multiplier (0 = miss)
+float check_dragon_hit(vec3 world_pos) {
+    // Head check (highest priority)
+    vec3 head_world = body_to_world(HEAD_CENTER);
+    if (distance(world_pos, head_world) < HEAD_RADIUS) {
+        return HEAD_MULTIPLIER;
+    }
+
+    // Body check
+    vec3 body_world = body_to_world(BODY_CENTER);
+    if (distance(world_pos, body_world) < BODY_RADIUS) {
+        return BODY_MULTIPLIER;
+    }
+
+    // Tail check
+    for (int i = 0; i < 4; i++) {
+        vec3 tail_world = body_to_world(TAIL_SEGMENTS[i]);
+        if (distance(world_pos, tail_world) < TAIL_RADIUS) {
+            return TAIL_MULTIPLIER;
+        }
+    }
+
+    return 0.0;
+}
+
+// Process crystal destruction and chain reactions
+void process_crystal_attack(vec3 attack_pos, float damage, uint crystal_idx) {
+    if (crystal_idx >= 10) return;
+
+    uint mask = 1u << crystal_idx;
+    if ((crystals.alive_mask & mask) == 0) return;
+
+    vec3 crystal_pos = crystals.positions[crystal_idx].xyz;
+    float dist = distance(attack_pos, crystal_pos);
+
+    if (dist < 2.0) {
+        // Crystal destroyed
+        atomicOr(combat_out.crystal_destroyed, mask);
+
+        // Explosion damages nearby players
+        for (uint i = 0; i < players.count && i < 256; i++) {
+            vec3 player_pos = players.positions[i].xyz;
+            float player_dist = distance(crystal_pos, player_pos);
+
+            if (player_dist < CRYSTAL_EXPLOSION_RADIUS) {
+                float falloff = 1.0 - (player_dist / CRYSTAL_EXPLOSION_RADIUS);
+                float explosion_dmg = CRYSTAL_EXPLOSION_DAMAGE * falloff;
+
+                // Knockback direction
+                vec3 knockback = normalize(player_pos - crystal_pos) * falloff * 5.0;
+                knockback.y += 2.0; // Upward component
+
+                combat_out.player_damage[i].xyz += knockback;
+                combat_out.player_damage[i].w += explosion_dmg;
+            }
+        }
+
+        // Damage dragon if linked
+        if (dragon.phase != 4) {
+            atomicAdd(combat_out.dragon_damage_total, uint(CRYSTAL_EXPLOSION_DAMAGE * 0.5));
+        }
+    }
+}
+
+shared uint shared_dragon_damage;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Initialize shared memory
+    if (gl_LocalInvocationID.x == 0) {
+        shared_dragon_damage = 0;
+    }
+    barrier();
+
+    // Process attacks
+    if (idx < attacks.attack_count) {
+        vec4 attack = attacks.attacks[idx];
+        vec3 attack_pos = attack.xyz;
+        float damage = attack.w;
+
+        if (damage > 0.0) {
+            // Crystal attack - find nearest crystal
+            float min_dist = 1e10;
+            uint nearest = 10;
+            for (uint i = 0; i < 10; i++) {
+                if ((crystals.alive_mask & (1u << i)) != 0) {
+                    float d = distance(attack_pos, crystals.positions[i].xyz);
+                    if (d < min_dist) {
+                        min_dist = d;
+                        nearest = i;
+                    }
+                }
+            }
+            if (nearest < 10 && min_dist < 2.0) {
+                process_crystal_attack(attack_pos, damage, nearest);
+            }
+        } else {
+            // Dragon attack
+            float multiplier = check_dragon_hit(attack_pos);
+            if (multiplier > 0.0) {
+                uint dmg = uint(abs(damage) * multiplier);
+                atomicAdd(shared_dragon_damage, dmg);
+            }
+        }
+    }
+
+    barrier();
+
+    // Aggregate dragon damage
+    if (gl_LocalInvocationID.x == 0 && shared_dragon_damage > 0) {
+        atomicAdd(combat_out.dragon_damage_total, shared_dragon_damage);
+    }
+
+    // Player collision detection (contact damage)
+    if (idx < players.count) {
+        vec3 player_pos = players.positions[idx].xyz;
+        float player_health = players.positions[idx].w;
+
+        if (player_health <= 0.0) return;
+
+        // Check collision with dragon body parts
+        vec3 body_world = body_to_world(BODY_CENTER);
+        float body_dist = distance(player_pos, body_world);
+
+        if (body_dist < BODY_RADIUS + 1.0) {
+            // Player hit by dragon body
+            combat_out.player_damage[idx].w += DRAGON_CONTACT_DAMAGE;
+
+            // Wing knockback
+            vec3 knockback = normalize(player_pos - body_world) * WING_KNOCKBACK;
+            knockback.y = abs(knockback.y) + 3.0; // Always knock up
+            combat_out.player_damage[idx].xyz += knockback;
+        }
+
+        // Head check for additional damage
+        vec3 head_world = body_to_world(HEAD_CENTER);
+        if (distance(player_pos, head_world) < HEAD_RADIUS + 0.5) {
+            combat_out.player_damage[idx].w += DRAGON_CONTACT_DAMAGE * 0.5;
+        }
+
+        // Tail sweep check
+        for (int i = 0; i < 4; i++) {
+            vec3 tail_world = body_to_world(TAIL_SEGMENTS[i]);
+            float tail_dist = distance(player_pos, tail_world);
+            if (tail_dist < TAIL_RADIUS + 0.5) {
+                // Tail sweep knockback
+                vec3 sweep_dir = normalize(player_pos - tail_world);
+                combat_out.player_damage[idx].xyz += sweep_dir * 8.0;
+                combat_out.player_damage[idx].w += 2.0;
+                break;
+            }
+        }
+    }
+
+    barrier();
+
+    // Apply crystal destruction mask
+    if (idx == 0) {
+        crystals.alive_mask &= ~combat_out.crystal_destroyed;
+    }
+
+    // Apply dragon damage (single thread)
+    if (idx == 0 && combat_out.dragon_damage_total > 0 && dragon.phase != 4) {
+        dragon.health -= float(combat_out.dragon_damage_total);
+        if (dragon.health <= 0.0) {
+            dragon.health = 0.0;
+            dragon.phase = 4; // dying
+        }
+    }
+}

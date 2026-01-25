@@ -1,0 +1,456 @@
+#version 450
+
+// MoltenVK-compatible game tick shader
+// All bindings in single descriptor set to avoid argument buffer issues
+// Batched for multiple environments
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants for stage selection and batch info
+layout(push_constant) uniform PushConstants {
+    uint stage;        // 0-5 for different simulation phases
+    uint num_envs;     // Number of parallel environments
+    uint tick;         // Current tick number
+    uint random_seed;  // Base random seed
+} pc;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const float GRAVITY = -0.08;
+const float DRAG = 0.98;
+const float GROUND_DRAG = 0.6;
+const float WALK_SPEED = 0.1;
+const float SPRINT_MULTIPLIER = 1.3;
+const float JUMP_VELOCITY = 0.42;
+const float PLAYER_HEIGHT = 1.8;
+const float PLAYER_WIDTH = 0.6;
+
+const uint FLAG_ON_GROUND = 1u;
+const uint FLAG_SPRINTING = 2u;
+const uint FLAG_SNEAKING = 4u;
+const uint FLAG_FLYING = 8u;
+const uint FLAG_IN_WATER = 16u;
+const uint FLAG_IN_LAVA = 32u;
+
+const uint DIM_OVERWORLD = 0u;
+const uint DIM_NETHER = 1u;
+const uint DIM_END = 2u;
+
+// ============================================================================
+// STRUCTURES (matching C++ side)
+// ============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint dimension;
+    uint gamemode;
+    uint activeSlot;
+    uint flags;
+    ivec3 targetBlock;
+    uint targetBlockFace;
+    vec4 statusEffects[8];
+};
+
+struct InputState {
+    vec3 movement;
+    float lookDeltaX;
+    float lookDeltaY;
+    uint action;
+    uint actionData;
+    uint flags;
+};
+
+struct GameState {
+    uint tickNumber;
+    uint gameFlags;
+    uint randomSeed;
+    float deltaTime;
+    uint dimension;
+    uint reserved[3];
+};
+
+struct Mob {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float maxHealth;
+    uint mobType;
+    uint state;
+    uint targetEntity;
+    uint flags;
+    vec3 homePosition;
+    float aggroRange;
+    uint aiData[4];
+};
+
+struct Observation {
+    // Player state (16 floats)
+    float pos_x, pos_y, pos_z;
+    float vel_x, vel_y, vel_z;
+    float yaw, pitch;
+    float health, hunger, saturation;
+    float on_ground, sprinting, sneaking, flying;
+    float dimension;
+    // Combat state (8 floats)
+    float nearest_mob_dist;
+    float nearest_mob_dir_x, nearest_mob_dir_z;
+    float nearest_mob_health;
+    float dragon_health;
+    float dragon_phase;
+    float crystals_remaining;
+    float in_combat;
+    // Goal state (8 floats)
+    float has_won;
+    float in_end;
+    float portal_dist;
+    float portal_dir_x, portal_dir_z;
+    float reserved0, reserved1, reserved2;
+};
+
+// ============================================================================
+// BUFFER BINDINGS - All in set 0 for MoltenVK compatibility
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) buffer InputBuffer {
+    InputState inputs[];
+};
+
+layout(set = 0, binding = 2) buffer MobBuffer {
+    uint mob_counts[];  // Per-env mob count
+    Mob mobs[];         // Flattened: env * MAX_MOBS_PER_ENV + mob_idx
+};
+
+layout(set = 0, binding = 3) buffer ChunkBuffer {
+    uint chunk_data[];  // Simplified chunk storage
+};
+
+layout(set = 0, binding = 4) buffer GameStateBuffer {
+    GameState game_states[];
+};
+
+layout(set = 0, binding = 5) buffer ObservationBuffer {
+    Observation observations[];
+};
+
+layout(set = 0, binding = 6) buffer RewardBuffer {
+    float rewards[];
+};
+
+layout(set = 0, binding = 7) buffer DoneBuffer {
+    uint dones[];
+};
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+float rand_range(inout uint seed, float min_val, float max_val) {
+    return min_val + rand(seed) * (max_val - min_val);
+}
+
+bool check_collision_ground(vec3 pos) {
+    // Simplified: ground at y=64 in overworld, y=32 in nether, y=48 in end
+    return pos.y <= 64.0;
+}
+
+// ============================================================================
+// STAGE 0: Setup / Per-tick initialization
+// ============================================================================
+
+void stage_setup(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    // Increment tick counter
+    game_states[env_id].tickNumber = pc.tick;
+    game_states[env_id].randomSeed = hash(pc.random_seed ^ env_id ^ pc.tick);
+    
+    // Clear per-tick accumulators
+    rewards[env_id] = 0.0;
+}
+
+// ============================================================================
+// STAGE 1: Player physics
+// ============================================================================
+
+void stage_player_physics(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    uint seed = game_states[env_id].randomSeed;
+    
+    float dt = 0.05;  // 20 TPS
+    
+    // Look direction update
+    p.yaw += inp.lookDeltaX * 0.15;
+    p.pitch = clamp(p.pitch + inp.lookDeltaY * 0.15, -90.0, 90.0);
+    
+    // Normalize yaw to [0, 360)
+    p.yaw = mod(p.yaw, 360.0);
+    if (p.yaw < 0.0) p.yaw += 360.0;
+    
+    // Movement direction (relative to yaw)
+    float yaw_rad = radians(p.yaw);
+    float sin_yaw = sin(yaw_rad);
+    float cos_yaw = cos(yaw_rad);
+    
+    vec3 forward = vec3(-sin_yaw, 0.0, cos_yaw);
+    vec3 right = vec3(cos_yaw, 0.0, sin_yaw);
+    
+    // Input to world-space movement
+    vec3 move_input = inp.movement;
+    vec3 move_dir = forward * move_input.z + right * move_input.x;
+    
+    // Speed calculation
+    float speed = WALK_SPEED;
+    bool sprinting = (inp.flags & FLAG_SPRINTING) != 0u;
+    bool sneaking = (inp.flags & FLAG_SNEAKING) != 0u;
+    bool on_ground = (p.flags & FLAG_ON_GROUND) != 0u;
+    
+    if (sprinting && !sneaking) {
+        speed *= SPRINT_MULTIPLIER;
+        p.flags |= FLAG_SPRINTING;
+    } else {
+        p.flags &= ~FLAG_SPRINTING;
+    }
+    
+    if (sneaking) {
+        speed *= 0.3;
+        p.flags |= FLAG_SNEAKING;
+    } else {
+        p.flags &= ~FLAG_SNEAKING;
+    }
+    
+    // Apply movement acceleration
+    if (length(move_dir) > 0.001) {
+        move_dir = normalize(move_dir) * speed;
+        p.velocity.x += move_dir.x;
+        p.velocity.z += move_dir.z;
+    }
+    
+    // Jump
+    bool jump_pressed = (inp.flags & 1u) != 0u;
+    if (jump_pressed && on_ground) {
+        p.velocity.y = JUMP_VELOCITY;
+        p.flags &= ~FLAG_ON_GROUND;
+        
+        // Sprint-jumping exhaustion
+        if (sprinting) {
+            p.exhaustion += 0.2;
+        }
+    }
+    
+    // Gravity
+    if (!on_ground) {
+        p.velocity.y += GRAVITY;
+    }
+    
+    // Air/ground drag
+    if (on_ground) {
+        p.velocity.x *= GROUND_DRAG;
+        p.velocity.z *= GROUND_DRAG;
+    } else {
+        p.velocity.x *= DRAG;
+        p.velocity.z *= DRAG;
+    }
+    p.velocity.y *= DRAG;
+    
+    // Position update
+    p.position += p.velocity;
+    
+    // Ground collision
+    if (check_collision_ground(p.position)) {
+        p.position.y = 64.0;
+        p.velocity.y = 0.0;
+        p.flags |= FLAG_ON_GROUND;
+    }
+    
+    // Void death
+    if (p.position.y < -64.0) {
+        p.health = 0.0;
+        dones[env_id] = 1u;
+        rewards[env_id] -= 10.0;  // Death penalty
+    }
+    
+    // Sprint exhaustion
+    if (sprinting && length(vec2(p.velocity.x, p.velocity.z)) > 0.01) {
+        p.exhaustion += 0.1 * dt;
+    }
+    
+    players[env_id] = p;
+    game_states[env_id].randomSeed = seed;
+}
+
+// ============================================================================
+// STAGE 2: Mob AI (simplified)
+// ============================================================================
+
+void stage_mob_ai(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    // Simplified: no mobs for now, just update observations
+}
+
+// ============================================================================
+// STAGE 3: Combat resolution
+// ============================================================================
+
+void stage_combat(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    
+    // Attack action
+    if (inp.action == 1u) {  // Attack
+        // Simplified: deal damage to nearest mob within range
+        // For now just add small reward for attacking
+        rewards[env_id] += 0.01;
+    }
+    
+    // Use item action
+    if (inp.action == 2u) {
+        // Simplified: use item
+        rewards[env_id] += 0.005;
+    }
+    
+    players[env_id] = p;
+}
+
+// ============================================================================
+// STAGE 4: Block interactions
+// ============================================================================
+
+void stage_blocks(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    // Simplified: no block interactions yet
+}
+
+// ============================================================================
+// STAGE 5: World update and observation extraction
+// ============================================================================
+
+void stage_world_update(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    
+    // Hunger system
+    if (p.exhaustion >= 4.0) {
+        p.exhaustion -= 4.0;
+        if (p.saturation > 0.0) {
+            p.saturation = max(0.0, p.saturation - 1.0);
+        } else {
+            p.hunger = max(0.0, p.hunger - 1.0);
+        }
+    }
+    
+    // Health regeneration (if hunger >= 18)
+    if (p.hunger >= 18.0 && p.health < 20.0) {
+        p.health = min(20.0, p.health + 0.05);
+        p.exhaustion += 0.1;
+    }
+    
+    // Starvation damage
+    if (p.hunger <= 0.0) {
+        p.health -= 0.1;
+        if (p.health <= 0.0) {
+            dones[env_id] = 1u;
+            rewards[env_id] -= 10.0;
+        }
+    }
+    
+    // Build observation
+    Observation obs;
+    
+    // Player state
+    obs.pos_x = p.position.x;
+    obs.pos_y = p.position.y;
+    obs.pos_z = p.position.z;
+    obs.vel_x = p.velocity.x;
+    obs.vel_y = p.velocity.y;
+    obs.vel_z = p.velocity.z;
+    obs.yaw = p.yaw / 360.0;
+    obs.pitch = (p.pitch + 90.0) / 180.0;
+    obs.health = p.health / 20.0;
+    obs.hunger = p.hunger / 20.0;
+    obs.saturation = p.saturation / 20.0;
+    obs.on_ground = (p.flags & FLAG_ON_GROUND) != 0u ? 1.0 : 0.0;
+    obs.sprinting = (p.flags & FLAG_SPRINTING) != 0u ? 1.0 : 0.0;
+    obs.sneaking = (p.flags & FLAG_SNEAKING) != 0u ? 1.0 : 0.0;
+    obs.flying = (p.flags & FLAG_FLYING) != 0u ? 1.0 : 0.0;
+    obs.dimension = float(p.dimension);
+    
+    // Combat state (placeholder)
+    obs.nearest_mob_dist = 100.0;
+    obs.nearest_mob_dir_x = 0.0;
+    obs.nearest_mob_dir_z = 0.0;
+    obs.nearest_mob_health = 0.0;
+    obs.dragon_health = 200.0;
+    obs.dragon_phase = 0.0;
+    obs.crystals_remaining = 10.0;
+    obs.in_combat = 0.0;
+    
+    // Goal state
+    obs.has_won = 0.0;
+    obs.in_end = p.dimension == DIM_END ? 1.0 : 0.0;
+    obs.portal_dist = 1000.0;
+    obs.portal_dir_x = 0.0;
+    obs.portal_dir_z = 0.0;
+    obs.reserved0 = 0.0;
+    obs.reserved1 = 0.0;
+    obs.reserved2 = 0.0;
+    
+    observations[env_id] = obs;
+    players[env_id] = p;
+    
+    // Small time penalty to encourage efficiency
+    rewards[env_id] -= 0.001;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+    
+    switch (pc.stage) {
+        case 0u: stage_setup(env_id); break;
+        case 1u: stage_player_physics(env_id); break;
+        case 2u: stage_mob_ai(env_id); break;
+        case 3u: stage_combat(env_id); break;
+        case 4u: stage_blocks(env_id); break;
+        case 5u: stage_world_update(env_id); break;
+    }
+}

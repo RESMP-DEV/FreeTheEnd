@@ -1,0 +1,629 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const uint MOB_TYPE_BLAZE = 3;
+
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;  // Generic attack (used as melee for blaze)
+const uint AI_STATE_FIREBALL = 7;
+const uint AI_STATE_MELEE = 8;   // Close-range melee attack
+const uint AI_STATE_DEAD = 9;
+
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_IN_WATER = 1 << 1;
+const uint MOB_FLAG_IN_LAVA = 1 << 2;
+const uint MOB_FLAG_NO_AI = 1 << 3;
+const uint MOB_FLAG_BURNING = 1 << 6;
+
+// Blaze-specific constants
+const float BLAZE_DETECTION_RANGE = 48.0;
+const float BLAZE_ATTACK_RANGE = 32.0;
+const float BLAZE_MELEE_RANGE = 2.0;
+const float BLAZE_HOVER_HEIGHT = 3.0;
+const float BLAZE_HOVER_VARIANCE = 1.5;
+const float BLAZE_SPEED = 0.25;
+const float BLAZE_VERTICAL_SPEED = 0.15;
+const uint BLAZE_FIREBALL_COOLDOWN = 100;  // 5 seconds at 20 tps
+const uint BLAZE_MELEE_COOLDOWN = 20;      // 1 second melee cooldown
+const uint BLAZE_CHARGE_TIME = 40;
+const uint BLAZE_BURST_COUNT = 3;
+const float WATER_DAMAGE_RATE = 5.0;
+const float SNOWBALL_DAMAGE = 3.0;
+const float MELEE_DAMAGE = 6.0;
+
+// Type data indices for blaze
+const uint TD_FIREBALL_COUNT = 0;
+const uint TD_CHARGE_TIMER = 1;
+const uint TD_ON_FIRE_DURATION = 2;
+const uint TD_HOVER_HEIGHT = 3;      // Stored as float bits
+const uint TD_TARGET_HOVER = 4;      // Stored as float bits
+const uint TD_MELEE_COOLDOWN = 5;    // Melee attack cooldown
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+};
+
+// Fireball spawn request (written to separate buffer for CPU to process)
+struct FireballSpawn {
+    vec3 position;
+    float speed;
+    vec3 direction;
+    uint source_entity;
+    uint target_entity;
+    uint _pad;
+};
+
+// Melee attack output for CPU-side damage processing
+struct MeleeAttack {
+    uint source_entity;
+    uint target_entity;
+    float damage;
+    uint fire_duration;  // Ticks to set target on fire
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer FireballBuffer {
+    uint fireball_count;
+    FireballSpawn fireballs[];
+};
+
+layout(set = 0, binding = 4) buffer MeleeBuffer {
+    uint melee_count;
+    MeleeAttack melee_attacks[];
+};
+
+// Incoming damage events (from snowballs, water, etc.)
+struct DamageEvent {
+    uint target_entity;
+    uint damage_type;  // 0=normal, 1=water, 2=snowball, 3=rain
+    float damage;
+    uint _pad;
+};
+
+layout(set = 0, binding = 5) buffer readonly DamageBuffer {
+    uint damage_count;
+    DamageEvent damages[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+} pc;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+vec3 random_direction(inout uint seed) {
+    float theta = random_float(seed) * 6.28318530718;
+    float phi = acos(2.0 * random_float(seed) - 1.0);
+    return vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+}
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float angle_to(vec3 from, vec3 to) {
+    vec2 dir = normalize(to.xz - from.xz);
+    return atan(dir.x, dir.y);
+}
+
+float pitch_to(vec3 from, vec3 to) {
+    vec3 diff = to - from;
+    float horiz_dist = length(diff.xz);
+    return atan(diff.y, horiz_dist);
+}
+
+// Block queries
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+bool is_water(uint block_id) {
+    return block_id == 8 || block_id == 9;
+}
+
+// Entity queries
+vec3 get_entity_position(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool entity_exists(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint find_nearest_entity(vec3 pos, float max_range, out float out_distance) {
+    uint nearest = 0xFFFFFFFF;
+    float nearest_dist = max_range * max_range;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist_sq = distance_squared(pos, entities[i].position);
+        if (dist_sq < nearest_dist) {
+            nearest_dist = dist_sq;
+            nearest = entities[i].entity_id;
+        }
+    }
+
+    out_distance = sqrt(nearest_dist);
+    return nearest;
+}
+
+// ============================================================================
+// Hovering mechanics
+// ============================================================================
+
+float get_ground_height(vec3 pos) {
+    ivec3 block_pos = world_to_block(pos);
+    for (int y = block_pos.y; y >= 0; y--) {
+        if (is_solid(get_block_at(ivec3(block_pos.x, y, block_pos.z)))) {
+            return float(y + 1);
+        }
+    }
+    return 0.0;
+}
+
+void update_hover(inout MobState mob, float dt, inout uint seed) {
+    float current_hover = uintBitsToFloat(mob.type_data[TD_HOVER_HEIGHT]);
+    float target_hover = uintBitsToFloat(mob.type_data[TD_TARGET_HOVER]);
+
+    // Occasionally change target hover height
+    if (random_float(seed) < 0.02) {
+        target_hover = BLAZE_HOVER_HEIGHT + (random_float(seed) - 0.5) * BLAZE_HOVER_VARIANCE * 2.0;
+        mob.type_data[TD_TARGET_HOVER] = floatBitsToUint(target_hover);
+    }
+
+    // Smoothly adjust toward target
+    float ground = get_ground_height(mob.position);
+    float target_y = ground + target_hover;
+    float diff = target_y - mob.position.y;
+
+    // Vertical movement
+    mob.velocity.y = clamp(diff * 0.1, -BLAZE_VERTICAL_SPEED, BLAZE_VERTICAL_SPEED);
+
+    // Update current hover tracking
+    mob.type_data[TD_HOVER_HEIGHT] = floatBitsToUint(mob.position.y - ground);
+}
+
+// ============================================================================
+// Fireball spawning
+// ============================================================================
+
+void spawn_fireball(MobState mob, vec3 target_pos, uint mob_idx) {
+    uint idx = atomicAdd(fireball_count, 1);
+    if (idx < 64) { // Max fireballs per frame
+        fireballs[idx].position = mob.position + vec3(0.0, 1.0, 0.0);
+        fireballs[idx].direction = normalize_safe(target_pos - mob.position);
+        fireballs[idx].speed = 0.9;  // Blaze fireball speed
+        fireballs[idx].source_entity = mob_idx;
+        fireballs[idx].target_entity = mob.target_entity_id;
+        fireballs[idx]._pad = 0;
+    }
+}
+
+// Queue a melee attack for CPU-side damage processing
+void queue_melee_attack(uint mob_idx, uint target_id, float damage, uint fire_ticks) {
+    uint idx = atomicAdd(melee_count, 1);
+    if (idx < 64) {
+        melee_attacks[idx].source_entity = mob_idx;
+        melee_attacks[idx].target_entity = target_id;
+        melee_attacks[idx].damage = damage;
+        melee_attacks[idx].fire_duration = fire_ticks;
+    }
+}
+
+// Check for incoming damage events (snowballs, water, etc.)
+void process_incoming_damage(inout MobState mob, uint mob_idx) {
+    for (uint i = 0; i < damage_count; i++) {
+        if (damages[i].target_entity == mob_idx) {
+            uint dtype = damages[i].damage_type;
+            float dmg = damages[i].damage;
+
+            if (dtype == 2) {  // Snowball
+                mob.health -= SNOWBALL_DAMAGE;
+                mob.hurt_time = 10;
+            } else if (dtype == 1 || dtype == 3) {  // Water or rain
+                mob.health -= WATER_DAMAGE_RATE * 0.05;
+                mob.hurt_time = 10;
+                mob.type_data[TD_ON_FIRE_DURATION] = 0;  // Extinguish flames
+            } else {
+                mob.health -= dmg;
+                mob.hurt_time = 10;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Blaze AI States
+// ============================================================================
+
+void blaze_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Flames always on
+    mob.type_data[TD_ON_FIRE_DURATION] = 100;
+
+    // Look for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, BLAZE_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Random floating movement
+    if (mob.state_timer > 40 + uint(random_float(seed) * 60.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec3 offset = random_direction(seed) * 5.0;
+        offset.y *= 0.3; // Less vertical
+        mob.path_target = mob.position + offset;
+        mob.state_timer = 0;
+    }
+
+    // Slow drift
+    mob.velocity.x *= 0.95;
+    mob.velocity.z *= 0.95;
+}
+
+void blaze_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, BLAZE_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Move toward wander target
+    float target_dist = distance(mob.position.xz, mob.path_target.xz);
+    if (target_dist < 1.5 || mob.state_timer > 100) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 dir = normalize_safe(mob.path_target - mob.position);
+    mob.velocity.x = dir.x * BLAZE_SPEED * 0.5;
+    mob.velocity.z = dir.z * BLAZE_SPEED * 0.5;
+    mob.yaw = angle_to(mob.position, mob.path_target);
+}
+
+void blaze_chase(inout MobState mob, inout uint seed, uint mob_idx) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target
+    if (dist > BLAZE_DETECTION_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In melee range - do contact damage
+    if (dist < BLAZE_MELEE_RANGE && mob.type_data[TD_MELEE_COOLDOWN] == 0) {
+        mob.ai_state = AI_STATE_MELEE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In fireball range - start charging fireball
+    if (dist < BLAZE_ATTACK_RANGE && mob.attack_cooldown == 0) {
+        mob.ai_state = AI_STATE_FIREBALL;
+        mob.type_data[TD_CHARGE_TIMER] = 0;
+        mob.type_data[TD_FIREBALL_COUNT] = BLAZE_BURST_COUNT;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Move toward target, maintaining hover height
+    vec3 horizontal_dir = normalize_safe(vec3(target_pos.x - mob.position.x, 0.0, target_pos.z - mob.position.z));
+    mob.velocity.x = horizontal_dir.x * BLAZE_SPEED;
+    mob.velocity.z = horizontal_dir.z * BLAZE_SPEED;
+
+    mob.yaw = angle_to(mob.position, target_pos);
+    mob.pitch = pitch_to(mob.position, target_pos);
+}
+
+// Melee attack - contact damage with fire
+void blaze_melee(inout MobState mob, inout uint seed, uint mob_idx) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Face target
+    mob.yaw = angle_to(mob.position, target_pos);
+    mob.pitch = pitch_to(mob.position, target_pos);
+
+    // Perform melee attack
+    if (mob.state_timer == 5) {  // Slight delay for attack animation
+        if (dist < BLAZE_MELEE_RANGE * 1.5) {
+            // 6 damage + 5 seconds of fire (100 ticks)
+            queue_melee_attack(mob_idx, mob.target_entity_id, MELEE_DAMAGE, 100);
+            mob.type_data[TD_MELEE_COOLDOWN] = BLAZE_MELEE_COOLDOWN;
+        }
+    }
+
+    // Return to chase after attack
+    if (mob.state_timer > 10) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+}
+
+void blaze_fireball(inout MobState mob, inout uint seed, uint mob_idx) {
+    mob.state_timer++;
+    mob.type_data[TD_CHARGE_TIMER]++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+
+    // Face target while charging
+    mob.yaw = angle_to(mob.position, target_pos);
+    mob.pitch = pitch_to(mob.position, target_pos);
+
+    // Rise up slightly during charge (blaze behavior)
+    if (mob.type_data[TD_CHARGE_TIMER] < BLAZE_CHARGE_TIME) {
+        mob.velocity.y = BLAZE_VERTICAL_SPEED * 0.5;  // Rise up while charging
+    }
+
+    // Stop horizontal movement during charge
+    mob.velocity.x *= 0.8;
+    mob.velocity.z *= 0.8;
+
+    // Fire sequence
+    uint charge_time = mob.type_data[TD_CHARGE_TIMER];
+    uint fireballs_remaining = mob.type_data[TD_FIREBALL_COUNT];
+
+    if (charge_time >= BLAZE_CHARGE_TIME && fireballs_remaining > 0) {
+        // Shoot fireball with slight spread
+        vec3 aim = target_pos + vec3(
+            (random_float(seed) - 0.5) * 2.0,
+            (random_float(seed) - 0.5) * 1.0,
+            (random_float(seed) - 0.5) * 2.0
+        );
+        spawn_fireball(mob, aim, mob_idx);
+
+        mob.type_data[TD_FIREBALL_COUNT] = fireballs_remaining - 1;
+        mob.type_data[TD_CHARGE_TIMER] = BLAZE_CHARGE_TIME - 10; // Quick follow-up shots
+    }
+
+    // Done shooting - enter 5 second cooldown
+    if (fireballs_remaining == 0) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.attack_cooldown = BLAZE_FIREBALL_COOLDOWN;  // 5 seconds
+        mob.state_timer = 0;
+    }
+
+    // Timeout
+    if (mob.state_timer > 120) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.attack_cooldown = BLAZE_FIREBALL_COOLDOWN / 2;
+        mob.state_timer = 0;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    // Only process blazes
+    if (mob.mob_type != MOB_TYPE_BLAZE) return;
+    if (mob.ai_state == AI_STATE_DEAD || (mob.flags & MOB_FLAG_NO_AI) != 0) return;
+
+    uint seed = mob.random_seed ^ pc.random_seed ^ idx;
+    float dt = pc.delta_time;
+
+    // Initialize blaze-specific state if needed
+    if (mob.type_data[TD_HOVER_HEIGHT] == 0) {
+        mob.type_data[TD_HOVER_HEIGHT] = floatBitsToUint(BLAZE_HOVER_HEIGHT);
+        mob.type_data[TD_TARGET_HOVER] = floatBitsToUint(BLAZE_HOVER_HEIGHT);
+        mob.type_data[TD_ON_FIRE_DURATION] = 100;  // Always burning
+        mob.type_data[TD_MELEE_COOLDOWN] = 0;
+        mob.health = 20.0;      // Blaze HP
+        mob.max_health = 20.0;
+    }
+
+    // Process incoming damage (snowballs, water, etc.)
+    process_incoming_damage(mob, idx);
+
+    // Water damage - blazes are fire creatures
+    if ((mob.flags & MOB_FLAG_IN_WATER) != 0) {
+        mob.health -= WATER_DAMAGE_RATE * dt;
+        mob.hurt_time = 10;
+        mob.type_data[TD_ON_FIRE_DURATION] = 0;
+    }
+
+    // Timers
+    mob.hurt_time = max(mob.hurt_time - 1, 0);
+    mob.no_damage_time = max(mob.no_damage_time - 1, 0);
+    mob.attack_cooldown = max(mob.attack_cooldown - 1, 0);
+    mob.ai_tick_cooldown = max(mob.ai_tick_cooldown - 1, 0);
+    mob.type_data[TD_MELEE_COOLDOWN] = max(mob.type_data[TD_MELEE_COOLDOWN] - 1, 0);
+
+    // Hovering
+    update_hover(mob, dt, seed);
+
+    // AI state machine
+    if (mob.ai_tick_cooldown == 0) {
+        mob.ai_tick_cooldown = 2;
+
+        switch (mob.ai_state) {
+            case AI_STATE_IDLE:
+                blaze_idle(mob, seed);
+                break;
+            case AI_STATE_WANDER:
+                blaze_wander(mob, seed);
+                break;
+            case AI_STATE_CHASE:
+                blaze_chase(mob, seed, idx);
+                break;
+            case AI_STATE_FIREBALL:
+                blaze_fireball(mob, seed, idx);
+                break;
+            case AI_STATE_MELEE:
+                blaze_melee(mob, seed, idx);
+                break;
+        }
+    }
+
+    // Blazes hover, apply air drag
+    mob.velocity *= 0.9;
+
+    // Apply velocity
+    mob.position += mob.velocity * dt * 20.0;
+
+    // Flames particle effect - blazes always burn (unless in water)
+    if ((mob.flags & MOB_FLAG_IN_WATER) == 0) {
+        mob.type_data[TD_ON_FIRE_DURATION] = 100;
+    }
+    if (mob.type_data[TD_ON_FIRE_DURATION] > 0) {
+        mob.flags |= MOB_FLAG_BURNING;
+    } else {
+        mob.flags &= ~MOB_FLAG_BURNING;
+    }
+
+    // Death
+    if (mob.health <= 0.0) {
+        mob.ai_state = AI_STATE_DEAD;
+        // Blaze rod drops handled by CPU-side death processing
+    }
+
+    mob.random_seed = seed;
+    mobs[idx] = mob;
+}

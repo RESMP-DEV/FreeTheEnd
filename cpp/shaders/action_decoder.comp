@@ -1,0 +1,346 @@
+#version 450
+
+// Action decoder for 32-action discrete space
+// Decodes integer actions into InputState for the game simulation
+// Batched for multiple parallel environments
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint num_envs;      // Number of parallel environments
+    uint reserved[3];   // Padding for alignment
+} pc;
+
+// ============================================================================
+// ACTION SPACE (32 discrete actions)
+// ============================================================================
+//
+// Movement (0-6):
+//   0: noop
+//   1: forward
+//   2: backward
+//   3: strafe left
+//   4: strafe right
+//   5: forward + strafe left (diagonal)
+//   6: forward + strafe right (diagonal)
+//
+// Jump (7-8):
+//   7: jump
+//   8: jump + forward
+//
+// Combat (9-10):
+//   9: attack
+//   10: attack + forward
+//
+// Sprint (11):
+//   11: toggle sprint
+//
+// Look fine (12-15):
+//   12: look left 5 degrees
+//   13: look right 5 degrees
+//   14: look up 7.5 degrees
+//   15: look down 7.5 degrees
+//
+// Look coarse (16-19):
+//   16: look left 45 degrees
+//   17: look right 45 degrees
+//   18: look up 30 degrees
+//   19: look down 30 degrees
+//
+// Interaction (20-21):
+//   20: use/interact
+//   21: drop item
+//
+// Hotbar (22-30):
+//   22-30: select slot 0-8
+//
+// Crafting (31):
+//   31: quick craft
+//
+// ============================================================================
+
+const uint ACTION_NOOP = 0u;
+
+// Movement
+const uint ACTION_FORWARD = 1u;
+const uint ACTION_BACKWARD = 2u;
+const uint ACTION_STRAFE_LEFT = 3u;
+const uint ACTION_STRAFE_RIGHT = 4u;
+const uint ACTION_FORWARD_LEFT = 5u;
+const uint ACTION_FORWARD_RIGHT = 6u;
+
+// Jump
+const uint ACTION_JUMP = 7u;
+const uint ACTION_JUMP_FORWARD = 8u;
+
+// Combat
+const uint ACTION_ATTACK = 9u;
+const uint ACTION_ATTACK_FORWARD = 10u;
+
+// Sprint
+const uint ACTION_SPRINT_TOGGLE = 11u;
+
+// Fine look
+const uint ACTION_LOOK_LEFT_FINE = 12u;
+const uint ACTION_LOOK_RIGHT_FINE = 13u;
+const uint ACTION_LOOK_UP_FINE = 14u;
+const uint ACTION_LOOK_DOWN_FINE = 15u;
+
+// Coarse look
+const uint ACTION_LOOK_LEFT_COARSE = 16u;
+const uint ACTION_LOOK_RIGHT_COARSE = 17u;
+const uint ACTION_LOOK_UP_COARSE = 18u;
+const uint ACTION_LOOK_DOWN_COARSE = 19u;
+
+// Interaction
+const uint ACTION_USE = 20u;
+const uint ACTION_DROP = 21u;
+
+// Hotbar slots 22-30
+const uint ACTION_HOTBAR_0 = 22u;
+const uint ACTION_HOTBAR_8 = 30u;
+
+// Crafting
+const uint ACTION_CRAFT = 31u;
+
+// Look angles
+const float LOOK_FINE_YAW = 5.0;
+const float LOOK_FINE_PITCH = 7.5;
+const float LOOK_COARSE_YAW = 45.0;
+const float LOOK_COARSE_PITCH = 30.0;
+
+// Input flags
+const uint INPUT_FLAG_JUMP = 1u;
+const uint INPUT_FLAG_SPRINT = 2u;
+const uint INPUT_FLAG_SNEAK = 4u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+// Player state needed for sprint toggle
+struct PlayerState {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint invincibility_timer;
+    uint attack_cooldown;
+    uint weapon_slot;
+    float arrow_charge;
+    uint arrows;
+    uint selected_slot;  // Current hotbar slot
+    uint reserved;
+};
+
+// Output to game simulation
+struct InputState {
+    float movement_x;    // Strafe: -1=left, +1=right
+    float movement_y;    // Unused (vertical for fly mode)
+    float movement_z;    // Forward: +1=forward, -1=backward
+    float look_delta_x;  // Yaw delta (degrees)
+    float look_delta_y;  // Pitch delta (degrees)
+    uint action;         // 0=none, 1=attack, 2=use, 3=drop, 4=craft, 5=swap_slot
+    uint action_data;    // Slot number for swap_slot
+    uint flags;          // bit0=jump, bit1=sprint, bit2=sneak
+};
+
+// Discrete action input from RL policy
+struct ActionInput {
+    uint action;         // 0-31 discrete action
+    uint reserved[3];    // Padding
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer readonly ActionBuffer {
+    ActionInput actions[];
+};
+
+layout(set = 0, binding = 1) buffer PlayerBuffer {
+    PlayerState players[];
+};
+
+layout(set = 0, binding = 2) buffer writeonly InputBuffer {
+    InputState inputs[];
+};
+
+// ============================================================================
+// ACTION DECODER
+// ============================================================================
+
+void decode_action(uint env_id, uint action) {
+    InputState inp;
+
+    // Reset all inputs to neutral
+    inp.movement_x = 0.0;
+    inp.movement_y = 0.0;
+    inp.movement_z = 0.0;
+    inp.look_delta_x = 0.0;
+    inp.look_delta_y = 0.0;
+    inp.action = 0u;
+    inp.action_data = 0u;
+    inp.flags = 0u;
+
+    // Decode action
+    switch (action) {
+        // ---- Movement ----
+        case ACTION_NOOP:
+            break;
+
+        case ACTION_FORWARD:
+            inp.movement_z = 1.0;
+            break;
+
+        case ACTION_BACKWARD:
+            inp.movement_z = -1.0;
+            break;
+
+        case ACTION_STRAFE_LEFT:
+            inp.movement_x = -1.0;
+            break;
+
+        case ACTION_STRAFE_RIGHT:
+            inp.movement_x = 1.0;
+            break;
+
+        case ACTION_FORWARD_LEFT:
+            inp.movement_z = 1.0;
+            inp.movement_x = -1.0;
+            break;
+
+        case ACTION_FORWARD_RIGHT:
+            inp.movement_z = 1.0;
+            inp.movement_x = 1.0;
+            break;
+
+        // ---- Jump ----
+        case ACTION_JUMP:
+            inp.flags |= INPUT_FLAG_JUMP;
+            break;
+
+        case ACTION_JUMP_FORWARD:
+            inp.flags |= INPUT_FLAG_JUMP;
+            inp.movement_z = 1.0;
+            break;
+
+        // ---- Combat ----
+        case ACTION_ATTACK:
+            inp.action = 1u;  // Attack action
+            break;
+
+        case ACTION_ATTACK_FORWARD:
+            inp.action = 1u;
+            inp.movement_z = 1.0;
+            break;
+
+        // ---- Sprint toggle ----
+        case ACTION_SPRINT_TOGGLE:
+            // Toggle sprint based on current player state
+            if ((players[env_id].flags & INPUT_FLAG_SPRINT) != 0u) {
+                // Currently sprinting, stop
+                inp.flags &= ~INPUT_FLAG_SPRINT;
+            } else {
+                // Not sprinting, start
+                inp.flags |= INPUT_FLAG_SPRINT;
+                inp.movement_z = 1.0;  // Need forward movement to sprint
+            }
+            break;
+
+        // ---- Fine look ----
+        case ACTION_LOOK_LEFT_FINE:
+            inp.look_delta_x = -LOOK_FINE_YAW;
+            break;
+
+        case ACTION_LOOK_RIGHT_FINE:
+            inp.look_delta_x = LOOK_FINE_YAW;
+            break;
+
+        case ACTION_LOOK_UP_FINE:
+            inp.look_delta_y = -LOOK_FINE_PITCH;
+            break;
+
+        case ACTION_LOOK_DOWN_FINE:
+            inp.look_delta_y = LOOK_FINE_PITCH;
+            break;
+
+        // ---- Coarse look ----
+        case ACTION_LOOK_LEFT_COARSE:
+            inp.look_delta_x = -LOOK_COARSE_YAW;
+            break;
+
+        case ACTION_LOOK_RIGHT_COARSE:
+            inp.look_delta_x = LOOK_COARSE_YAW;
+            break;
+
+        case ACTION_LOOK_UP_COARSE:
+            inp.look_delta_y = -LOOK_COARSE_PITCH;
+            break;
+
+        case ACTION_LOOK_DOWN_COARSE:
+            inp.look_delta_y = LOOK_COARSE_PITCH;
+            break;
+
+        // ---- Interaction ----
+        case ACTION_USE:
+            inp.action = 2u;  // Use/interact action
+            break;
+
+        case ACTION_DROP:
+            inp.action = 3u;  // Drop action
+            break;
+
+        // ---- Hotbar slots ----
+        case ACTION_HOTBAR_0:
+        case ACTION_HOTBAR_0 + 1u:
+        case ACTION_HOTBAR_0 + 2u:
+        case ACTION_HOTBAR_0 + 3u:
+        case ACTION_HOTBAR_0 + 4u:
+        case ACTION_HOTBAR_0 + 5u:
+        case ACTION_HOTBAR_0 + 6u:
+        case ACTION_HOTBAR_0 + 7u:
+        case ACTION_HOTBAR_0 + 8u:
+            inp.action = 5u;  // Swap slot action
+            inp.action_data = action - ACTION_HOTBAR_0;
+            break;
+
+        // ---- Crafting ----
+        case ACTION_CRAFT:
+            inp.action = 4u;  // Craft action
+            break;
+
+        default:
+            // Invalid action, treat as noop
+            break;
+    }
+
+    // Write decoded input
+    inputs[env_id] = inp;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+
+    if (env_id >= pc.num_envs) {
+        return;
+    }
+
+    uint action = actions[env_id].action;
+
+    // Clamp to valid range
+    action = min(action, 31u);
+
+    decode_action(env_id, action);
+}
