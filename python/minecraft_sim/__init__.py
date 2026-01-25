@@ -118,11 +118,14 @@ else:
     discrete_to_input = None
     check_gpu = None
     mc189_core = None
-    OBSERVATION_SIZE = 48
-    ACTION_SIZE = 17
-    MAX_BATCH_SIZE = 4096
-    TICKS_PER_SECOND = 20
-    MC189_ACTION_COUNT = 17
+    # Import canonical constants (single source of truth)
+    from .constants import (
+        ACTION_SIZE,
+        MAX_BATCH_SIZE,
+        OBSERVATION_SIZE,
+        TICKS_PER_SECOND,
+    )
+    MC189_ACTION_COUNT = ACTION_SIZE
 
 # =============================================================================
 # Import Python wrappers
