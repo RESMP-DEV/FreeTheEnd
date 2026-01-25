@@ -1,0 +1,196 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ==========================================================================
+  # Test Python fallback paths (no C++ extension)
+  # ==========================================================================
+  test-python-fallback:
+    name: Python Fallback Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies (no C++ build)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy gymnasium pytest pytest-cov
+
+      - name: Install package in development mode
+        run: |
+          pip install -e ./python --no-build-isolation
+        env:
+          # Ensure we don't try to build C++ extension
+          SKIP_CPP_BUILD: "1"
+
+      - name: Run fallback tests
+        run: |
+          pytest tests/test_fallback.py -v --tb=short
+
+      - name: Run determinism tests (fallback mode)
+        run: |
+          pytest tests/test_determinism.py -v --tb=short -k "not cpp"
+
+  # ==========================================================================
+  # Lint and static analysis
+  # ==========================================================================
+  lint:
+    name: Lint & Dimension Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install linting tools
+        run: |
+          pip install ruff
+
+      - name: Run ruff linter
+        run: |
+          ruff check python/ examples/ tests/ --ignore E501
+
+      - name: Check for hardcoded dimensions
+        run: |
+          python scripts/check_hardcoded_dims.py python/ examples/ --errors-only
+
+  # ==========================================================================
+  # Test with C++ extension (requires GPU runner or mock)
+  # ==========================================================================
+  test-with-cpp:
+    name: Full Tests (with C++)
+    runs-on: ubuntu-latest
+    # Only run if we have self-hosted GPU runners configured
+    # if: github.repository == 'RESMP-DEV/FreeTheEnd'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Install Python dependencies
+        run: |
+          pip install numpy gymnasium pytest pytest-cov stable-baselines3
+
+      - name: Check if C++ extension can be built
+        id: check-cpp
+        continue-on-error: true
+        run: |
+          cd cpp
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1 | tee cmake_output.txt
+          if grep -q "Vulkan" cmake_output.txt; then
+            echo "cpp_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "cpp_available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build C++ extension
+        if: steps.check-cpp.outputs.cpp_available == 'true'
+        run: |
+          cd cpp/build
+          make -j$(nproc)
+
+      - name: Install package
+        run: |
+          pip install -e ./python
+
+      - name: Run all tests
+        run: |
+          pytest tests/ -v --tb=short
+
+  # ==========================================================================
+  # Test training scripts work
+  # ==========================================================================
+  test-training-scripts:
+    name: Training Script Smoke Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install numpy gymnasium pytest
+
+      - name: Install package
+        run: |
+          pip install -e ./python --no-build-isolation
+
+      - name: Check training scripts are syntactically valid
+        run: |
+          python -m py_compile examples/train_ppo.py
+          python -m py_compile examples/train_ppo_speedrun.py
+          python -m py_compile examples/train_ppo_smoke.py
+
+      - name: Test imports work without C++
+        run: |
+          python -c "
+          from minecraft_sim.backend import VulkanBackend
+          from minecraft_sim.constants import OBSERVATION_SIZE, ACTION_SIZE
+          print(f'OBSERVATION_SIZE={OBSERVATION_SIZE}')
+          print(f'ACTION_SIZE={ACTION_SIZE}')
+          backend = VulkanBackend(num_envs=4)
+          print(f'Backend obs_dim={backend.obs_dim}')
+          assert backend.obs_dim == OBSERVATION_SIZE, 'Dimension mismatch!'
+          print('All imports and dimensions OK')
+          "
+
+  # ==========================================================================
+  # Type checking (optional)
+  # ==========================================================================
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install numpy gymnasium mypy types-setuptools
+
+      - name: Install package
+        run: |
+          pip install -e ./python --no-build-isolation
+
+      - name: Run mypy (non-strict)
+        continue-on-error: true  # Don't fail CI on type errors yet
+        run: |
+          mypy python/minecraft_sim --ignore-missing-imports --no-strict-optional

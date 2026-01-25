@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from .constants import OBSERVATION_SIZE
+
 try:
     import mc189_core as _mc189
 
@@ -43,7 +45,7 @@ class VulkanBackend:
         self._shader_dir = _resolve_shader_dir(shader_dir)
         self._simulator: Any | None = None
         self._device_name = "Unavailable"
-        self._obs_dim = 48  # Dragon fight observation size (48 floats)
+        self._obs_dim = OBSERVATION_SIZE  # Use constant from constants.py
 
         if not _HAS_CORE:
             self._observations = np.zeros((self._num_envs, self._obs_dim), dtype=np.float32)
