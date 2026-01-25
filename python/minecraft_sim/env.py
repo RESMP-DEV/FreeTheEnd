@@ -239,7 +239,17 @@ class DragonFightEnv(gym.Env):
             # Fallback: return zeros if simulator not available
             return np.zeros(48, dtype=np.float32), {}
 
-        self._sim.reset()
+        # Generate deterministic seed from numpy if not provided.
+        # This ensures the C++ backend respects np.random.seed() calls.
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
+        # Pass seed to C++ backend to avoid hardware entropy (std::random_device)
+        try:
+            self._sim.reset(seed=seed)
+        except TypeError:
+            # Fallback if C++ API doesn't support seed parameter yet
+            self._sim.reset()
         # Execute a no-op step to get initial observation
         self._sim.step(np.array([0], dtype=np.int32))
         obs = np.array(self._sim.get_observations(), dtype=np.float32).flatten()

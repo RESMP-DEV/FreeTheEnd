@@ -98,15 +98,55 @@ class VulkanBackend:
         dones = np.zeros((self._num_envs,), dtype=bool)
         return observations, rewards, dones, {}
 
-    def reset(self, env_ids: NDArray[np.int32] | None = None) -> NDArray[np.float32]:
-        """Reset specified environments (or all if None)."""
+    def reset(
+        self,
+        env_ids: NDArray[np.int32] | None = None,
+        seed: int | None = None,
+    ) -> NDArray[np.float32]:
+        """Reset specified environments (or all if None).
+
+        Args:
+            env_ids: Optional array of environment indices to reset. If None,
+                resets all environments.
+            seed: Optional seed for deterministic world generation. If None,
+                generates a seed from numpy's random state, ensuring that
+                `np.random.seed()` or SB3's `set_random_seed()` controls
+                the simulation's randomness.
+
+        Returns:
+            Observations array of shape (num_envs, obs_dim).
+
+        Note:
+            Without an explicit seed, the C++ backend defaults to hardware
+            entropy (std::random_device), which bypasses Python's random state.
+            This method generates a deterministic seed from numpy when none is
+            provided, ensuring reproducibility when training scripts set seeds.
+        """
+        # Generate deterministic seed from numpy's random state if not provided.
+        # This ensures np.random.seed() / SB3's set_random_seed() cascade to C++.
+        if seed is None:
+            seed = int(np.random.randint(0, 2**63))
+
         if self._simulator is not None:
             if env_ids is None:
-                self._simulator.reset()
+                # Reset all environments with the same base seed
+                if hasattr(self._simulator, "reset") and callable(self._simulator.reset):
+                    # Try passing seed if the C++ API supports it
+                    try:
+                        self._simulator.reset(seed=seed)
+                    except TypeError:
+                        # Fallback: C++ reset() doesn't accept seed kwarg yet
+                        self._simulator.reset()
             else:
                 env_ids_array = np.asarray(env_ids, dtype=np.int32).ravel()
-                for env_id in env_ids_array:
-                    self._simulator.reset(int(env_id))
+                for i, env_id in enumerate(env_ids_array):
+                    # Derive deterministic sub-seeds for specific envs
+                    env_seed = seed + i
+                    try:
+                        self._simulator.reset(int(env_id), seed=env_seed)
+                    except TypeError:
+                        # Fallback: C++ reset(env_id) doesn't accept seed yet
+                        self._simulator.reset(int(env_id))
             return self._simulator.get_observations()
 
         return np.zeros((self._num_envs, self._obs_dim), dtype=np.float32)

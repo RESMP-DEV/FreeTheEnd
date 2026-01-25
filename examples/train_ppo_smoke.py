@@ -24,9 +24,10 @@ def simple_ppo_update(
     policy_net,
     value_net,
     optimizer,
+    obs_dim: int = 48,
 ):
     """Minimal PPO update - just for smoke test."""
-    assert obs_batch.shape[1] == 32
+    assert obs_batch.shape[1] == obs_dim, f"Expected obs_dim={obs_dim}, got {obs_batch.shape[1]}"
     assert action_batch.shape[1] == 7
     return {"loss": 0.0}
 
