@@ -1,0 +1,615 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 End Portal Frame and Activation Shader
+// Handles end portal frame placement, eye of ender insertion, and portal activation
+//
+// Portal Frame Mechanics:
+// - 12 frames arranged in 3x3 ring (corners excluded)
+// - Each frame has a facing direction (toward center)
+// - Frames can hold an eye of ender
+// - Portal activates when all 12 eyes are placed
+// - Portal blocks spawn in 3x3 center area
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Block IDs (must match game_tick.comp and C++ backend)
+const uint BLOCK_AIR = 0;
+const uint BLOCK_END_PORTAL = 119;
+const uint BLOCK_END_PORTAL_FRAME = 120;
+const uint BLOCK_END_PORTAL_FRAME_EYE = 121;  // Frame with eye inserted
+
+// Dimension IDs
+const uint DIM_OVERWORLD = 0;
+const uint DIM_NETHER = 1;
+const uint DIM_END = 2;
+
+// Portal frame constants
+const int PORTAL_FRAME_COUNT = 12;
+const int PORTAL_CENTER_SIZE = 3;  // 3x3 portal center
+
+// Frame facing directions (metadata bits 0-1)
+// 0 = South (+Z), 1 = West (-X), 2 = North (-Z), 3 = East (+X)
+const uint FACING_SOUTH = 0;
+const uint FACING_WEST = 1;
+const uint FACING_NORTH = 2;
+const uint FACING_EAST = 3;
+
+// Eye placement bit (metadata bit 2)
+const uint EYE_BIT = 4;
+
+// Item IDs
+const uint ITEM_EYE_OF_ENDER = 381;
+
+// Event types
+const uint EVENT_EYE_PLACED = 0;
+const uint EVENT_PORTAL_ACTIVATED = 1;
+const uint EVENT_PORTAL_ROOM_FOUND = 2;
+
+// ============================================================================
+// PUSH CONSTANTS
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    uint agentCount;        // Number of agents to process
+    uint maxPortalRooms;    // Max portal rooms per dimension
+    uint maxEvents;         // Max events to write
+    float deltaTime;        // Time step
+} pc;
+
+// ============================================================================
+// BUFFER BINDINGS
+// ============================================================================
+
+// Agent positions: vec4(x, y, z, yaw)
+layout(std430, set = 0, binding = 0) readonly buffer AgentPositions {
+    vec4 agentPos[];
+};
+
+// Agent dimensions and state
+// uvec4(dimension(u8), portalRoomFound(u8), eyesPlaced(u8), portalActive(u8))
+layout(std430, set = 0, binding = 1) buffer AgentState {
+    uvec4 agentState[];
+};
+
+// Agent actions: current action being performed
+// uvec4(actionType, targetBlockX, targetBlockY, targetBlockZ)
+layout(std430, set = 0, binding = 2) readonly buffer AgentActions {
+    uvec4 agentActions[];
+};
+
+// Agent inventory: item IDs (uint16 per slot, packed)
+layout(std430, set = 0, binding = 3) buffer AgentInventory {
+    uint inventoryData[];
+};
+
+// Portal room registry
+// Each entry: ivec4(centerX, centerY, centerZ, eyesMask(u16) | active(u8) | valid(u8))
+// eyesMask: 12 bits for which frames have eyes
+layout(std430, set = 0, binding = 4) buffer PortalRooms {
+    uvec4 portalRoomHeader;  // (overworldCount, netherCount, 0, 0)
+    ivec4 portalRooms[];     // Room data
+};
+
+// Dimension extents
+layout(std430, set = 0, binding = 5) readonly buffer DimensionExtents {
+    ivec4 extentsOverworld[2];  // [0]=(minX, minZ, maxX, maxZ), [1]=(height, strideX, strideZ, 0)
+    ivec4 extentsNether[2];
+    ivec4 extentsEnd[2];
+};
+
+// Voxel data (uint16 block IDs, linearized as [Y][X][Z])
+layout(std430, set = 0, binding = 6) buffer OverworldVoxels {
+    uint overworldBlocks[];
+};
+
+layout(std430, set = 0, binding = 7) buffer NetherVoxels {
+    uint netherBlocks[];
+};
+
+// Events output
+// uvec4(agentIdx|eventType<<16, x, y, z)
+layout(std430, set = 0, binding = 8) writeonly buffer Events {
+    uvec4 events[];
+};
+
+layout(std430, set = 0, binding = 9) buffer EventCount {
+    uint eventCount;
+};
+
+// Observation output: end portal state per agent
+// vec4(portalRoomFound, eyesNeeded, eyesPlaced, portalActive)
+layout(std430, set = 0, binding = 10) writeonly buffer PortalObservation {
+    vec4 portalObs[];
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Get dimension extents
+void getDimensionExtents(uint dim, out ivec4 ext0, out ivec4 ext1) {
+    if (dim == DIM_OVERWORLD) {
+        ext0 = extentsOverworld[0];
+        ext1 = extentsOverworld[1];
+    } else if (dim == DIM_NETHER) {
+        ext0 = extentsNether[0];
+        ext1 = extentsNether[1];
+    } else {
+        ext0 = extentsEnd[0];
+        ext1 = extentsEnd[1];
+    }
+}
+
+// Sample block at world coordinates in a dimension
+uint sampleBlock(uint dimension, ivec3 worldPos) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(dimension, ext0, ext1);
+
+    // Check bounds
+    if (worldPos.x < ext0.x || worldPos.x >= ext0.z ||
+        worldPos.z < ext0.y || worldPos.z >= ext0.w ||
+        worldPos.y < 0 || worldPos.y >= ext1.x) {
+        return BLOCK_AIR;
+    }
+
+    // Compute linear index: Y * strideX * strideZ + (X - minX) * strideZ + (Z - minZ)
+    int localX = worldPos.x - ext0.x;
+    int localZ = worldPos.z - ext0.y;
+    uint linearIdx = uint(worldPos.y) * uint(ext1.y) * uint(ext1.z) + uint(localX) * uint(ext1.z) + uint(localZ);
+
+    // Read packed uint16 pair
+    uint packedIdx = linearIdx / 2;
+    uint packed;
+    if (dimension == DIM_OVERWORLD) {
+        packed = overworldBlocks[packedIdx];
+    } else if (dimension == DIM_NETHER) {
+        packed = netherBlocks[packedIdx];
+    } else {
+        return BLOCK_AIR;  // End dimension not stored here
+    }
+
+    // Extract correct uint16
+    if ((linearIdx & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    } else {
+        return packed >> 16;
+    }
+}
+
+// Set block at world coordinates in a dimension
+void setBlock(uint dimension, ivec3 worldPos, uint blockType) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(dimension, ext0, ext1);
+
+    // Check bounds
+    if (worldPos.x < ext0.x || worldPos.x >= ext0.z ||
+        worldPos.z < ext0.y || worldPos.z >= ext0.w ||
+        worldPos.y < 0 || worldPos.y >= ext1.x) {
+        return;
+    }
+
+    int localX = worldPos.x - ext0.x;
+    int localZ = worldPos.z - ext0.y;
+    uint linearIdx = uint(worldPos.y) * uint(ext1.y) * uint(ext1.z) + uint(localX) * uint(ext1.z) + uint(localZ);
+
+    uint packedIdx = linearIdx / 2;
+
+    if (dimension == DIM_OVERWORLD) {
+        uint packed = overworldBlocks[packedIdx];
+        if ((linearIdx & 1u) == 0u) {
+            packed = (packed & 0xFFFF0000u) | (blockType & 0xFFFFu);
+        } else {
+            packed = (packed & 0x0000FFFFu) | ((blockType & 0xFFFFu) << 16);
+        }
+        overworldBlocks[packedIdx] = packed;
+    } else if (dimension == DIM_NETHER) {
+        uint packed = netherBlocks[packedIdx];
+        if ((linearIdx & 1u) == 0u) {
+            packed = (packed & 0xFFFF0000u) | (blockType & 0xFFFFu);
+        } else {
+            packed = (packed & 0x0000FFFFu) | ((blockType & 0xFFFFu) << 16);
+        }
+        netherBlocks[packedIdx] = packed;
+    }
+}
+
+// Write an event
+void writeEvent(uint agentIdx, uint eventType, ivec3 pos) {
+    uint idx = atomicAdd(eventCount, 1u);
+    if (idx < pc.maxEvents) {
+        events[idx] = uvec4(agentIdx | (eventType << 16), uint(pos.x), uint(pos.y), uint(pos.z));
+    }
+}
+
+// Get inventory slot (2 uint16 items packed per uint)
+uint getInventorySlot(uint agentIdx, uint slot) {
+    uint baseIdx = agentIdx * 18;  // 36 slots / 2 = 18 uints per agent
+    uint packedIdx = baseIdx + slot / 2;
+    uint packed = inventoryData[packedIdx];
+    if ((slot & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    } else {
+        return packed >> 16;
+    }
+}
+
+// Set inventory slot
+void setInventorySlot(uint agentIdx, uint slot, uint itemId) {
+    uint baseIdx = agentIdx * 18;
+    uint packedIdx = baseIdx + slot / 2;
+    uint packed = inventoryData[packedIdx];
+    if ((slot & 1u) == 0u) {
+        packed = (packed & 0xFFFF0000u) | (itemId & 0xFFFFu);
+    } else {
+        packed = (packed & 0x0000FFFFu) | ((itemId & 0xFFFFu) << 16);
+    }
+    inventoryData[packedIdx] = packed;
+}
+
+// Check if item is eye of ender
+bool isEyeOfEnder(uint itemId) {
+    return itemId == ITEM_EYE_OF_ENDER;
+}
+
+// ============================================================================
+// PORTAL FRAME GEOMETRY
+// ============================================================================
+
+// Portal frame positions relative to center (0,0)
+// 12 frames arranged in 3x3 ring without corners
+// Layout (looking down, +Z is south):
+//
+//     N
+//   W   E
+//     S
+//
+// Frame positions and their required facing direction:
+// North side (Z-2): X=-1,0,1 facing South (toward center)
+// South side (Z+2): X=-1,0,1 facing North (toward center)
+// West side  (X-2): Z=-1,0,1 facing East (toward center)
+// East side  (X+2): Z=-1,0,1 facing West (toward center)
+
+// Get frame offset and facing for index 0-11
+void getFrameOffsetAndFacing(int idx, out ivec2 offset, out uint facing) {
+    // North side (indices 0-2, Z = -2)
+    if (idx < 3) {
+        offset = ivec2(idx - 1, -2);
+        facing = FACING_SOUTH;
+    }
+    // East side (indices 3-5, X = 2)
+    else if (idx < 6) {
+        offset = ivec2(2, idx - 4);
+        facing = FACING_WEST;
+    }
+    // South side (indices 6-8, Z = 2)
+    else if (idx < 9) {
+        offset = ivec2(8 - idx - 1, 2);  // Reverse order for consistency
+        facing = FACING_NORTH;
+    }
+    // West side (indices 9-11, X = -2)
+    else {
+        offset = ivec2(-2, 11 - idx - 1);  // Reverse order for consistency
+        facing = FACING_EAST;
+    }
+}
+
+// Check if a block is an end portal frame (with or without eye)
+bool isPortalFrame(uint blockId) {
+    return blockId == BLOCK_END_PORTAL_FRAME || blockId == BLOCK_END_PORTAL_FRAME_EYE;
+}
+
+// Check if a portal frame has an eye
+bool hasEye(uint blockId) {
+    return blockId == BLOCK_END_PORTAL_FRAME_EYE;
+}
+
+// Get frame index from position relative to portal center (-1 if not a frame position)
+int getFrameIndex(ivec2 relPos) {
+    // North side (Z = -2)
+    if (relPos.y == -2 && relPos.x >= -1 && relPos.x <= 1) {
+        return relPos.x + 1;  // 0, 1, 2
+    }
+    // East side (X = 2)
+    if (relPos.x == 2 && relPos.y >= -1 && relPos.y <= 1) {
+        return relPos.y + 4;  // 3, 4, 5
+    }
+    // South side (Z = 2)
+    if (relPos.y == 2 && relPos.x >= -1 && relPos.x <= 1) {
+        return 7 - relPos.x;  // 8, 7, 6
+    }
+    // West side (X = -2)
+    if (relPos.x == -2 && relPos.y >= -1 && relPos.y <= 1) {
+        return 10 - relPos.y;  // 11, 10, 9
+    }
+    return -1;
+}
+
+// ============================================================================
+// PORTAL ROOM DETECTION
+// ============================================================================
+
+// Check if there's a valid portal room structure at the given center position
+// Returns eyesMask (12 bits) or 0xFFFFFFFF if not a valid portal room
+uint checkPortalRoom(uint dimension, ivec3 center) {
+    uint eyesMask = 0;
+
+    // Check all 12 frame positions
+    for (int i = 0; i < PORTAL_FRAME_COUNT; i++) {
+        ivec2 offset;
+        uint expectedFacing;
+        getFrameOffsetAndFacing(i, offset, expectedFacing);
+
+        ivec3 framePos = center + ivec3(offset.x, 0, offset.y);
+        uint blockId = sampleBlock(dimension, framePos);
+
+        // Must be a portal frame
+        if (!isPortalFrame(blockId)) {
+            return 0xFFFFFFFFu;  // Invalid room
+        }
+
+        // Track if eye is placed
+        if (hasEye(blockId)) {
+            eyesMask |= (1u << i);
+        }
+    }
+
+    return eyesMask;
+}
+
+// ============================================================================
+// PORTAL ACTIVATION
+// ============================================================================
+
+// Activate portal: fill center 3x3 with end portal blocks
+void activatePortal(uint dimension, ivec3 center) {
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dz = -1; dz <= 1; dz++) {
+            ivec3 pos = center + ivec3(dx, 0, dz);
+            setBlock(dimension, pos, BLOCK_END_PORTAL);
+        }
+    }
+}
+
+// Count bits set in mask (eye count)
+uint countEyes(uint mask) {
+    uint count = 0;
+    for (int i = 0; i < PORTAL_FRAME_COUNT; i++) {
+        if ((mask & (1u << i)) != 0u) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// EYE PLACEMENT
+// ============================================================================
+
+// Try to place eye of ender in a portal frame
+// Returns true if successful
+bool tryPlaceEye(uint agentIdx, uint dimension, ivec3 targetBlock) {
+    uint blockId = sampleBlock(dimension, targetBlock);
+
+    // Must be empty portal frame
+    if (blockId != BLOCK_END_PORTAL_FRAME) {
+        return false;
+    }
+
+    // Check if agent has eye of ender in inventory
+    // Search all 36 inventory slots
+    int eyeSlot = -1;
+    for (uint slot = 0; slot < 36; slot++) {
+        if (isEyeOfEnder(getInventorySlot(agentIdx, slot))) {
+            eyeSlot = int(slot);
+            break;
+        }
+    }
+
+    if (eyeSlot < 0) {
+        return false;  // No eye of ender
+    }
+
+    // Consume eye and place in frame
+    setInventorySlot(agentIdx, uint(eyeSlot), 0);
+    setBlock(dimension, targetBlock, BLOCK_END_PORTAL_FRAME_EYE);
+
+    return true;
+}
+
+// ============================================================================
+// PORTAL ROOM SEARCH (for observation)
+// ============================================================================
+
+// Find nearest portal room to agent position
+// Returns -1 if not found, or room index
+int findNearestPortalRoom(vec3 agentPosition, uint dimension) {
+    uint startIdx = 0;
+    uint endIdx = portalRoomHeader.x;  // Overworld count
+
+    if (dimension == DIM_NETHER) {
+        startIdx = portalRoomHeader.x;
+        endIdx = startIdx + portalRoomHeader.y;
+    }
+
+    float minDistSq = 1e30;
+    int nearestRoom = -1;
+
+    for (uint i = startIdx; i < endIdx; i++) {
+        ivec4 room = portalRooms[i];
+
+        // Check if valid
+        if ((room.w & 0xFF000000u) == 0u) {
+            continue;  // Not valid
+        }
+
+        vec3 roomCenter = vec3(float(room.x), float(room.y), float(room.z));
+        float distSq = dot(agentPosition - roomCenter, agentPosition - roomCenter);
+
+        if (distSq < minDistSq) {
+            minDistSq = distSq;
+            nearestRoom = int(i);
+        }
+    }
+
+    return nearestRoom;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.agentCount) {
+        return;
+    }
+
+    // Read agent state
+    vec4 pos = agentPos[idx];
+    uvec4 state = agentState[idx];
+    uvec4 action = agentActions[idx];
+
+    uint dimension = state.x & 0xFFu;
+
+    // Initialize observation
+    bool portalRoomFound = false;
+    uint eyesPlaced = 0;
+    uint eyesNeeded = 12;
+    bool portalActive = false;
+
+    // Skip end dimension (portal is overworld-only structure)
+    if (dimension == DIM_END) {
+        portalObs[idx] = vec4(0.0, 12.0, 0.0, 0.0);
+        return;
+    }
+
+    // Check if agent is using item on a portal frame (right-click interaction)
+    const uint ACTION_USE = 9;  // From mc189_action_type_t
+
+    if (action.x == ACTION_USE) {
+        ivec3 targetBlock = ivec3(int(action.y), int(action.z), int(action.w));
+
+        // Try to place eye
+        if (tryPlaceEye(idx, dimension, targetBlock)) {
+            writeEvent(idx, EVENT_EYE_PLACED, targetBlock);
+
+            // Find portal center from this frame and check for completion
+            // Search in small area around target for portal room center
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    ivec3 potentialCenter = targetBlock + ivec3(dx, 0, dz);
+                    uint eyesMask = checkPortalRoom(dimension, potentialCenter);
+
+                    if (eyesMask != 0xFFFFFFFFu) {
+                        // Found valid portal room
+                        uint eyeCount = countEyes(eyesMask);
+
+                        // Check if all 12 eyes placed
+                        if (eyeCount == 12u) {
+                            // Activate portal
+                            activatePortal(dimension, potentialCenter);
+                            writeEvent(idx, EVENT_PORTAL_ACTIVATED, potentialCenter);
+
+                            // Update portal room registry
+                            // Find existing entry or add new one
+                            uint startIdx = (dimension == DIM_OVERWORLD) ? 0 : portalRoomHeader.x;
+                            uint endIdx = startIdx + ((dimension == DIM_OVERWORLD) ? portalRoomHeader.x : portalRoomHeader.y);
+
+                            for (uint i = startIdx; i < endIdx; i++) {
+                                ivec4 room = portalRooms[i];
+                                if (room.x == potentialCenter.x && room.y == potentialCenter.y && room.z == potentialCenter.z) {
+                                    // Update existing
+                                    room.w = int((uint(room.w) & 0xFF000000u) | (eyesMask & 0xFFFFu) | 0x00FF0000u);  // active = 1
+                                    portalRooms[i] = room;
+                                    break;
+                                }
+                            }
+                        }
+
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Find nearest portal room for observation
+    int nearestRoom = findNearestPortalRoom(pos.xyz, dimension);
+
+    if (nearestRoom >= 0) {
+        ivec4 room = portalRooms[nearestRoom];
+
+        // Check distance (within 32 blocks to count as "found")
+        vec3 roomCenter = vec3(float(room.x), float(room.y), float(room.z));
+        float dist = length(pos.xyz - roomCenter);
+
+        if (dist < 32.0) {
+            portalRoomFound = true;
+
+            // Get eyes mask from room data
+            uint eyesMask = room.w & 0xFFFFu;
+            eyesPlaced = countEyes(eyesMask);
+            eyesNeeded = 12u - eyesPlaced;
+
+            // Check if active
+            portalActive = ((room.w >> 16) & 0xFFu) != 0u;
+
+            // Emit event if newly found
+            if ((state.y & 0xFFu) == 0u) {
+                writeEvent(idx, EVENT_PORTAL_ROOM_FOUND, ivec3(room.x, room.y, room.z));
+            }
+        }
+    } else {
+        // No registered room - do a local search around agent
+        // Search within 16 blocks for portal frames
+        ivec3 searchCenter = ivec3(floor(pos.xyz));
+
+        for (int dx = -16; dx <= 16 && !portalRoomFound; dx += 4) {
+            for (int dz = -16; dz <= 16 && !portalRoomFound; dz += 4) {
+                for (int dy = -8; dy <= 8 && !portalRoomFound; dy += 4) {
+                    ivec3 checkPos = searchCenter + ivec3(dx, dy, dz);
+                    uint eyesMask = checkPortalRoom(dimension, checkPos);
+
+                    if (eyesMask != 0xFFFFFFFFu) {
+                        // Found a portal room structure
+                        portalRoomFound = true;
+                        eyesPlaced = countEyes(eyesMask);
+                        eyesNeeded = 12u - eyesPlaced;
+                        portalActive = (eyesPlaced == 12u);
+
+                        // Register this room
+                        if (dimension == DIM_OVERWORLD) {
+                            uint roomIdx = atomicAdd(portalRoomHeader.x, 1u);
+                            if (roomIdx < pc.maxPortalRooms) {
+                                portalRooms[roomIdx] = ivec4(checkPos.x, checkPos.y, checkPos.z,
+                                    int((eyesMask & 0xFFFFu) | ((portalActive ? 1u : 0u) << 16) | 0xFF000000u));
+                            }
+                        }
+
+                        writeEvent(idx, EVENT_PORTAL_ROOM_FOUND, checkPos);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Update agent state
+    state.y = portalRoomFound ? 1u : 0u;
+    state.z = eyesPlaced;
+    state.w = portalActive ? 1u : 0u;
+    agentState[idx] = state;
+
+    // Write observation
+    portalObs[idx] = vec4(
+        portalRoomFound ? 1.0 : 0.0,
+        float(eyesNeeded),
+        float(eyesPlaced),
+        portalActive ? 1.0 : 0.0
+    );
+}

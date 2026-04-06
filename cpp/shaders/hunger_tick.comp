@@ -1,0 +1,104 @@
+#version 450
+
+// Minecraft 1.8.9 hunger/exhaustion mechanics
+// Exhaustion accumulates from actions, depletes saturation, then food
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Player survival state buffer
+layout(std430, set = 0, binding = 0) buffer PlayerSurvivalBuffer {
+    float health[];         // Current health (0-20)
+} health_buf;
+
+layout(std430, set = 0, binding = 1) buffer MaxHealthBuffer {
+    float max_health[];     // Maximum health (default 20)
+} max_health_buf;
+
+layout(std430, set = 0, binding = 2) buffer FoodLevelBuffer {
+    float food_level[];     // Food points (0-20)
+} food_buf;
+
+layout(std430, set = 0, binding = 3) buffer SaturationBuffer {
+    float saturation[];     // Saturation (0 to food_level)
+} saturation_buf;
+
+layout(std430, set = 0, binding = 4) buffer ExhaustionBuffer {
+    float exhaustion[];     // Exhaustion accumulator
+} exhaustion_buf;
+
+// Exhaustion delta input (accumulated this tick from movement, actions, etc.)
+layout(std430, set = 0, binding = 5) readonly buffer ExhaustionDeltaBuffer {
+    float exhaustion_delta[];
+} delta_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint player_count;
+    float tick_delta;       // Time since last tick (seconds), typically 0.05 for 20 TPS
+    uint game_difficulty;   // 0=peaceful, 1=easy, 2=normal, 3=hard
+} pc;
+
+// MC exhaustion thresholds
+const float EXHAUSTION_THRESHOLD = 4.0;  // Exhaustion needed to deplete 1 saturation/food
+const float STARVATION_RATE = 0.5;       // Health loss per second when starving (hard mode)
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.player_count) return;
+
+    // Peaceful mode: no hunger depletion, auto-restore
+    if (pc.game_difficulty == 0) {
+        food_buf.food_level[idx] = 20.0;
+        saturation_buf.saturation[idx] = 5.0;
+        exhaustion_buf.exhaustion[idx] = 0.0;
+        return;
+    }
+
+    float food = food_buf.food_level[idx];
+    float saturation = saturation_buf.saturation[idx];
+    float exhaustion = exhaustion_buf.exhaustion[idx];
+
+    // Add exhaustion from this tick's actions
+    exhaustion += delta_buf.exhaustion_delta[idx];
+
+    // Process exhaustion into saturation/food depletion
+    while (exhaustion >= EXHAUSTION_THRESHOLD) {
+        exhaustion -= EXHAUSTION_THRESHOLD;
+
+        if (saturation > 0.0) {
+            // Deplete saturation first
+            saturation = max(0.0, saturation - 1.0);
+        } else if (food > 0.0) {
+            // Then deplete food level
+            food = max(0.0, food - 1.0);
+        }
+    }
+
+    // Starvation damage (when food = 0)
+    if (food <= 0.0) {
+        float current_health = health_buf.health[idx];
+        float min_health;
+
+        // Difficulty determines minimum health from starvation
+        // Easy: stops at 10 HP, Normal: stops at 1 HP, Hard: can kill
+        if (pc.game_difficulty == 1) {
+            min_health = 10.0;
+        } else if (pc.game_difficulty == 2) {
+            min_health = 1.0;
+        } else {
+            min_health = 0.0;  // Hard mode: starvation can kill
+        }
+
+        if (current_health > min_health) {
+            float damage = STARVATION_RATE * pc.tick_delta;
+            health_buf.health[idx] = max(min_health, current_health - damage);
+        }
+    }
+
+    // Clamp saturation to not exceed food level (MC invariant)
+    saturation = min(saturation, food);
+
+    // Write back
+    food_buf.food_level[idx] = food;
+    saturation_buf.saturation[idx] = saturation;
+    exhaustion_buf.exhaustion[idx] = exhaustion;
+}

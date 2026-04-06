@@ -1,0 +1,511 @@
+# yaml-language-server: $schema=
+# minecraft_sim Completion Tasks
+# Generated: January 24, 2026
+# Target: Fix 5 test failures + complete stage integration
+
+tasks:
+  # =============================================================================
+  # PRIORITY 0: Fix Test Failures (5 failures → 0)
+  # =============================================================================
+
+  - name: fix-nether-state-tracking
+    prompt: |
+      Fix the Nether state tracking issue in contrib/minecraft_sim/python/minecraft_sim/stage_envs.py.
+
+      **Problem:** Tests expect `_build_snapshot()` to update `_stage_state["in_nether"]` when obs[12] > 0.5, but the update logic is only in `_shape_reward()`.
+
+      **Failing tests:**
+      - tests/test_stage3_nether.py::TestStageStateNetherEntry::test_in_nether_set_on_dimension_indicator
+      - tests/test_stage3_nether.py::TestStageStateNetherEntry::test_in_nether_remains_true_after_cleared
+      - tests/test_stage3_nether.py::TestStageStateFullProgression::test_full_nether_progression
+      - tests/test_stage3_nether.py::TestStageStateFullProgression::test_snapshot_values_match_stage_state
+
+      **Fix:** In NetherNavigationEnv._build_snapshot(), add logic to update self._stage_state["in_nether"]:
+      ```python
+      def _build_snapshot(self, obs: NDArray[np.float32]) -> dict[str, Any]:
+          # ... existing code ...
+          
+          # Update stage state for nether entry (persistent flag)
+          if obs.size > 12 and obs[12] > 0.5 and not self._stage_state["in_nether"]:
+              self._stage_state["in_nether"] = True
+          
+          # ... rest of method
+      ```
+
+      Look for _build_snapshot around line 712 in stage_envs.py.
+      Run: `cd contrib/minecraft_sim && uv run pytest tests/test_stage3_nether.py::TestStageStateNetherEntry -v`
+    priority: P0
+
+  - name: fix-reward-bounds
+    prompt: |
+      Fix the reward bounds issue in Stage 4 (Stronghold Finding) environment.
+
+      **Problem:** Test expects min_reward > -10.0 but actual rewards reach -50.0.
+
+      **Failing test:**
+      - tests/test_stage4_stronghold.py::TestRewardPolicyConsistency::test_reward_bounded_by_policy
+
+      **File:** contrib/minecraft_sim/python/minecraft_sim/stage_envs.py (StrongholdFindingEnv class)
+
+      **Fix options:**
+      1. Clamp negative rewards in _shape_reward() to -10.0:
+         `reward = max(reward, -10.0)`
+      2. Or reduce death penalty from -50 to -10
+      3. Or adjust reward_scale to keep total within bounds
+
+      Look for StrongholdFindingEnv class and its _shape_reward method.
+      The death penalty should not exceed the test bound of -10.0.
+
+      Run: `cd contrib/minecraft_sim && uv run pytest tests/test_stage4_stronghold.py::TestRewardPolicyConsistency -v`
+    priority: P0
+    dependencies:
+      - fix-nether-state-tracking
+
+  - name: verify-test-fixes
+    prompt: |
+      Verify all 5 test failures are fixed.
+
+      Run the full test suite to confirm:
+      ```bash
+      cd minecraft_sim
+      uv run pytest tests/ -q --ignore=tests/integration
+      ```
+
+      Expected: 1215 passed, 0 failed (was 1210 passed, 5 failed)
+
+      If any tests still fail, debug and fix them.
+      Update contrib/minecraft_sim/STATUS.md test count if all pass.
+    priority: P0
+    dependencies:
+      - fix-reward-bounds
+
+  # =============================================================================
+  # PRIORITY 1: Dimension Transitions (Roadmap Phase 2)
+  # =============================================================================
+
+  - name: dimension-transition-state
+    prompt: |
+      Implement dimension transition state management in minecraft_sim.
+
+      **Current state:** Nether/End transitions are limited.
+
+      **Goal:** Support full state preservation during dimension changes:
+      1. Overworld → Nether (nether portal)
+      2. Nether → Overworld (return portal)
+      3. Overworld → End (end portal)
+      4. End → Overworld (dragon death/portal)
+
+      **Files to modify:**
+      - contrib/minecraft_sim/python/minecraft_sim/speedrun_env.py
+      - contrib/minecraft_sim/python/minecraft_sim/stage_envs.py
+
+      **Implementation:**
+      1. Add dimension enum: OVERWORLD=0, NETHER=1, END=2
+      2. Add _current_dimension state variable
+      3. Detect dimension changes from observation vector
+      4. Preserve inventory/position state across transitions
+      5. Reset stage-appropriate state on dimension entry
+
+      Reference the obs layout in README.md for dimension indicators.
+    priority: P1
+    dependencies:
+      - verify-test-fixes
+
+  - name: stage-shader-dispatch
+    prompt: |
+      Wire stage-specific shader dispatch in the curriculum system.
+
+      **Goal:** Each stage (1-6) should load only the shaders it needs.
+
+      **Files:**
+      - contrib/minecraft_sim/python/minecraft_sim/curriculum.py
+      - contrib/minecraft_sim/cpp/src/mc189_simulator.cpp
+
+      **Shader groups per stage:**
+      - Stage 1 Basic Survival: overworld_gen, block_breaking, resource_detection
+      - Stage 2 Resource Gathering: furnace_tick, item_physics, block_updates  
+      - Stage 3 Nether Navigation: nether_gen, fortress_gen, mob_ai_ghast, mob_ai_blaze
+      - Stage 4 Enderman Hunting: mob_ai_enderman_full, enderman_spawning
+      - Stage 5 Stronghold Finding: stronghold_gen, decoration
+      - Stage 6 Dragon Fight: dragon_fight_mvk, dragon_ai_full, end_terrain
+
+      Add a shader_set parameter to stage configuration.
+    priority: P1
+    dependencies:
+      - dimension-transition-state
+
+  # =============================================================================
+  # PRIORITY 2: World State Management (Roadmap Phase 3)
+  # =============================================================================
+
+  - name: persistent-inventory
+    prompt: |
+      Implement persistent inventory state across stage transitions.
+
+      **Goal:** Inventory should persist when moving between stages or dimensions.
+
+      **Current issue:** Inventory resets on stage transitions.
+
+      **Files:**
+      - contrib/minecraft_sim/python/minecraft_sim/speedrun_env.py
+      - contrib/minecraft_sim/python/minecraft_sim/progression.py
+
+      **Implementation:**
+      1. Add inventory_state dict to SpeedrunEnv
+      2. On stage transition, serialize current inventory
+      3. On new stage init, restore inventory state
+      4. Key items to track: pickaxe, sword, armor, pearls, rods, eyes
+
+      Ensure SB3 wrapper preserves the reset semantics.
+    priority: P2
+    dependencies:
+      - stage-shader-dispatch
+
+  # =============================================================================
+  # PRIORITY 3: Documentation & Polish
+  # =============================================================================
+
+  - name: update-roadmap-checkboxes
+    prompt: |
+      Update the README.md roadmap to reflect completed items.
+
+      **File:** contrib/minecraft_sim/README.md
+
+      After the previous tasks complete, update the roadmap section:
+      ```markdown
+      ### Phase 1: Shader Compilation ✅
+      - [x] Core dragon fight shaders
+      - [x] Fixed reserved word issues
+      - [x] dragon_breath.comp atomicSub compatibility
+
+      ### Phase 2: Stage Integration ✅
+      - [x] Wire CurriculumManager to mc189_core
+      - [x] Stage-specific shader dispatch
+      - [x] Dimension transitions
+
+      ### Phase 3: World State Management ✅
+      - [x] Persistent inventory
+      ```
+
+      Also update STATUS.md Remaining Issues table to show fixes.
+    priority: P3
+    dependencies:
+      - persistent-inventory
+
+  # =============================================================================
+  # DOCUMENTATION: Comprehensive Docs Suite
+  # =============================================================================
+
+  - name: docs-update-throughput-numbers
+    prompt: |
+      Update all documentation with correct throughput benchmarks.
+
+      **Actual benchmarks (Apple M4 Max, January 2026):**
+      - 64 environments: ~264,000 steps/sec
+      - 256 environments: ~615,000 steps/sec
+      - MineRL comparison: 4,400× speedup (not 800×)
+
+      **Files to update:**
+      1. contrib/minecraft_sim/docs/training_guide.md - hardware table shows old numbers
+      2. contrib/minecraft_sim/docs/ARCHITECTURE.md - mentions 48K+ steps/sec
+      3. Any other docs referencing throughput
+
+      Search for "48,000", "48K", "85,000", "85K", "800×" and update to correct values.
+    priority: P1
+    dependencies:
+      - verify-test-fixes
+
+  - name: docs-quickstart-by-the-numbers
+    prompt: |
+      Create a "By The Numbers" quickstart tutorial at contrib/minecraft_sim/docs/quickstart_by_numbers.md
+
+      **Target audience:** Developer who wants working code in 5 minutes.
+
+      **Structure:**
+      ```markdown
+      # Quickstart: Dragon Fight in 5 Minutes
+
+      ## Prerequisites (1 minute)
+      - Python 3.12
+      - uv package manager
+      - macOS with MoltenVK or Linux with Vulkan
+
+      ## Install (1 minute)
+      ```bash
+      cd minecraft_sim
+      uv sync
+      export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+      ```
+
+      ## Run Your First Environment (1 minute)
+      ```python
+      from minecraft_sim import VecDragonFightEnv
+      env = VecDragonFightEnv(num_envs=64)
+      obs = env.reset()
+      for _ in range(1000):
+          obs, rewards, dones, infos = env.step(np.zeros(64, dtype=np.int32))
+      env.close()
+      print("Success!")
+      ```
+
+      ## Train a PPO Agent (2 minutes)
+      ```python
+      from minecraft_sim import SB3VecDragonFightEnv
+      from stable_baselines3 import PPO
+      env = SB3VecDragonFightEnv(num_envs=64)
+      model = PPO("MlpPolicy", env, verbose=1)
+      model.learn(total_timesteps=100_000)
+      model.save("dragon_ppo")
+      ```
+
+      ## Key Numbers
+      | Metric | Value |
+      |--------|-------|
+      | Throughput | 264K steps/sec |
+      | Observation dim | 48 |
+      | Actions | 17 |
+      | Episode length | ~2000 steps |
+      ```
+
+      Keep it SHORT. No theory, just working commands.
+    priority: P1
+    dependencies:
+      - docs-update-throughput-numbers
+
+  - name: docs-advanced-training-tutorial
+    prompt: |
+      Create an advanced tutorial at contrib/minecraft_sim/docs/tutorial_advanced_training.md
+
+      **Target audience:** ML researcher wanting to understand the full system.
+
+      **Structure (aim for 2000+ words):**
+
+      ## 1. Understanding the Observation Space
+      - Full breakdown of all 48 dimensions
+      - How to interpret dragon_phase, crystal_count, can_hit
+      - Normalization ranges and raw value mappings
+      - Code examples for decoding observations
+
+      ## 2. Action Space Deep Dive
+      - All 17 actions with precise effects
+      - Movement math: how FORWARD combines with yaw
+      - Attack timing: perch detection, look-up angle
+      - Composite actions: JUMP_FORWARD, ATTACK_FORWARD
+
+      ## 3. Reward Engineering
+      - Default reward structure
+      - How to modify rewards in stage_envs.py
+      - Reward shaping for faster learning
+      - Curriculum bonus patterns
+
+      ## 4. Curriculum Learning Setup
+      - CurriculumManager configuration
+      - Stage promotion criteria
+      - Snapshot/checkpoint integration
+      - Multi-stage training loop
+
+      ## 5. Hyperparameter Reference
+      - PPO settings that work
+      - Learning rate schedules
+      - Batch size vs throughput tradeoffs
+      - Entropy coefficient tuning
+
+      ## 6. Debugging Training
+      - TensorBoard metrics to watch
+      - Common failure modes
+      - Reward collapse diagnosis
+      - Episode length patterns
+
+      Include full code examples throughout.
+    priority: P2
+    dependencies:
+      - docs-quickstart-by-the-numbers
+
+  - name: docs-full-speedrun-tutorial
+    prompt: |
+      Create a full speedrun training tutorial at contrib/minecraft_sim/docs/tutorial_full_speedrun.md
+
+      **Target:** Train an agent through all 6 stages from spawn to dragon kill.
+
+      **Structure:**
+
+      ## Overview
+      - What "Free The End" means
+      - The 6 stages and their challenges
+      - Expected training time (~24-48 hours on M4 Max)
+
+      ## Stage-by-Stage Setup
+
+      ### Stage 1: Basic Survival
+      - Environment: BasicSurvivalEnv
+      - Goal: Survive 5 minutes, gather wood
+      - Key observations: health, hunger, nearby_blocks
+      - Suggested reward shaping
+
+      ### Stage 2: Resource Gathering
+      - Goal: Craft iron pickaxe, gather obsidian
+      - Inventory management
+      - Crafting action space
+
+      ### Stage 3: Nether Navigation
+      - Goal: Find fortress, kill blazes
+      - Dimension transition handling
+      - Ghast/blaze combat
+
+      ### Stage 4: Enderman Hunting
+      - Goal: Collect 12 ender pearls
+      - Pumpkin helmet strategy
+      - Water bucket traps
+
+      ### Stage 5: Stronghold Finding
+      - Goal: Locate stronghold, fill portal
+      - Eye of ender mechanics
+      - Frame filling logic
+
+      ### Stage 6: Dragon Fight
+      - Goal: Kill the Ender Dragon
+      - Crystal destruction priority
+      - Perch timing attacks
+
+      ## Full Training Script
+      Complete working Python script for 6-stage curriculum training.
+
+      ## Checkpointing Strategy
+      How to save/resume multi-day training runs.
+    priority: P2
+    dependencies:
+      - docs-advanced-training-tutorial
+
+  - name: docs-api-reference-complete
+    prompt: |
+      Expand contrib/minecraft_sim/docs/api.md with complete API reference.
+
+      **Current state:** Partial documentation exists.
+
+      **Required sections:**
+
+      ## Environments
+      - VecDragonFightEnv (full constructor args)
+      - SB3VecDragonFightEnv
+      - SpeedrunEnv
+      - All 6 stage environments (BasicSurvivalEnv, ResourceGatheringEnv, etc.)
+
+      ## Configuration Classes
+      - SimulatorConfig (all fields)
+      - StageConfig
+      - CurriculumConfig
+
+      ## Observation/Action Spaces
+      - Full observation index table
+      - Action enum with descriptions
+      - Normalization constants
+
+      ## Reward Functions
+      - Default reward function
+      - Stage-specific modifiers
+      - Configurable parameters
+
+      ## Low-Level API
+      - mc189_core.MC189Simulator
+      - Shader loading
+      - Buffer management
+
+      Use proper docstring format with type hints.
+    priority: P2
+    dependencies:
+      - docs-advanced-training-tutorial
+
+  - name: docs-troubleshooting-guide
+    prompt: |
+      Create contrib/minecraft_sim/docs/troubleshooting.md
+
+      **Common issues and solutions:**
+
+      ## Installation Issues
+
+      ### "VK_ICD_FILENAMES not set"
+      - Symptom: Vulkan initialization fails
+      - Fix: export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+
+      ### "mc189_core not found"
+      - Symptom: ImportError on import
+      - Fix: Build and copy .so file to python/minecraft_sim/
+
+      ### "Python version mismatch"
+      - Symptom: ImportError with ABI mismatch
+      - Fix: Use Python 3.12, not 3.14
+
+      ## Runtime Issues
+
+      ### "Low throughput"
+      - Check GPU utilization
+      - Reduce num_envs if memory-bound
+      - Verify shader compilation
+
+      ### "NaN in observations"
+      - Check for division by zero in reward shaping
+      - Validate environment reset
+
+      ### "Agent stuck in death loop"
+      - Reward clipping needed
+      - Death penalty too high
+      - Add survival bonus
+
+      ## Training Issues
+
+      ### "Reward collapse to zero"
+      - Learning rate too high
+      - Entropy coefficient too low
+      - Not enough exploration
+
+      ### "Episode length not decreasing"
+      - Check success condition
+      - Verify milestone rewards
+      - Add intermediate rewards
+
+      Include diagnostic commands for each issue.
+    priority: P2
+    dependencies:
+      - docs-quickstart-by-the-numbers
+
+  - name: docs-shader-reference
+    prompt: |
+      Create contrib/minecraft_sim/docs/shader_reference.md documenting all 79 shaders.
+
+      **Structure:**
+
+      ## Shader Groups
+
+      ### Core Simulation
+      | Shader | Purpose | Input | Output |
+      |--------|---------|-------|--------|
+      | dragon_fight_mvk | Main dragon fight | state buffer | obs/reward |
+      | batch_step | Parallel step | actions | next_state |
+      | batch_reset | Environment reset | seed | initial_state |
+
+      ### World Generation
+      | Shader | Stage | Description |
+      |--------|-------|-------------|
+      | overworld_gen | 1-2 | Terrain generation |
+      | nether_gen | 3 | Nether terrain |
+      | fortress_gen | 3 | Fortress structures |
+      ...
+
+      ### Combat
+      | Shader | Description |
+      |--------|-------------|
+      | dragon_knockback | Dragon attack physics |
+      | crystal_tick | Crystal healing |
+      ...
+
+      ## Shader Compilation
+      How to modify and recompile shaders:
+      ```bash
+      glslc -o shader.spv shader.comp --target-env=vulkan1.0
+      ```
+
+      ## Adding New Shaders
+      Step-by-step guide for adding a new compute shader.
+    priority: P3
+    dependencies:
+      - docs-api-reference-complete

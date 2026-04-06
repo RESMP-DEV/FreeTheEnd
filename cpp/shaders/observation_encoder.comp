@@ -1,0 +1,515 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Observation Encoder Compute Shader
+// Encodes raw Minecraft game state into 256-float normalized observation vector
+// for RL agent consumption
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Observation layout offsets
+const uint OBS_PLAYER_STATE_OFFSET = 0;      // [0-31]
+const uint OBS_INVENTORY_OFFSET = 32;         // [32-63]
+const uint OBS_ENVIRONMENT_OFFSET = 64;       // [64-127]
+const uint OBS_GOALS_OFFSET = 128;            // [128-191]
+const uint OBS_DRAGON_OFFSET = 192;           // [192-223]
+const uint OBS_DIMENSION_PORTAL_OFFSET = 224; // [224-255]
+
+// Normalization constants
+const float WORLD_BOUND = 30000000.0;  // Minecraft world limit
+const float MAX_VELOCITY = 100.0;       // Max reasonable velocity
+const float MAX_HEALTH = 20.0;
+const float MAX_HUNGER = 20.0;
+const float MAX_ARMOR = 20.0;
+const float MAX_XP_LEVEL = 30.0;
+const float MAX_ITEM_ID = 512.0;
+const float MAX_STACK_SIZE = 64.0;
+const float MAX_MOB_DISTANCE = 64.0;
+const float MAX_PORTAL_DISTANCE = 256.0;
+const float MAX_OBJECTIVE_DISTANCE = 1024.0;
+const float MAX_FIRE_TICKS = 300.0;
+
+// Dragon constants
+const float MAX_DRAGON_HEALTH = 200.0;
+const float MAX_CRYSTALS = 10.0;
+const float MAX_CRYSTAL_DISTANCE = 128.0;
+
+// Item IDs for key inventory items
+const uint ITEM_WOOD = 17;
+const uint ITEM_PLANKS = 5;
+const uint ITEM_COBBLESTONE = 4;
+const uint ITEM_IRON_INGOT = 265;
+const uint ITEM_DIAMOND = 264;
+const uint ITEM_COAL = 263;
+const uint ITEM_BLAZE_ROD = 369;
+const uint ITEM_ENDER_PEARL = 368;
+const uint ITEM_EYE_OF_ENDER = 381;
+const uint ITEM_ARROW = 262;
+const uint ITEM_BED = 355;
+const uint ITEM_BUCKET = 325;
+
+// Dimension IDs
+const uint DIM_OVERWORLD = 0;
+const uint DIM_NETHER = 1;
+const uint DIM_END = 2;
+
+// Dragon states (one-hot indices)
+const uint DRAGON_STATE_IDLE = 0;
+const uint DRAGON_STATE_CHARGING = 1;
+const uint DRAGON_STATE_STRAFING = 2;
+const uint DRAGON_STATE_LANDING = 3;
+const uint DRAGON_STATE_PERCHED = 4;
+const uint DRAGON_STATE_DYING = 5;
+
+// ============================================================================
+// INPUT STRUCTURES
+// ============================================================================
+
+struct PlayerState {
+    vec3 position;
+    vec3 velocity;
+    float pitch;
+    float yaw;
+    float health;
+    float hunger;
+    float armor;
+    float xp_level;
+    uint flags;  // Bit flags for boolean states
+    float fire_ticks;
+    uint status_effects;  // Bit flags for status effects
+};
+
+struct InventorySlot {
+    uint item_id;
+    uint count;
+};
+
+struct MobInfo {
+    uint mob_type;
+    vec3 position;
+    float health;
+};
+
+struct BlockInfo {
+    uint block_id;
+    vec3 position;
+};
+
+struct GoalProgress {
+    float stage_progress[8];
+};
+
+struct DragonState {
+    bool exists;
+    float health;
+    vec3 position;
+    uint state;
+    bool is_perched;
+    uint crystals_remaining;
+    vec3 nearest_crystal_pos;
+};
+
+struct PortalInfo {
+    uint current_dimension;
+    vec3 nearest_portal_pos;
+    float portal_cooldown;
+    bool in_portal;
+    bool stronghold_found;
+    vec3 stronghold_pos;
+    uint end_portal_eyes;
+};
+
+// ============================================================================
+// BUFFER BINDINGS
+// ============================================================================
+
+layout(std430, binding = 0) readonly buffer PlayerStateBuffer {
+    PlayerState player;
+};
+
+layout(std430, binding = 1) readonly buffer InventoryBuffer {
+    InventorySlot hotbar[9];
+    InventorySlot main_inventory[27];
+    InventorySlot armor_slots[4];
+};
+
+layout(std430, binding = 2) readonly buffer EnvironmentBuffer {
+    BlockInfo nearby_blocks[27];  // 3x3x3 around player
+    MobInfo nearby_mobs[16];      // 16 nearest mobs
+    float light_level;
+    float time_of_day;            // 0-24000 ticks normalized
+    uint biome_id;
+    uint dimension;
+};
+
+layout(std430, binding = 3) readonly buffer GoalBuffer {
+    uint current_stage;           // 0-5 for 6 stages
+    GoalProgress stage_1;         // Early game
+    GoalProgress stage_2;         // Resource gathering
+    GoalProgress stage_3;         // Nether
+    GoalProgress stage_4;         // Pearl hunting
+    GoalProgress stage_5;         // Stronghold
+    GoalProgress stage_6;         // Dragon fight
+    vec2 objective_direction;
+    float objective_distance;
+};
+
+layout(std430, binding = 4) readonly buffer DragonBuffer {
+    DragonState dragon;
+};
+
+layout(std430, binding = 5) readonly buffer PortalBuffer {
+    PortalInfo portal;
+};
+
+layout(std430, binding = 6) writeonly buffer ObservationBuffer {
+    float observation[256];
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+float normalize_pos(float val) {
+    return clamp(val / WORLD_BOUND, -1.0, 1.0);
+}
+
+float normalize_vel(float val) {
+    return clamp(val / MAX_VELOCITY, -1.0, 1.0);
+}
+
+float normalize_angle(float val) {
+    // Normalize angle from -180..180 to -1..1
+    return clamp(val / 180.0, -1.0, 1.0);
+}
+
+float normalize_0_1(float val, float max_val) {
+    return clamp(val / max_val, 0.0, 1.0);
+}
+
+float flag_to_float(uint flags, uint bit) {
+    return ((flags & (1u << bit)) != 0u) ? 1.0 : 0.0;
+}
+
+vec2 direction_to_target(vec3 player_pos, vec3 target_pos) {
+    vec3 delta = target_pos - player_pos;
+    float dist = length(delta.xz);
+    if (dist < 0.001) return vec2(0.0);
+    return normalize(delta.xz);
+}
+
+float distance_to_target(vec3 player_pos, vec3 target_pos) {
+    return length(target_pos - player_pos);
+}
+
+// Count items in inventory
+uint count_item(uint target_id) {
+    uint total = 0;
+    for (int i = 0; i < 9; i++) {
+        if (hotbar[i].item_id == target_id) {
+            total += hotbar[i].count;
+        }
+    }
+    for (int i = 0; i < 27; i++) {
+        if (main_inventory[i].item_id == target_id) {
+            total += main_inventory[i].count;
+        }
+    }
+    return total;
+}
+
+// ============================================================================
+// ENCODER FUNCTIONS
+// ============================================================================
+
+void encode_player_state(uint base_idx) {
+    // Positions [0-2]
+    observation[base_idx + 0] = normalize_pos(player.position.x);
+    observation[base_idx + 1] = normalize_pos(player.position.y);
+    observation[base_idx + 2] = normalize_pos(player.position.z);
+
+    // Velocities [3-5]
+    observation[base_idx + 3] = normalize_vel(player.velocity.x);
+    observation[base_idx + 4] = normalize_vel(player.velocity.y);
+    observation[base_idx + 5] = normalize_vel(player.velocity.z);
+
+    // Orientation [6-7]
+    observation[base_idx + 6] = normalize_angle(player.pitch);
+    observation[base_idx + 7] = normalize_angle(player.yaw);
+
+    // Status [8-12]
+    observation[base_idx + 8] = normalize_0_1(player.health, MAX_HEALTH);
+    observation[base_idx + 9] = normalize_0_1(player.hunger, MAX_HUNGER);
+    observation[base_idx + 10] = normalize_0_1(player.armor, MAX_ARMOR);
+    observation[base_idx + 11] = normalize_0_1(player.xp_level, MAX_XP_LEVEL);
+
+    // Boolean states [12-20] - packed in flags
+    // Bit 0: is_sprinting, 1: is_sneaking, 2: is_jumping
+    // Bit 3: is_on_ground, 4: is_in_water, 5: is_in_lava
+    // Bit 6: is_burning
+    observation[base_idx + 12] = flag_to_float(player.flags, 0); // is_sprinting
+    observation[base_idx + 13] = flag_to_float(player.flags, 1); // is_sneaking
+    observation[base_idx + 14] = flag_to_float(player.flags, 2); // is_jumping
+    observation[base_idx + 15] = flag_to_float(player.flags, 3); // is_on_ground
+    observation[base_idx + 16] = flag_to_float(player.flags, 4); // is_in_water
+    observation[base_idx + 17] = flag_to_float(player.flags, 5); // is_in_lava
+    observation[base_idx + 18] = flag_to_float(player.flags, 6); // is_burning
+
+    // Fire ticks [19]
+    observation[base_idx + 19] = normalize_0_1(player.fire_ticks, MAX_FIRE_TICKS);
+
+    // Status effects [20-25] - 6 effects
+    // Bit 0: speed, 1: strength, 2: resistance, 3: fire_resistance, 4: regeneration, 5: absorption
+    for (int i = 0; i < 6; i++) {
+        observation[base_idx + 20 + i] = flag_to_float(player.status_effects, uint(i));
+    }
+
+    // Padding [26-31] - reserved for future use
+    for (int i = 26; i < 32; i++) {
+        observation[base_idx + i] = 0.0;
+    }
+}
+
+void encode_inventory(uint base_idx) {
+    // Hotbar item IDs [0-8]
+    for (int i = 0; i < 9; i++) {
+        observation[base_idx + i] = normalize_0_1(float(hotbar[i].item_id), MAX_ITEM_ID);
+    }
+
+    // Hotbar counts [9-17]
+    for (int i = 0; i < 9; i++) {
+        observation[base_idx + 9 + i] = normalize_0_1(float(hotbar[i].count), MAX_STACK_SIZE);
+    }
+
+    // Key item counts [18-31] - 14 items
+    observation[base_idx + 18] = normalize_0_1(float(count_item(ITEM_WOOD)), MAX_STACK_SIZE);
+    observation[base_idx + 19] = normalize_0_1(float(count_item(ITEM_PLANKS)), MAX_STACK_SIZE);
+    observation[base_idx + 20] = normalize_0_1(float(count_item(ITEM_COBBLESTONE)), MAX_STACK_SIZE);
+    observation[base_idx + 21] = normalize_0_1(float(count_item(ITEM_IRON_INGOT)), MAX_STACK_SIZE);
+    observation[base_idx + 22] = normalize_0_1(float(count_item(ITEM_DIAMOND)), MAX_STACK_SIZE);
+    observation[base_idx + 23] = normalize_0_1(float(count_item(ITEM_COAL)), MAX_STACK_SIZE);
+    observation[base_idx + 24] = normalize_0_1(float(count_item(ITEM_BLAZE_ROD)), MAX_STACK_SIZE);
+    observation[base_idx + 25] = normalize_0_1(float(count_item(ITEM_ENDER_PEARL)), MAX_STACK_SIZE);
+    observation[base_idx + 26] = normalize_0_1(float(count_item(ITEM_EYE_OF_ENDER)), MAX_STACK_SIZE);
+
+    // Food total - approximate by counting common food items
+    // For simplicity, just estimate based on hunger recovery potential
+    observation[base_idx + 27] = normalize_0_1(player.hunger, MAX_HUNGER); // placeholder
+
+    observation[base_idx + 28] = normalize_0_1(float(count_item(ITEM_ARROW)), MAX_STACK_SIZE);
+    observation[base_idx + 29] = normalize_0_1(float(count_item(ITEM_BED)), 16.0);
+    observation[base_idx + 30] = normalize_0_1(float(count_item(ITEM_BUCKET)), 16.0);
+
+    // Padding [31]
+    observation[base_idx + 31] = 0.0;
+}
+
+void encode_environment(uint base_idx) {
+    // Nearby blocks 3x3x3 = 27 values [0-26]
+    // Encode as normalized block ID
+    for (int i = 0; i < 27; i++) {
+        observation[base_idx + i] = normalize_0_1(float(nearby_blocks[i].block_id), 256.0);
+    }
+
+    // Nearby mobs [27-58] - 16 mobs x 2 values (type+distance normalized, angle encoded)
+    // Actually using: type (normalized), distance (normalized), angle_x, angle_z for each
+    // But we have 37 floats left (64-27=37), so 16 mobs * 2 = 32, leaving 5 for env
+    for (int i = 0; i < 16; i++) {
+        uint mob_idx = base_idx + 27 + i * 2;
+        MobInfo mob = nearby_mobs[i];
+
+        // Mob type normalized (0 = no mob, otherwise mob_type / 128)
+        observation[mob_idx + 0] = normalize_0_1(float(mob.mob_type), 128.0);
+
+        // Distance to mob, normalized
+        float dist = distance_to_target(player.position, mob.position);
+        observation[mob_idx + 1] = normalize_0_1(dist, MAX_MOB_DISTANCE);
+    }
+
+    // Environment info [59-63]
+    observation[base_idx + 59] = normalize_0_1(light_level, 15.0);
+    observation[base_idx + 60] = (time_of_day < 12000.0) ? 1.0 : 0.0; // is_day
+    observation[base_idx + 61] = normalize_0_1(time_of_day, 24000.0);
+    observation[base_idx + 62] = normalize_0_1(float(biome_id), 128.0);
+    observation[base_idx + 63] = normalize_0_1(float(dimension), 2.0);
+}
+
+void encode_goals(uint base_idx) {
+    // Current stage one-hot [0-5]
+    for (uint i = 0; i < 6; i++) {
+        observation[base_idx + i] = (current_stage == i) ? 1.0 : 0.0;
+    }
+
+    // Stage 1 progress [6-13]
+    for (int i = 0; i < 8; i++) {
+        observation[base_idx + 6 + i] = clamp(stage_1.stage_progress[i], 0.0, 1.0);
+    }
+
+    // Stage 2 progress [14-21]
+    for (int i = 0; i < 8; i++) {
+        observation[base_idx + 14 + i] = clamp(stage_2.stage_progress[i], 0.0, 1.0);
+    }
+
+    // Stage 3 progress [22-29]
+    for (int i = 0; i < 8; i++) {
+        observation[base_idx + 22 + i] = clamp(stage_3.stage_progress[i], 0.0, 1.0);
+    }
+
+    // Stage 4 progress [30-37]
+    for (int i = 0; i < 8; i++) {
+        observation[base_idx + 30 + i] = clamp(stage_4.stage_progress[i], 0.0, 1.0);
+    }
+
+    // Stage 5 progress [38-45]
+    for (int i = 0; i < 8; i++) {
+        observation[base_idx + 38 + i] = clamp(stage_5.stage_progress[i], 0.0, 1.0);
+    }
+
+    // Stage 6 progress [46-53]
+    for (int i = 0; i < 8; i++) {
+        observation[base_idx + 46 + i] = clamp(stage_6.stage_progress[i], 0.0, 1.0);
+    }
+
+    // Objective direction [54-55] - normalized vec2
+    observation[base_idx + 54] = clamp(objective_direction.x, -1.0, 1.0);
+    observation[base_idx + 55] = clamp(objective_direction.y, -1.0, 1.0);
+
+    // Objective distance [56]
+    observation[base_idx + 56] = normalize_0_1(objective_distance, MAX_OBJECTIVE_DISTANCE);
+
+    // Padding [57-63]
+    for (int i = 57; i < 64; i++) {
+        observation[base_idx + i] = 0.0;
+    }
+}
+
+void encode_dragon(uint base_idx) {
+    // Dragon existence and health [0-1]
+    observation[base_idx + 0] = dragon.exists ? 1.0 : 0.0;
+    observation[base_idx + 1] = normalize_0_1(dragon.health, MAX_DRAGON_HEALTH);
+
+    // Dragon position [2-4]
+    observation[base_idx + 2] = normalize_pos(dragon.position.x);
+    observation[base_idx + 3] = normalize_pos(dragon.position.y);
+    observation[base_idx + 4] = normalize_pos(dragon.position.z);
+
+    // Dragon state one-hot [5-10]
+    for (uint i = 0; i < 6; i++) {
+        observation[base_idx + 5 + i] = (dragon.state == i) ? 1.0 : 0.0;
+    }
+
+    // Dragon perched [11]
+    observation[base_idx + 11] = dragon.is_perched ? 1.0 : 0.0;
+
+    // Crystals remaining [12]
+    observation[base_idx + 12] = normalize_0_1(float(dragon.crystals_remaining), MAX_CRYSTALS);
+
+    // Nearest crystal direction [13-14]
+    vec2 crystal_dir = direction_to_target(player.position, dragon.nearest_crystal_pos);
+    observation[base_idx + 13] = crystal_dir.x;
+    observation[base_idx + 14] = crystal_dir.y;
+
+    // Nearest crystal distance [15]
+    float crystal_dist = distance_to_target(player.position, dragon.nearest_crystal_pos);
+    observation[base_idx + 15] = normalize_0_1(crystal_dist, MAX_CRYSTAL_DISTANCE);
+
+    // Player on island - determine if player is in End and near center
+    bool on_island = (dimension == DIM_END) &&
+                     (abs(player.position.x) < 100.0) &&
+                     (abs(player.position.z) < 100.0);
+    observation[base_idx + 16] = on_island ? 1.0 : 0.0;
+
+    // Padding [17-31]
+    for (int i = 17; i < 32; i++) {
+        observation[base_idx + i] = 0.0;
+    }
+}
+
+void encode_dimension_portal(uint base_idx) {
+    // Current dimension one-hot [0-2]
+    for (uint i = 0; i < 3; i++) {
+        observation[base_idx + i] = (portal.current_dimension == i) ? 1.0 : 0.0;
+    }
+
+    // Nearest portal direction [3-4]
+    vec2 portal_dir = direction_to_target(player.position, portal.nearest_portal_pos);
+    observation[base_idx + 3] = portal_dir.x;
+    observation[base_idx + 4] = portal_dir.y;
+
+    // Nearest portal distance [5]
+    float portal_dist = distance_to_target(player.position, portal.nearest_portal_pos);
+    observation[base_idx + 5] = normalize_0_1(portal_dist, MAX_PORTAL_DISTANCE);
+
+    // Portal cooldown [6]
+    observation[base_idx + 6] = normalize_0_1(portal.portal_cooldown, 80.0); // 4 second cooldown
+
+    // In portal [7]
+    observation[base_idx + 7] = portal.in_portal ? 1.0 : 0.0;
+
+    // Stronghold found [8]
+    observation[base_idx + 8] = portal.stronghold_found ? 1.0 : 0.0;
+
+    // Stronghold direction [9-10]
+    vec2 stronghold_dir = direction_to_target(player.position, portal.stronghold_pos);
+    observation[base_idx + 9] = stronghold_dir.x;
+    observation[base_idx + 10] = stronghold_dir.y;
+
+    // Stronghold distance [11]
+    float stronghold_dist = distance_to_target(player.position, portal.stronghold_pos);
+    observation[base_idx + 11] = normalize_0_1(stronghold_dist, MAX_OBJECTIVE_DISTANCE);
+
+    // End portal eyes placed [12]
+    observation[base_idx + 12] = normalize_0_1(float(portal.end_portal_eyes), 12.0);
+
+    // Padding [13-31]
+    for (int i = 13; i < 32; i++) {
+        observation[base_idx + i] = 0.0;
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Each thread handles one section based on index
+    // Workgroup size 256 means all 256 floats are written in parallel
+
+    if (idx < 32) {
+        // Player state [0-31]
+        if (idx == 0) {
+            encode_player_state(OBS_PLAYER_STATE_OFFSET);
+        }
+    } else if (idx < 64) {
+        // Inventory [32-63]
+        if (idx == 32) {
+            encode_inventory(OBS_INVENTORY_OFFSET);
+        }
+    } else if (idx < 128) {
+        // Environment [64-127]
+        if (idx == 64) {
+            encode_environment(OBS_ENVIRONMENT_OFFSET);
+        }
+    } else if (idx < 192) {
+        // Goals [128-191]
+        if (idx == 128) {
+            encode_goals(OBS_GOALS_OFFSET);
+        }
+    } else if (idx < 224) {
+        // Dragon [192-223]
+        if (idx == 192) {
+            encode_dragon(OBS_DRAGON_OFFSET);
+        }
+    } else {
+        // Dimension/Portal [224-255]
+        if (idx == 224) {
+            encode_dimension_portal(OBS_DIMENSION_PORTAL_OFFSET);
+        }
+    }
+}

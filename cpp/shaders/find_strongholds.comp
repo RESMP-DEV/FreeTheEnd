@@ -1,0 +1,177 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : require
+
+/*
+ * find_strongholds.comp - Minecraft 1.8.9 Stronghold Position Calculator
+ *
+ * Strongholds in MC 1.8.9 generate in 3 rings around (0,0):
+ * - Ring 1: 3 strongholds at 1280-2816 blocks from origin
+ * - Ring 2: 6 strongholds at 4352-5888 blocks from origin
+ * - Ring 3: 10 strongholds at 7424-8960 blocks from origin
+ *
+ * For speedrunning, only the first 3 strongholds (ring 1) matter.
+ * This shader computes positions for all seeds in parallel.
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Stronghold position output
+struct StrongholdData {
+    ivec2 positions[3];  // x, z coordinates for 3 strongholds
+    int valid;           // Bitmask of valid positions
+    int _pad;
+};
+
+layout(std430, binding = 0) buffer SeedBuffer {
+    int seeds[];
+};
+
+layout(std430, binding = 1) buffer StrongholdBuffer {
+    StrongholdData strongholds[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint seed_count;
+    uint seed_offset;
+} pc;
+
+// Java Random implementation (LCG) - requires 64-bit integers
+const int64_t JAVA_LCG_MULTIPLIER = 0x5DEECE66DL;
+const int64_t JAVA_LCG_ADDEND = 0xBL;
+const int64_t JAVA_LCG_MASK = (1L << 48) - 1;
+
+// Initialize Java Random with seed
+int64_t java_random_init(int64_t seed) {
+    return (seed ^ JAVA_LCG_MULTIPLIER) & JAVA_LCG_MASK;
+}
+
+// Advance the random state and return next 32 bits
+int java_random_next(inout int64_t state, int bits) {
+    state = (state * JAVA_LCG_MULTIPLIER + JAVA_LCG_ADDEND) & JAVA_LCG_MASK;
+    return int(state >> (48 - bits));
+}
+
+// nextInt(bound) - returns [0, bound)
+int java_random_next_int(inout int64_t state, int bound) {
+    if ((bound & (bound - 1)) == 0) {
+        // Power of 2 - fast path
+        return int((int64_t(bound) * int64_t(java_random_next(state, 31))) >> 31);
+    }
+
+    int bits, val;
+    do {
+        bits = java_random_next(state, 31);
+        val = bits % bound;
+    } while (bits - val + (bound - 1) < 0);
+
+    return val;
+}
+
+// nextDouble() - returns [0.0, 1.0)
+double java_random_next_double(inout int64_t state) {
+    int64_t a = int64_t(java_random_next(state, 26)) << 27;
+    int64_t b = int64_t(java_random_next(state, 27));
+    return double(a + b) / double(1L << 53);
+}
+
+// Calculate stronghold positions for MC 1.8.9
+// Only calculates the first 3 strongholds (ring 1)
+void find_strongholds_189(int world_seed, out ivec2 positions[3], out int valid_mask) {
+    // ChunkGeneratorOverworld uses this seed derivation
+    int64_t rng_state = java_random_init(int64_t(world_seed));
+
+    // Skip to stronghold generation
+    // In MC 1.8.9, MapGenStronghold initializes with world seed
+    rng_state = java_random_init(int64_t(world_seed));
+
+    // Ring 1 parameters
+    const double MIN_DIST = 1280.0;  // Minimum distance from origin
+    const double MAX_DIST = 2816.0;  // Maximum distance from origin
+    const int COUNT = 3;             // Strongholds in first ring
+
+    valid_mask = 0;
+
+    // Starting angle is randomized
+    double angle = java_random_next_double(rng_state) * 3.141592653589793 * 2.0;
+
+    for (int i = 0; i < COUNT; i++) {
+        // Distance from origin (in blocks)
+        double dist = (MIN_DIST + MAX_DIST) / 2.0;
+        dist += (java_random_next_double(rng_state) - 0.5) * (MAX_DIST - MIN_DIST);
+
+        // Convert polar to cartesian (chunk coordinates)
+        // Note: cos/sin only work with float in GLSL, cast angle
+        int chunk_x = int(round(double(cos(float(angle))) * dist / 16.0));
+        int chunk_z = int(round(double(sin(float(angle))) * dist / 16.0));
+
+        // Store block coordinates (center of chunk)
+        positions[i].x = chunk_x * 16 + 8;
+        positions[i].y = chunk_z * 16 + 8;  // Using y for z since ivec2
+
+        valid_mask |= (1 << i);
+
+        // Advance angle for next stronghold (evenly distributed + jitter)
+        angle += (3.141592653589793 * 2.0) / double(COUNT);
+        angle += (java_random_next_double(rng_state) - 0.5) * 0.5;
+    }
+}
+
+// More accurate 1.8.9 implementation matching MapGenStronghold.generatePositions()
+void find_strongholds_accurate(int world_seed, out ivec2 positions[3], out int valid_mask) {
+    // MapGenStronghold uses a different RNG setup
+    int64_t rng = java_random_init(int64_t(world_seed));
+
+    valid_mask = 0;
+
+    // Initial angle (radians)
+    double angle = java_random_next_double(rng) * 3.141592653589793 * 2.0;
+
+    // Distance in chunks
+    int distance = 32;  // ~512 blocks minimum
+    int spread = 32;    // Range variation
+
+    // In 1.8.9, the algorithm changed from previous versions
+    // Uses a spiral pattern with random offset
+
+    for (int i = 0; i < 3; i++) {
+        // Calculate chunk position
+        double d = (4 * distance) + (distance * i * 6);
+        d += java_random_next_double(rng) * (double(distance) * 2.5);
+
+        int cx = int(round(cos(float(angle)) * float(d)));
+        int cz = int(round(sin(float(angle)) * float(d)));
+
+        // Block coordinates (center of region)
+        positions[i].x = cx * 16 + 8;
+        positions[i].y = cz * 16 + 8;
+
+        valid_mask |= (1 << i);
+
+        // Rotate by approximately 120 degrees with jitter
+        angle += 6.283185307179586 / 3.0;
+        angle += (java_random_next_double(rng) - 0.5) * 1.5707963267948966;
+    }
+}
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+    uint seed_idx = global_id + pc.seed_offset;
+
+    if (seed_idx >= pc.seed_count) {
+        return;
+    }
+
+    int seed = seeds[seed_idx];
+
+    ivec2 positions[3];
+    int valid_mask;
+
+    // Use accurate implementation
+    find_strongholds_accurate(seed, positions, valid_mask);
+
+    // Store results
+    strongholds[seed_idx].positions[0] = positions[0];
+    strongholds[seed_idx].positions[1] = positions[1];
+    strongholds[seed_idx].positions[2] = positions[2];
+    strongholds[seed_idx].valid = valid_mask;
+}

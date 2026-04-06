@@ -1,0 +1,702 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+/*
+ * Minecraft 1.8.9 Enchantment Effects - GLSL Compute Shader
+ *
+ * Implements enchantment mechanics affecting mob drops and combat:
+ * - Looting (sword): Increases maximum drops from mobs
+ * - Fire Aspect (sword): Sets targets on fire
+ * - Sharpness/Smite/Bane (sword): Damage bonuses (handled in damage.glsl)
+ *
+ * Reference: Minecraft Wiki enchantment mechanics (1.8.9)
+ *
+ * Drop calculation order:
+ *   base_drop -> looting_bonus -> final_drop_count -> spawn_items
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Enchantment IDs (matches MC 1.8.9)
+const uint ENCHANT_NONE = 0;
+const uint ENCHANT_PROTECTION = 1;
+const uint ENCHANT_FIRE_PROTECTION = 2;
+const uint ENCHANT_FEATHER_FALLING = 3;
+const uint ENCHANT_BLAST_PROTECTION = 4;
+const uint ENCHANT_PROJECTILE_PROTECTION = 5;
+const uint ENCHANT_RESPIRATION = 6;
+const uint ENCHANT_AQUA_AFFINITY = 7;
+const uint ENCHANT_THORNS = 8;
+const uint ENCHANT_SHARPNESS = 16;
+const uint ENCHANT_SMITE = 17;
+const uint ENCHANT_BANE_OF_ARTHROPODS = 18;
+const uint ENCHANT_KNOCKBACK = 19;
+const uint ENCHANT_FIRE_ASPECT = 20;
+const uint ENCHANT_LOOTING = 21;
+const uint ENCHANT_EFFICIENCY = 32;
+const uint ENCHANT_SILK_TOUCH = 33;
+const uint ENCHANT_UNBREAKING = 34;
+const uint ENCHANT_FORTUNE = 35;
+
+// Item IDs for drops
+const uint ITEM_ENDER_PEARL = 368;
+const uint ITEM_BLAZE_ROD = 369;
+const uint ITEM_ROTTEN_FLESH = 367;
+const uint ITEM_BONE = 352;
+const uint ITEM_ARROW = 262;
+const uint ITEM_STRING = 287;
+const uint ITEM_SPIDER_EYE = 375;
+const uint ITEM_GUNPOWDER = 289;
+const uint ITEM_GHAST_TEAR = 370;
+const uint ITEM_GOLD_NUGGET = 371;
+const uint ITEM_MAGMA_CREAM = 378;
+const uint ITEM_SLIME_BALL = 341;
+const uint ITEM_IRON_INGOT = 265;
+const uint ITEM_CARROT = 391;
+const uint ITEM_POTATO = 392;
+
+// Mob types (must match game_tick.comp)
+const uint MOB_ZOMBIE = 0;
+const uint MOB_SKELETON = 1;
+const uint MOB_CREEPER = 2;
+const uint MOB_SPIDER = 3;
+const uint MOB_ENDERMAN = 4;
+const uint MOB_BLAZE = 5;
+const uint MOB_GHAST = 6;
+const uint MOB_ZOMBIE_PIGMAN = 7;
+const uint MOB_MAGMA_CUBE = 8;
+const uint MOB_SLIME = 9;
+const uint MOB_IRON_GOLEM = 10;
+const uint MOB_WITHER_SKELETON = 11;
+
+// Looting enchantment constants
+const uint LOOTING_MAX_LEVEL = 3;
+
+// Drop table structure:
+// Each mob has base_min, base_max, and item type
+// Looting adds to base_max: new_max = base_max + looting_level
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobDeath {
+    uint mob_type;          // Type of mob that died
+    uint killer_entity;     // Entity that killed it (0xFFFFFFFF = non-player)
+    vec3 position;          // Death position for item spawning
+    uint killer_weapon;     // Weapon used (for enchantment lookup)
+    uint flags;             // Death flags (burned, drowned, etc.)
+};
+
+struct ItemDrop {
+    uint item_id;           // Minecraft item ID
+    uint count;             // Stack count
+    vec3 position;          // Spawn position
+    vec3 velocity;          // Initial velocity (random scatter)
+    uint metadata;          // Item metadata/damage
+};
+
+struct EnchantmentData {
+    uint enchant_id;        // Enchantment type
+    uint level;             // Enchantment level (1-5 typically)
+};
+
+struct WeaponEnchants {
+    uint enchant_count;
+    EnchantmentData enchants[6];  // Max 6 enchants per weapon
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobDeathBuffer {
+    uint death_count;
+    uint padding[3];
+    MobDeath deaths[];
+};
+
+layout(set = 0, binding = 1) buffer ItemDropBuffer {
+    uint drop_count;
+    uint max_drops;
+    uint padding2[2];
+    ItemDrop drops[];
+};
+
+layout(set = 0, binding = 2) buffer WeaponEnchantBuffer {
+    WeaponEnchants weapon_enchants[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint max_deaths;
+    uint random_seed;
+    float delta_time;
+} pc;
+
+// ============================================================================
+// RNG Helpers
+// ============================================================================
+
+uint pcg_hash(uint input_val) {
+    uint state = input_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+uint random_uint(inout uint seed, uint max_exclusive) {
+    seed = pcg_hash(seed);
+    return seed % max_exclusive;
+}
+
+// Random integer in range [min, max] inclusive
+uint random_range(inout uint seed, uint min_val, uint max_val) {
+    if (min_val >= max_val) return min_val;
+    return min_val + random_uint(seed, max_val - min_val + 1);
+}
+
+vec3 random_velocity(inout uint seed) {
+    float angle = random_float(seed) * 6.28318530718;
+    float speed = 0.1 + random_float(seed) * 0.2;
+    return vec3(
+        cos(angle) * speed,
+        0.2 + random_float(seed) * 0.3,
+        sin(angle) * speed
+    );
+}
+
+// ============================================================================
+// Enchantment Queries
+// ============================================================================
+
+/*
+ * Get looting level from weapon enchantments.
+ *
+ * @param weapon_id  Index into weapon_enchants buffer
+ * @return           Looting level (0-3), 0 if not present
+ */
+uint get_looting_level(uint weapon_id) {
+    if (weapon_id == 0xFFFFFFFF) return 0;
+
+    WeaponEnchants we = weapon_enchants[weapon_id];
+    for (uint i = 0; i < we.enchant_count && i < 6; i++) {
+        if (we.enchants[i].enchant_id == ENCHANT_LOOTING) {
+            return min(we.enchants[i].level, LOOTING_MAX_LEVEL);
+        }
+    }
+    return 0;
+}
+
+/*
+ * Get fire aspect level from weapon enchantments.
+ *
+ * @param weapon_id  Index into weapon_enchants buffer
+ * @return           Fire Aspect level (0-2), 0 if not present
+ */
+uint get_fire_aspect_level(uint weapon_id) {
+    if (weapon_id == 0xFFFFFFFF) return 0;
+
+    WeaponEnchants we = weapon_enchants[weapon_id];
+    for (uint i = 0; i < we.enchant_count && i < 6; i++) {
+        if (we.enchants[i].enchant_id == ENCHANT_FIRE_ASPECT) {
+            return min(we.enchants[i].level, 2u);
+        }
+    }
+    return 0;
+}
+
+// ============================================================================
+// Drop Calculation Functions
+// ============================================================================
+
+/*
+ * Calculate ender pearl drops from enderman.
+ *
+ * Base drop: 0-1 pearls
+ * With Looting I:   0-2 pearls
+ * With Looting II:  0-3 pearls
+ * With Looting III: 0-4 pearls
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param seed           RNG seed (modified)
+ * @return               Number of ender pearls to drop
+ */
+uint calculate_ender_pearl_drops(uint looting_level, inout uint seed) {
+    // Base: 0-1, max increases by looting level
+    uint max_drops = 1 + looting_level;
+    return random_range(seed, 0, max_drops);
+}
+
+/*
+ * Calculate blaze rod drops from blaze.
+ *
+ * Base drop: 0-1 rods
+ * With Looting I:   0-2 rods
+ * With Looting II:  0-3 rods
+ * With Looting III: 0-4 rods
+ *
+ * Note: Blaze rods only drop when killed by player (not environmental damage).
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param killed_by_player  True if killed by player
+ * @param seed           RNG seed (modified)
+ * @return               Number of blaze rods to drop
+ */
+uint calculate_blaze_rod_drops(uint looting_level, bool killed_by_player, inout uint seed) {
+    // Blaze rods only drop from player kills
+    if (!killed_by_player) return 0;
+
+    // Base: 0-1, max increases by looting level
+    uint max_drops = 1 + looting_level;
+    return random_range(seed, 0, max_drops);
+}
+
+/*
+ * Calculate zombie drops.
+ *
+ * Rotten Flesh: 0-2 base, +1 max per looting level
+ * Rare drops (iron ingot, carrot, potato): 2.5% base
+ *   Each looting level adds 1% chance
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param seed           RNG seed (modified)
+ * @param out_flesh      Output: rotten flesh count
+ * @param out_rare_item  Output: rare item ID (0 if none)
+ * @param out_rare_count Output: rare item count
+ */
+void calculate_zombie_drops(
+    uint looting_level,
+    inout uint seed,
+    out uint out_flesh,
+    out uint out_rare_item,
+    out uint out_rare_count
+) {
+    // Rotten flesh: 0-2 base
+    uint max_flesh = 2 + looting_level;
+    out_flesh = random_range(seed, 0, max_flesh);
+
+    // Rare drop chance: 2.5% + 1% per looting level
+    float rare_chance = 0.025 + 0.01 * float(looting_level);
+    if (random_float(seed) < rare_chance) {
+        // Equal chance of iron, carrot, or potato
+        uint rare_type = random_uint(seed, 3);
+        if (rare_type == 0) {
+            out_rare_item = ITEM_IRON_INGOT;
+        } else if (rare_type == 1) {
+            out_rare_item = ITEM_CARROT;
+        } else {
+            out_rare_item = ITEM_POTATO;
+        }
+        out_rare_count = 1;
+    } else {
+        out_rare_item = 0;
+        out_rare_count = 0;
+    }
+}
+
+/*
+ * Calculate skeleton drops.
+ *
+ * Bones: 0-2 base, +1 max per looting level
+ * Arrows: 0-2 base, +1 max per looting level
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param seed           RNG seed (modified)
+ * @param out_bones      Output: bone count
+ * @param out_arrows     Output: arrow count
+ */
+void calculate_skeleton_drops(
+    uint looting_level,
+    inout uint seed,
+    out uint out_bones,
+    out uint out_arrows
+) {
+    uint max_bones = 2 + looting_level;
+    uint max_arrows = 2 + looting_level;
+
+    out_bones = random_range(seed, 0, max_bones);
+    out_arrows = random_range(seed, 0, max_arrows);
+}
+
+/*
+ * Calculate wither skeleton drops.
+ *
+ * Bones: 0-2 base, +1 max per looting level
+ * Coal: 0-1 base, +1 max per looting level
+ * Wither Skull: 2.5% base, +1% per looting level
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param seed           RNG seed (modified)
+ * @param out_bones      Output: bone count
+ * @param out_coal       Output: coal count
+ * @param out_skull      Output: 1 if skull drops, 0 otherwise
+ */
+void calculate_wither_skeleton_drops(
+    uint looting_level,
+    inout uint seed,
+    out uint out_bones,
+    out uint out_coal,
+    out uint out_skull
+) {
+    uint max_bones = 2 + looting_level;
+    uint max_coal = 1 + looting_level;
+
+    out_bones = random_range(seed, 0, max_bones);
+    out_coal = random_range(seed, 0, max_coal);
+
+    // Skull: 2.5% + 1% per looting level
+    float skull_chance = 0.025 + 0.01 * float(looting_level);
+    out_skull = (random_float(seed) < skull_chance) ? 1 : 0;
+}
+
+/*
+ * Calculate spider drops.
+ *
+ * String: 0-2 base, +1 max per looting level
+ * Spider Eye: 33% chance when killed by player, +looting% per level
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param killed_by_player  True if killed by player
+ * @param seed           RNG seed (modified)
+ * @param out_string     Output: string count
+ * @param out_eye        Output: spider eye count (0 or 1)
+ */
+void calculate_spider_drops(
+    uint looting_level,
+    bool killed_by_player,
+    inout uint seed,
+    out uint out_string,
+    out uint out_eye
+) {
+    uint max_string = 2 + looting_level;
+    out_string = random_range(seed, 0, max_string);
+
+    // Spider eye only from player kills
+    if (killed_by_player) {
+        // 33% base + 1/3 of looting level
+        float eye_chance = 0.333 + 0.333 * float(looting_level) / 3.0;
+        out_eye = (random_float(seed) < eye_chance) ? 1 : 0;
+    } else {
+        out_eye = 0;
+    }
+}
+
+/*
+ * Calculate creeper drops.
+ *
+ * Gunpowder: 0-2 base, +1 max per looting level
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param seed           RNG seed (modified)
+ * @return               Gunpowder count
+ */
+uint calculate_creeper_drops(uint looting_level, inout uint seed) {
+    uint max_drops = 2 + looting_level;
+    return random_range(seed, 0, max_drops);
+}
+
+/*
+ * Calculate ghast drops.
+ *
+ * Ghast Tears: 0-1 base, +1 max per looting level
+ * Gunpowder: 0-2 base, +1 max per looting level
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param seed           RNG seed (modified)
+ * @param out_tears      Output: ghast tear count
+ * @param out_gunpowder  Output: gunpowder count
+ */
+void calculate_ghast_drops(
+    uint looting_level,
+    inout uint seed,
+    out uint out_tears,
+    out uint out_gunpowder
+) {
+    uint max_tears = 1 + looting_level;
+    uint max_gunpowder = 2 + looting_level;
+
+    out_tears = random_range(seed, 0, max_tears);
+    out_gunpowder = random_range(seed, 0, max_gunpowder);
+}
+
+/*
+ * Calculate zombie pigman drops.
+ *
+ * Rotten Flesh: 0-1 base, +1 max per looting level
+ * Gold Nugget: 0-1 base, +1 max per looting level
+ * Gold Ingot (rare): 2.5% + 1% per looting level
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param killed_by_player  True if killed by player
+ * @param seed           RNG seed (modified)
+ * @param out_flesh      Output: rotten flesh count
+ * @param out_nuggets    Output: gold nugget count
+ * @param out_ingot      Output: 1 if gold ingot drops, 0 otherwise
+ */
+void calculate_zombie_pigman_drops(
+    uint looting_level,
+    bool killed_by_player,
+    inout uint seed,
+    out uint out_flesh,
+    out uint out_nuggets,
+    out uint out_ingot
+) {
+    uint max_flesh = 1 + looting_level;
+    uint max_nuggets = 1 + looting_level;
+
+    out_flesh = random_range(seed, 0, max_flesh);
+    out_nuggets = random_range(seed, 0, max_nuggets);
+
+    // Rare gold ingot drop
+    if (killed_by_player) {
+        float ingot_chance = 0.025 + 0.01 * float(looting_level);
+        out_ingot = (random_float(seed) < ingot_chance) ? 1 : 0;
+    } else {
+        out_ingot = 0;
+    }
+}
+
+/*
+ * Calculate magma cube drops.
+ *
+ * Magma Cream: 0-1 base (only from large/medium cubes)
+ * With Looting I:   0-2
+ * With Looting II:  0-3
+ * With Looting III: 0-4
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param size           Cube size (0=tiny, 1=small, 2=medium, 3=large)
+ * @param seed           RNG seed (modified)
+ * @return               Magma cream count
+ */
+uint calculate_magma_cube_drops(uint looting_level, uint size, inout uint seed) {
+    // Only medium (2) and large (3) cubes drop magma cream
+    if (size < 2) return 0;
+
+    uint max_drops = 1 + looting_level;
+    return random_range(seed, 0, max_drops);
+}
+
+/*
+ * Calculate slime drops.
+ *
+ * Slime Ball: 0-2 base (only from small slimes)
+ * With Looting I:   0-3
+ * With Looting II:  0-4
+ * With Looting III: 0-5
+ *
+ * @param looting_level  Looting enchantment level (0-3)
+ * @param size           Slime size (0=tiny, 1=small, 2=medium, 3=large)
+ * @param seed           RNG seed (modified)
+ * @return               Slime ball count
+ */
+uint calculate_slime_drops(uint looting_level, uint size, inout uint seed) {
+    // Only tiny slimes (smallest size) drop slime balls
+    if (size != 0) return 0;
+
+    uint max_drops = 2 + looting_level;
+    return random_range(seed, 0, max_drops);
+}
+
+// ============================================================================
+// Item Drop Spawning
+// ============================================================================
+
+/*
+ * Spawn an item drop at the given position.
+ *
+ * @param item_id   Minecraft item ID
+ * @param count     Stack count
+ * @param pos       Spawn position
+ * @param seed      RNG seed (modified) for velocity randomization
+ */
+void spawn_item_drop(uint item_id, uint count, vec3 pos, inout uint seed) {
+    if (count == 0 || item_id == 0) return;
+
+    uint idx = atomicAdd(drop_count, 1);
+    if (idx >= max_drops) {
+        atomicAdd(drop_count, 0xFFFFFFFF); // Rollback
+        return;
+    }
+
+    drops[idx].item_id = item_id;
+    drops[idx].count = count;
+    drops[idx].position = pos + vec3(0.0, 0.5, 0.0); // Slightly above ground
+    drops[idx].velocity = random_velocity(seed);
+    drops[idx].metadata = 0;
+}
+
+// ============================================================================
+// Main Processing
+// ============================================================================
+
+void process_mob_death(uint idx, inout uint seed) {
+    MobDeath death = deaths[idx];
+
+    // Get looting level from killer's weapon
+    uint looting = get_looting_level(death.killer_weapon);
+    bool player_kill = (death.killer_entity != 0xFFFFFFFF);
+    vec3 pos = death.position;
+
+    switch (death.mob_type) {
+        case MOB_ENDERMAN: {
+            uint pearls = calculate_ender_pearl_drops(looting, seed);
+            spawn_item_drop(ITEM_ENDER_PEARL, pearls, pos, seed);
+            break;
+        }
+
+        case MOB_BLAZE: {
+            uint rods = calculate_blaze_rod_drops(looting, player_kill, seed);
+            spawn_item_drop(ITEM_BLAZE_ROD, rods, pos, seed);
+            break;
+        }
+
+        case MOB_ZOMBIE: {
+            uint flesh, rare_item, rare_count;
+            calculate_zombie_drops(looting, seed, flesh, rare_item, rare_count);
+            spawn_item_drop(ITEM_ROTTEN_FLESH, flesh, pos, seed);
+            spawn_item_drop(rare_item, rare_count, pos, seed);
+            break;
+        }
+
+        case MOB_SKELETON: {
+            uint bones, arrows;
+            calculate_skeleton_drops(looting, seed, bones, arrows);
+            spawn_item_drop(ITEM_BONE, bones, pos, seed);
+            spawn_item_drop(ITEM_ARROW, arrows, pos, seed);
+            break;
+        }
+
+        case MOB_WITHER_SKELETON: {
+            uint bones, coal, skull;
+            calculate_wither_skeleton_drops(looting, seed, bones, coal, skull);
+            spawn_item_drop(ITEM_BONE, bones, pos, seed);
+            // Coal item ID = 263
+            spawn_item_drop(263, coal, pos, seed);
+            // Wither skull item ID = 397:1
+            if (skull > 0) {
+                uint skull_idx = atomicAdd(drop_count, 1);
+                if (skull_idx < max_drops) {
+                    drops[skull_idx].item_id = 397;
+                    drops[skull_idx].count = 1;
+                    drops[skull_idx].position = pos + vec3(0.0, 0.5, 0.0);
+                    drops[skull_idx].velocity = random_velocity(seed);
+                    drops[skull_idx].metadata = 1; // Wither skeleton skull
+                }
+            }
+            break;
+        }
+
+        case MOB_SPIDER: {
+            uint string_count, eye;
+            calculate_spider_drops(looting, player_kill, seed, string_count, eye);
+            spawn_item_drop(ITEM_STRING, string_count, pos, seed);
+            spawn_item_drop(ITEM_SPIDER_EYE, eye, pos, seed);
+            break;
+        }
+
+        case MOB_CREEPER: {
+            uint gunpowder = calculate_creeper_drops(looting, seed);
+            spawn_item_drop(ITEM_GUNPOWDER, gunpowder, pos, seed);
+            // TODO: Music disc drop if killed by skeleton
+            break;
+        }
+
+        case MOB_GHAST: {
+            uint tears, gunpowder;
+            calculate_ghast_drops(looting, seed, tears, gunpowder);
+            spawn_item_drop(ITEM_GHAST_TEAR, tears, pos, seed);
+            spawn_item_drop(ITEM_GUNPOWDER, gunpowder, pos, seed);
+            break;
+        }
+
+        case MOB_ZOMBIE_PIGMAN: {
+            uint flesh, nuggets, ingot;
+            calculate_zombie_pigman_drops(looting, player_kill, seed, flesh, nuggets, ingot);
+            spawn_item_drop(ITEM_ROTTEN_FLESH, flesh, pos, seed);
+            spawn_item_drop(ITEM_GOLD_NUGGET, nuggets, pos, seed);
+            // Gold ingot item ID = 266
+            spawn_item_drop(266, ingot, pos, seed);
+            break;
+        }
+
+        case MOB_MAGMA_CUBE: {
+            // Size stored in flags (bits 0-1)
+            uint size = death.flags & 0x3;
+            uint cream = calculate_magma_cube_drops(looting, size, seed);
+            spawn_item_drop(ITEM_MAGMA_CREAM, cream, pos, seed);
+            break;
+        }
+
+        case MOB_SLIME: {
+            // Size stored in flags (bits 0-1)
+            uint size = death.flags & 0x3;
+            uint balls = calculate_slime_drops(looting, size, seed);
+            spawn_item_drop(ITEM_SLIME_BALL, balls, pos, seed);
+            break;
+        }
+
+        case MOB_IRON_GOLEM: {
+            // Iron Golem: 3-5 iron ingots (not affected by looting)
+            // + 0-2 poppies (not affected by looting)
+            uint iron = random_range(seed, 3, 5);
+            uint poppies = random_range(seed, 0, 2);
+            spawn_item_drop(ITEM_IRON_INGOT, iron, pos, seed);
+            // Poppy item ID = 38
+            spawn_item_drop(38, poppies, pos, seed);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= death_count || idx >= pc.max_deaths) return;
+
+    // Generate unique seed for this death event
+    uint seed = pc.random_seed ^ pcg_hash(idx) ^ pcg_hash(deaths[idx].mob_type);
+
+    process_mob_death(idx, seed);
+}
+
+// ============================================================================
+// Speedrun Notes
+// ============================================================================
+/*
+ * For speedrunning (Random Seed Glitchless), looting is generally not worth
+ * obtaining because:
+ *
+ * 1. Enchanting table setup requires:
+ *    - 15 bookshelves (45 leather + 135 paper + 90 wood planks)
+ *    - 4 obsidian + 2 diamonds + 1 book
+ *    - Lapis lazuli for enchanting
+ *
+ * 2. Time cost vs. benefit:
+ *    - Setting up enchanting: ~5-10 minutes
+ *    - Expected ender pearl gain with Looting III: ~3-6 extra pearls
+ *    - Simply killing more endermen is faster
+ *
+ * 3. Exception cases where looting might be worth:
+ *    - Found village with library (free bookshelves)
+ *    - Found looting book in chest/fishing
+ *    - Very unlucky pearl RNG (need insurance)
+ *
+ * 4. Blaze rod optimization:
+ *    - Need minimum 7 rods (6 for eyes + 1 for strength if using)
+ *    - With bad luck, need to kill ~14 blazes without looting
+ *    - With Looting III, ~7 blazes average
+ *    - But time to get Looting III > time to kill 7 extra blazes
+ *
+ * Bottom line: Skip enchanting, kill more mobs.
+ */

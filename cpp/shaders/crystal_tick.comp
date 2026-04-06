@@ -1,0 +1,122 @@
+#version 450
+
+// Crystal Tick - End crystal healing beams and rotation
+// MC 1.8.9 End crystal behavior
+
+layout(local_size_x = 10) in;
+
+// Dragon state buffer
+layout(std430, binding = 0) buffer DragonState {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    uint phase;
+    mat4 body_transform;
+    uint target_player;
+    float perch_timer;
+    float strafe_timer;
+    vec3 target_position;
+    uint crystals_alive;
+} dragon;
+
+// Crystal state buffer
+layout(std430, binding = 1) buffer CrystalState {
+    vec4 positions[10];     // xyz = position, w = rotation angle
+    uint alive_mask;
+    uint cage_mask;
+    float beam_timers[10];  // Healing beam animation progress
+} crystals;
+
+// Crystal visual output for rendering
+layout(std430, binding = 2) buffer CrystalVisuals {
+    vec4 beam_endpoints[10];    // Endpoint of healing beam (dragon position when healing)
+    vec4 beam_colors[10];       // RGBA beam color
+    float rotation_angles[10];  // Current rotation for rendering
+    float bob_offsets[10];      // Vertical bob offset
+    uint active_beams;          // Bitmask of crystals currently emitting beams
+} visuals;
+
+layout(push_constant) uniform PushConstants {
+    float delta_time;
+    float total_time;
+    uint tick;
+} pc;
+
+// Constants
+const float HEAL_RATE = 1.0;            // HP per second when healing
+const float HEAL_RANGE = 32.0;          // Max distance to heal dragon
+const float ROTATION_SPEED = 2.0;       // Radians per second
+const float BOB_AMPLITUDE = 0.3;        // Vertical bob amount
+const float BOB_FREQUENCY = 1.5;        // Bob cycles per second
+const float BEAM_FADE_SPEED = 3.0;      // How fast beam fades out
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= 10) return;
+
+    uint mask = 1u << idx;
+    bool alive = (crystals.alive_mask & mask) != 0;
+
+    // Dead crystals get no visuals
+    if (!alive) {
+        visuals.beam_colors[idx] = vec4(0.0);
+        crystals.beam_timers[idx] = 0.0;
+        return;
+    }
+
+    vec3 crystal_pos = crystals.positions[idx].xyz;
+
+    // Rotation animation
+    float rotation = crystals.positions[idx].w + ROTATION_SPEED * pc.delta_time;
+    if (rotation > 6.28318530718) rotation -= 6.28318530718;
+    crystals.positions[idx].w = rotation;
+    visuals.rotation_angles[idx] = rotation;
+
+    // Vertical bobbing
+    float bob_phase = pc.total_time * BOB_FREQUENCY * 6.28318530718 + float(idx) * 0.5;
+    visuals.bob_offsets[idx] = sin(bob_phase) * BOB_AMPLITUDE;
+
+    // Check if can heal dragon
+    bool can_heal = dragon.health > 0.0 && dragon.health < 200.0 && dragon.phase != 4;
+    float dist_to_dragon = distance(crystal_pos, dragon.position);
+    bool in_range = dist_to_dragon < HEAL_RANGE;
+
+    if (can_heal && in_range) {
+        // Healing active
+        crystals.beam_timers[idx] = min(crystals.beam_timers[idx] + pc.delta_time * BEAM_FADE_SPEED, 1.0);
+
+        // Heal dragon (only one crystal heals per tick for fairness)
+        if (idx == uint(findLSB(int(crystals.alive_mask)))) {
+            dragon.health = min(dragon.health + HEAL_RATE * pc.delta_time, 200.0);
+        }
+
+        // Set beam endpoint to dragon position
+        visuals.beam_endpoints[idx] = vec4(dragon.position, 1.0);
+
+        // Beam color - magenta/pink healing beam
+        float pulse = 0.7 + 0.3 * sin(pc.total_time * 8.0 + float(idx));
+        visuals.beam_colors[idx] = vec4(1.0, 0.3, 1.0, crystals.beam_timers[idx] * pulse);
+
+        // Mark beam as active
+        atomicOr(visuals.active_beams, mask);
+    } else {
+        // Fade out beam
+        crystals.beam_timers[idx] = max(crystals.beam_timers[idx] - pc.delta_time * BEAM_FADE_SPEED, 0.0);
+
+        if (crystals.beam_timers[idx] > 0.001) {
+            // Still fading
+            visuals.beam_colors[idx].a = crystals.beam_timers[idx] * 0.5;
+        } else {
+            // Fully faded
+            visuals.beam_colors[idx] = vec4(0.0);
+            atomicAnd(visuals.active_beams, ~mask);
+        }
+    }
+
+    // Cage glow effect (if crystal has cage)
+    if ((crystals.cage_mask & mask) != 0) {
+        // Caged crystals have slightly different visual
+        float cage_pulse = 0.5 + 0.5 * sin(pc.total_time * 4.0 + float(idx) * 1.2);
+        // This could be used by renderer for cage glow
+    }
+}

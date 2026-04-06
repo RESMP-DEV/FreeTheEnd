@@ -1,0 +1,1053 @@
+#version 450
+
+/*
+ * reward_computation.comp - Reward computation for all 6 curriculum stages
+ *
+ * This shader computes dense rewards for the Free The End speedrun curriculum.
+ * Each stage has milestone-based rewards to guide exploration and learning.
+ *
+ * Curriculum Stages:
+ *   1: Basic Survival    - Wood, tools, first night
+ *   2: Resource Gathering- Iron, bucket, furnace
+ *   3: Nether Navigation - Portal, fortress, blaze rods
+ *   4: Enderman Hunting  - Ender pearls collection
+ *   5: Stronghold Finding- Eyes of ender, portal activation
+ *   6: Dragon Fight      - Crystal destruction, dragon kill
+ *
+ * Buffer layout matches game_tick_mvk.comp and inventory_ops.comp
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// PUSH CONSTANTS
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    uint curriculum_stage;  // 1-6 active curriculum stage
+    uint num_envs;          // Number of parallel environments
+    uint tick;              // Current tick number
+    uint flags;             // Bit flags for options
+} pc;
+
+// ============================================================================
+// ITEM IDS (Minecraft 1.8.9)
+// ============================================================================
+
+const uint ITEM_NONE = 0u;
+
+// Wood & basic
+const uint ITEM_OAK_LOG = 17u;
+const uint ITEM_SPRUCE_LOG = 4113u;
+const uint ITEM_PLANKS = 5u;
+const uint ITEM_CRAFTING_TABLE = 58u;
+const uint ITEM_STICK = 280u;
+const uint ITEM_TORCH = 50u;
+const uint ITEM_CHEST = 54u;
+const uint ITEM_FURNACE = 61u;
+const uint ITEM_COBBLESTONE = 4u;
+const uint ITEM_COAL = 263u;
+
+// Tools - Wood
+const uint ITEM_WOODEN_PICKAXE = 270u;
+const uint ITEM_WOODEN_AXE = 271u;
+const uint ITEM_WOODEN_SHOVEL = 269u;
+const uint ITEM_WOODEN_SWORD = 268u;
+
+// Tools - Stone
+const uint ITEM_STONE_PICKAXE = 274u;
+const uint ITEM_STONE_AXE = 275u;
+const uint ITEM_STONE_SHOVEL = 273u;
+const uint ITEM_STONE_SWORD = 272u;
+
+// Tools - Iron
+const uint ITEM_IRON_PICKAXE = 257u;
+const uint ITEM_IRON_AXE = 258u;
+const uint ITEM_IRON_SWORD = 267u;
+
+// Tools - Diamond
+const uint ITEM_DIAMOND_PICKAXE = 278u;
+const uint ITEM_DIAMOND_SWORD = 276u;
+
+// Resources
+const uint ITEM_IRON_ORE = 15u;
+const uint ITEM_IRON_INGOT = 265u;
+const uint ITEM_DIAMOND = 264u;
+const uint ITEM_GOLD_INGOT = 266u;
+const uint ITEM_BUCKET = 325u;
+const uint ITEM_WATER_BUCKET = 326u;
+const uint ITEM_LAVA_BUCKET = 327u;
+const uint ITEM_FLINT_AND_STEEL = 259u;
+const uint ITEM_OBSIDIAN = 49u;
+
+// Nether items
+const uint ITEM_BLAZE_ROD = 369u;
+const uint ITEM_BLAZE_POWDER = 377u;
+const uint ITEM_NETHER_WART = 372u;
+
+// End items
+const uint ITEM_ENDER_PEARL = 368u;
+const uint ITEM_EYE_OF_ENDER = 381u;
+
+// Armor
+const uint ITEM_IRON_HELMET = 306u;
+const uint ITEM_IRON_CHESTPLATE = 307u;
+const uint ITEM_IRON_LEGGINGS = 308u;
+const uint ITEM_IRON_BOOTS = 309u;
+const uint ITEM_DIAMOND_HELMET = 310u;
+const uint ITEM_DIAMOND_CHESTPLATE = 311u;
+const uint ITEM_DIAMOND_LEGGINGS = 312u;
+const uint ITEM_DIAMOND_BOOTS = 313u;
+
+// Food
+const uint ITEM_COOKED_BEEF = 364u;
+const uint ITEM_BREAD = 297u;
+const uint ITEM_GOLDEN_APPLE = 322u;
+
+// Beds (for dragon one-cycle)
+const uint ITEM_BED = 355u;
+
+// ============================================================================
+// MOB TYPES
+// ============================================================================
+
+const uint MOB_NONE = 0u;
+const uint MOB_ZOMBIE = 1u;
+const uint MOB_SKELETON = 2u;
+const uint MOB_SPIDER = 3u;
+const uint MOB_CREEPER = 4u;
+const uint MOB_ENDERMAN = 5u;
+const uint MOB_BLAZE = 6u;
+const uint MOB_GHAST = 7u;
+const uint MOB_PIGMAN = 8u;
+const uint MOB_WITHER_SKELETON = 9u;
+const uint MOB_ENDER_DRAGON = 100u;
+
+// ============================================================================
+// DIMENSIONS
+// ============================================================================
+
+const uint DIM_OVERWORLD = 0u;
+const uint DIM_NETHER = 1u;
+const uint DIM_END = 2u;
+
+// ============================================================================
+// STAGE COMPLETION THRESHOLDS
+// ============================================================================
+
+// Stage 1: Basic Survival
+const uint STAGE1_COBBLE_THRESHOLD = 16u;
+
+// Stage 2: Resource Gathering
+const uint STAGE2_IRON_THRESHOLD = 3u;
+
+// Stage 3: Nether Navigation
+const uint STAGE3_BLAZE_ROD_THRESHOLD = 7u;
+
+// Stage 4: Enderman Hunting
+const uint STAGE4_PEARL_THRESHOLD = 12u;
+
+// Stage 5: Stronghold Finding
+const uint STAGE5_EYE_THRESHOLD = 12u;
+
+// Stage 6: Dragon Fight
+const float DRAGON_MAX_HEALTH = 200.0;
+const uint MAX_CRYSTALS = 10u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+// Player state from game_tick_mvk.comp
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint dimension;
+    uint gamemode;
+    uint activeSlot;
+    uint flags;
+    ivec3 targetBlock;
+    uint targetBlockFace;
+    vec4 statusEffects[8];
+};
+
+// Progress tracking state per environment
+struct ProgressState {
+    // Stage 1 milestones (bits 0-7)
+    uint stage1_flags;      // bit 0: first_wood, bit 1: crafting_table, bit 2: first_pickaxe,
+                            // bit 3: first_stone_pickaxe, bit 4: first_sword
+    uint wood_collected;    // Total wood logs collected
+    uint cobble_collected;  // Total cobblestone collected
+    uint mobs_killed;       // Total hostile mobs killed
+
+    // Stage 2 milestones (bits 8-15)
+    uint stage2_flags;      // bit 0: has_furnace, bit 1: has_iron_pick, bit 2: has_bucket,
+                            // bit 3: has_iron_armor_piece
+    uint iron_collected;    // Total iron ingots
+    uint diamond_collected; // Total diamonds
+
+    // Stage 3 milestones (bits 16-23)
+    uint stage3_flags;      // bit 0: portal_built, bit 1: entered_nether, bit 2: found_fortress,
+                            // bit 3: killed_blaze
+    uint blaze_rods;        // Blaze rods collected
+
+    // Stage 4 milestones (expanded: hunting + stronghold + portal)
+    uint stage4_flags;      // bit 0: killed_enderman, bit 1: first_eye_crafted,
+                            // bit 2: eye_thrown, bit 3: stronghold_found,
+                            // bit 4: portal_activated, bit 5: pearls_6, bit 6: pearls_12,
+                            // bit 7: eyes_12
+    uint ender_pearls;      // Ender pearls collected
+    uint eyes_crafted_s4;   // Eyes of ender crafted (Stage 4 tracking)
+    uint portal_frames_s4;  // Portal frames filled (Stage 4 tracking, 0-12)
+    float prev_stronghold_dist; // Previous distance to nearest stronghold
+
+    // Stage 5 milestones (legacy)
+    uint stage5_flags;      // bit 0: crafted_eye, bit 1: found_stronghold, bit 2: portal_activated
+    uint eyes_crafted;      // Eyes of ender crafted
+
+    // Stage 6 milestones
+    uint stage6_flags;      // bit 0: entered_end, bit 1: destroyed_first_crystal
+    uint crystals_destroyed;// End crystals destroyed
+    float dragon_damage_dealt; // Total damage dealt to dragon
+    uint dragon_killed;     // Dragon kill flag
+
+    // Timing
+    uint start_tick;        // Tick when stage started
+    uint total_deaths;      // Death counter
+
+    // Previous state for delta computation
+    float prev_health;
+    float prev_dragon_health;
+    uint prev_dimension;
+    uint prev_mobs_killed;
+};
+
+// Dragon state
+struct DragonState {
+    vec3 position;
+    float health;
+    vec3 velocity;
+    uint phase;             // 0: circling, 1: strafing, 2: charging, 3: landing, 4: perching, 5: takeoff, 6: dead
+    uint crystals_alive;    // Bitmask of alive crystals
+    float perch_timer;
+    vec3 target_position;
+};
+
+// Kill event from combat system
+struct KillEvent {
+    uint killer_id;         // 0xFFFFFFFF for player
+    uint victim_type;       // Mob type
+    float damage;
+    uint flags;
+};
+
+// ============================================================================
+// BUFFER BINDINGS (MoltenVK compatible - all in set 0)
+// ============================================================================
+
+const uint MAX_ENVS = 4096u;
+const uint MAX_KILLS_PER_ENV = 64u;
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) readonly buffer InventoryBuffer {
+    uint inventory_data[];  // Packed inventory (232 bytes per env)
+};
+
+layout(set = 0, binding = 2) buffer ProgressBuffer {
+    ProgressState progress[];
+};
+
+layout(set = 0, binding = 3) readonly buffer DragonBuffer {
+    DragonState dragons[];
+};
+
+layout(set = 0, binding = 4) readonly buffer KillCountBuffer {
+    uint kill_counts[MAX_ENVS];  // Per-env kill count this tick
+};
+
+layout(set = 0, binding = 5) readonly buffer KillEventBuffer {
+    KillEvent kills[];           // Flattened: env_id * MAX_KILLS_PER_ENV + kill_idx
+};
+
+layout(set = 0, binding = 6) buffer RewardBuffer {
+    float rewards[];        // Output rewards per environment
+};
+
+layout(set = 0, binding = 7) buffer DoneBuffer {
+    uint dones[];           // Episode termination flags
+};
+
+layout(set = 0, binding = 8) buffer InfoBuffer {
+    uint stage_complete[];  // Flag when stage objectives met
+};
+
+// Stronghold tracking (from stronghold_gen.comp)
+layout(set = 0, binding = 9) readonly buffer StrongholdBuffer {
+    ivec3 stronghold_positions[3];  // 3 strongholds per world
+    uint portal_frames_filled[];    // Per-env: count of frames with eyes (0-12)
+};
+
+// ============================================================================
+// INVENTORY HELPERS
+// ============================================================================
+
+const uint INV_STRIDE = 58u;  // 232 bytes / 4
+
+uint getInventoryOffset(uint env_id) {
+    return env_id * INV_STRIDE;
+}
+
+uint readItemId(uint base_offset, uint slot) {
+    uint word_offset = base_offset + (slot / 2u);
+    uint word = inventory_data[word_offset];
+    return (slot & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+}
+
+uint readCount(uint base_offset, uint slot) {
+    uint count_base = base_offset + 23u;  // 92 bytes / 4
+    uint word_offset = count_base + (slot / 4u);
+    uint word = inventory_data[word_offset];
+    uint shift = (slot & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+// Count total of an item across inventory
+uint countItem(uint inv_offset, uint item_id) {
+    uint total = 0u;
+    for (uint slot = 0u; slot < 46u; slot++) {
+        if (readItemId(inv_offset, slot) == item_id) {
+            total += readCount(inv_offset, slot);
+        }
+    }
+    return total;
+}
+
+// Check if player has any of specified item
+bool hasItem(uint inv_offset, uint item_id) {
+    for (uint slot = 0u; slot < 46u; slot++) {
+        if (readItemId(inv_offset, slot) == item_id && readCount(inv_offset, slot) > 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if has any wood type
+uint countWood(uint inv_offset) {
+    uint total = 0u;
+    total += countItem(inv_offset, ITEM_OAK_LOG);
+    total += countItem(inv_offset, ITEM_SPRUCE_LOG);
+    // Add other wood types if needed
+    return total;
+}
+
+// Check if has any pickaxe
+bool hasAnyPickaxe(uint inv_offset) {
+    return hasItem(inv_offset, ITEM_WOODEN_PICKAXE) ||
+           hasItem(inv_offset, ITEM_STONE_PICKAXE) ||
+           hasItem(inv_offset, ITEM_IRON_PICKAXE) ||
+           hasItem(inv_offset, ITEM_DIAMOND_PICKAXE);
+}
+
+bool hasStoneOrBetterPickaxe(uint inv_offset) {
+    return hasItem(inv_offset, ITEM_STONE_PICKAXE) ||
+           hasItem(inv_offset, ITEM_IRON_PICKAXE) ||
+           hasItem(inv_offset, ITEM_DIAMOND_PICKAXE);
+}
+
+bool hasIronOrBetterPickaxe(uint inv_offset) {
+    return hasItem(inv_offset, ITEM_IRON_PICKAXE) ||
+           hasItem(inv_offset, ITEM_DIAMOND_PICKAXE);
+}
+
+bool hasAnySword(uint inv_offset) {
+    return hasItem(inv_offset, ITEM_WOODEN_SWORD) ||
+           hasItem(inv_offset, ITEM_STONE_SWORD) ||
+           hasItem(inv_offset, ITEM_IRON_SWORD) ||
+           hasItem(inv_offset, ITEM_DIAMOND_SWORD);
+}
+
+bool hasIronArmor(uint inv_offset) {
+    return hasItem(inv_offset, ITEM_IRON_HELMET) ||
+           hasItem(inv_offset, ITEM_IRON_CHESTPLATE) ||
+           hasItem(inv_offset, ITEM_IRON_LEGGINGS) ||
+           hasItem(inv_offset, ITEM_IRON_BOOTS);
+}
+
+// ============================================================================
+// REWARD COMPUTATION - STAGE 1: BASIC SURVIVAL
+// ============================================================================
+
+float compute_stage1_reward(
+    uint env_id,
+    uint inv_offset,
+    Player p,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ---- Wood collection ----
+    uint wood_count = countWood(inv_offset);
+    if (wood_count > prog.wood_collected) {
+        // First wood is a bigger milestone
+        if (prog.wood_collected == 0u && wood_count > 0u) {
+            reward += 0.5;  // First wood bonus
+            prog.stage1_flags |= 1u;
+        } else {
+            reward += float(wood_count - prog.wood_collected) * 0.02;  // Incremental
+        }
+        prog.wood_collected = wood_count;
+    }
+
+    // ---- Crafting table ----
+    if ((prog.stage1_flags & 2u) == 0u && hasItem(inv_offset, ITEM_CRAFTING_TABLE)) {
+        reward += 0.3;
+        prog.stage1_flags |= 2u;
+    }
+
+    // ---- First pickaxe (any) ----
+    if ((prog.stage1_flags & 4u) == 0u && hasAnyPickaxe(inv_offset)) {
+        reward += 0.5;
+        prog.stage1_flags |= 4u;
+    }
+
+    // ---- Stone pickaxe ----
+    if ((prog.stage1_flags & 8u) == 0u && hasStoneOrBetterPickaxe(inv_offset)) {
+        reward += 0.3;
+        prog.stage1_flags |= 8u;
+    }
+
+    // ---- First sword ----
+    if ((prog.stage1_flags & 16u) == 0u && hasAnySword(inv_offset)) {
+        reward += 0.2;
+        prog.stage1_flags |= 16u;
+    }
+
+    // ---- Cobblestone collection ----
+    uint cobble = countItem(inv_offset, ITEM_COBBLESTONE);
+    if (cobble > prog.cobble_collected) {
+        // First cobble milestone
+        if (prog.cobble_collected == 0u && cobble > 0u) {
+            reward += 0.1;
+        }
+        reward += float(cobble - prog.cobble_collected) * 0.01;
+        prog.cobble_collected = cobble;
+    }
+
+    // ---- Mob kills ----
+    uint total_kills = kill_counts[env_id];
+    if (total_kills > prog.prev_mobs_killed) {
+        uint new_kills = total_kills - prog.prev_mobs_killed;
+        reward += float(new_kills) * 0.1;
+        prog.mobs_killed += new_kills;
+        prog.prev_mobs_killed = total_kills;
+    }
+
+    // ---- Furnace ----
+    if (hasItem(inv_offset, ITEM_FURNACE)) {
+        if ((prog.stage2_flags & 1u) == 0u) {
+            reward += 0.2;
+            prog.stage2_flags |= 1u;
+        }
+    }
+
+    // ---- Torch crafting (survival bonus) ----
+    if (hasItem(inv_offset, ITEM_TORCH)) {
+        reward += 0.05;  // Small survival bonus
+    }
+
+    return reward;
+}
+
+bool stage1_complete(uint inv_offset, ProgressState prog) {
+    // Completion: Has stone pickaxe + 16 cobblestone
+    return hasStoneOrBetterPickaxe(inv_offset) &&
+           prog.cobble_collected >= STAGE1_COBBLE_THRESHOLD;
+}
+
+// ============================================================================
+// REWARD COMPUTATION - STAGE 2: RESOURCE GATHERING
+// ============================================================================
+
+float compute_stage2_reward(
+    uint env_id,
+    uint inv_offset,
+    Player p,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ---- Iron ore collection ----
+    uint iron_ore = countItem(inv_offset, ITEM_IRON_ORE);
+    if (iron_ore > 0u) {
+        reward += 0.1;  // Any iron ore is progress
+    }
+
+    // ---- Iron ingot collection ----
+    uint iron = countItem(inv_offset, ITEM_IRON_INGOT);
+    if (iron > prog.iron_collected) {
+        uint new_iron = iron - prog.iron_collected;
+        reward += float(new_iron) * 0.3;
+        prog.iron_collected = iron;
+    }
+
+    // ---- Iron pickaxe ----
+    if ((prog.stage2_flags & 2u) == 0u && hasIronOrBetterPickaxe(inv_offset)) {
+        reward += 0.5;
+        prog.stage2_flags |= 2u;
+    }
+
+    // ---- Bucket ----
+    bool has_bucket = hasItem(inv_offset, ITEM_BUCKET) ||
+                      hasItem(inv_offset, ITEM_WATER_BUCKET) ||
+                      hasItem(inv_offset, ITEM_LAVA_BUCKET);
+    if ((prog.stage2_flags & 4u) == 0u && has_bucket) {
+        reward += 0.5;
+        prog.stage2_flags |= 4u;
+    }
+
+    // ---- Iron armor piece ----
+    if ((prog.stage2_flags & 8u) == 0u && hasIronArmor(inv_offset)) {
+        reward += 0.3;
+        prog.stage2_flags |= 8u;
+    }
+
+    // ---- Diamond (bonus, not required) ----
+    uint diamonds = countItem(inv_offset, ITEM_DIAMOND);
+    if (diamonds > prog.diamond_collected) {
+        reward += float(diamonds - prog.diamond_collected) * 0.5;
+        prog.diamond_collected = diamonds;
+    }
+
+    // ---- Flint and steel (needed for portal) ----
+    if (hasItem(inv_offset, ITEM_FLINT_AND_STEEL)) {
+        reward += 0.2;
+    }
+
+    // ---- Obsidian collection (portal prep) ----
+    uint obsidian = countItem(inv_offset, ITEM_OBSIDIAN);
+    if (obsidian > 0u) {
+        reward += float(min(obsidian, 10u)) * 0.1;  // Max 10 obsidian rewarded
+    }
+
+    return reward;
+}
+
+bool stage2_complete(uint inv_offset, ProgressState prog) {
+    // Completion: Has bucket + iron pickaxe + 3+ iron ingots
+    bool has_bucket = hasItem(inv_offset, ITEM_BUCKET) ||
+                      hasItem(inv_offset, ITEM_WATER_BUCKET) ||
+                      hasItem(inv_offset, ITEM_LAVA_BUCKET);
+    return has_bucket &&
+           hasIronOrBetterPickaxe(inv_offset) &&
+           prog.iron_collected >= STAGE2_IRON_THRESHOLD;
+}
+
+// ============================================================================
+// REWARD COMPUTATION - STAGE 3: NETHER NAVIGATION
+// ============================================================================
+
+float compute_stage3_reward(
+    uint env_id,
+    uint inv_offset,
+    Player p,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ---- Portal built (detected by having obsidian + flint) ----
+    if ((prog.stage3_flags & 1u) == 0u) {
+        uint obsidian = countItem(inv_offset, ITEM_OBSIDIAN);
+        bool has_flint = hasItem(inv_offset, ITEM_FLINT_AND_STEEL);
+        if (obsidian >= 10u && has_flint) {
+            reward += 1.0;  // Portal materials ready
+            prog.stage3_flags |= 1u;
+        }
+    }
+
+    // ---- Entered Nether ----
+    if ((prog.stage3_flags & 2u) == 0u && p.dimension == DIM_NETHER) {
+        reward += 0.5;
+        prog.stage3_flags |= 2u;
+    }
+
+    // ---- Fortress found (proximity-based or flag) ----
+    // This would be set by world gen system when player is near fortress
+    // For now, use blaze rod as proxy for finding fortress
+
+    // ---- Blaze rod collection ----
+    uint blaze_rods = countItem(inv_offset, ITEM_BLAZE_ROD);
+    if (blaze_rods > prog.blaze_rods) {
+        uint new_rods = blaze_rods - prog.blaze_rods;
+        reward += float(new_rods) * 0.3;
+
+        // First blaze kill bonus
+        if (prog.blaze_rods == 0u && blaze_rods > 0u) {
+            reward += 0.5;  // Found fortress bonus
+            prog.stage3_flags |= 4u;
+            prog.stage3_flags |= 8u;  // Killed blaze
+        }
+
+        prog.blaze_rods = blaze_rods;
+    }
+
+    // ---- Blaze powder (crafting progress) ----
+    uint powder = countItem(inv_offset, ITEM_BLAZE_POWDER);
+    if (powder > 0u) {
+        reward += 0.1;
+    }
+
+    // ---- Fire resistance potion would be tracked here ----
+
+    return reward;
+}
+
+bool stage3_complete(uint inv_offset, ProgressState prog) {
+    // Completion: Has 7+ blaze rods
+    return prog.blaze_rods >= STAGE3_BLAZE_ROD_THRESHOLD;
+}
+
+// ============================================================================
+// REWARD COMPUTATION - STAGE 4: ENDERMAN HUNTING + STRONGHOLD + PORTAL
+// ============================================================================
+
+// Helper: compute distance to nearest stronghold
+float distToNearestStronghold(vec3 playerPos) {
+    float min_dist = 1.0e10;
+    for (int i = 0; i < 3; i++) {
+        vec3 sh_pos = vec3(stronghold_positions[i]);
+        float dx = playerPos.x - sh_pos.x;
+        float dz = playerPos.z - sh_pos.z;
+        float dist = sqrt(dx * dx + dz * dz);
+        min_dist = min(min_dist, dist);
+    }
+    return min_dist;
+}
+
+float compute_stage4_reward(
+    uint env_id,
+    uint inv_offset,
+    Player p,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ==== PHASE 1: Ender pearl collection ====
+
+    uint pearls = countItem(inv_offset, ITEM_ENDER_PEARL);
+    if (pearls > prog.ender_pearls) {
+        uint new_pearls = pearls - prog.ender_pearls;
+        reward += float(new_pearls) * 0.2;
+
+        // First pearl bonus
+        if (prog.ender_pearls == 0u && pearls > 0u) {
+            reward += 0.5;
+            prog.stage4_flags |= 1u;  // Killed first enderman
+        }
+
+        // Threshold milestone: 6 pearls
+        if ((prog.stage4_flags & 32u) == 0u && pearls >= 6u) {
+            reward += 0.3;
+            prog.stage4_flags |= 32u;
+        }
+
+        // Threshold milestone: 12 pearls (enough for eyes)
+        if ((prog.stage4_flags & 64u) == 0u && pearls >= STAGE4_PEARL_THRESHOLD) {
+            reward += 0.5;
+            prog.stage4_flags |= 64u;
+        }
+
+        prog.ender_pearls = pearls;
+    }
+
+    // Track kill events for enderman specifically
+    uint base_kill_idx = env_id * MAX_KILLS_PER_ENV;
+    for (uint i = 0u; i < min(kill_counts[env_id], MAX_KILLS_PER_ENV); i++) {
+        KillEvent kill = kills[base_kill_idx + i];
+        if (kill.victim_type == MOB_ENDERMAN && kill.killer_id == 0xFFFFFFFFu) {
+            reward += 0.1;  // Bonus per enderman kill
+        }
+    }
+
+    // ==== PHASE 2: Eye of ender crafting ====
+
+    uint eyes = countItem(inv_offset, ITEM_EYE_OF_ENDER);
+    if (eyes > prog.eyes_crafted_s4) {
+        uint new_eyes = eyes - prog.eyes_crafted_s4;
+        reward += float(new_eyes) * 0.3;
+
+        // First eye crafted
+        if ((prog.stage4_flags & 2u) == 0u && eyes > 0u) {
+            reward += 0.5;
+            prog.stage4_flags |= 2u;
+        }
+
+        // 12 eyes milestone (enough for portal)
+        if ((prog.stage4_flags & 128u) == 0u && eyes >= STAGE5_EYE_THRESHOLD) {
+            reward += 1.0;
+            prog.stage4_flags |= 128u;
+        }
+
+        prog.eyes_crafted_s4 = eyes;
+    }
+
+    // ==== PHASE 3: Stronghold discovery ====
+
+    // Distance-based approach reward (only in overworld)
+    if (p.dimension == DIM_OVERWORLD) {
+        float curr_dist = distToNearestStronghold(p.position);
+
+        if (prog.prev_stronghold_dist > 0.0) {
+            float delta = prog.prev_stronghold_dist - curr_dist;
+            // Reward approaching stronghold (scaled by distance remaining)
+            if (delta > 0.0 && curr_dist < 3000.0) {
+                // Larger reward when closer (reward shaping gradient)
+                float proximity_scale = max(0.0, 1.0 - curr_dist / 3000.0);
+                reward += delta * 0.001 * (1.0 + proximity_scale * 2.0);
+            }
+        }
+        prog.prev_stronghold_dist = curr_dist;
+
+        // Stronghold found (within ~50 blocks and underground)
+        if ((prog.stage4_flags & 8u) == 0u && curr_dist < 50.0 && p.position.y < 45.0) {
+            reward += 2.0;
+            prog.stage4_flags |= 8u;
+        }
+    }
+
+    // ==== PHASE 4: Portal frame filling ====
+
+    uint frames_filled = portal_frames_filled[env_id];
+    if (frames_filled > prog.portal_frames_s4) {
+        uint new_frames = frames_filled - prog.portal_frames_s4;
+        reward += float(new_frames) * 0.5;  // Each frame placement is progress
+        prog.portal_frames_s4 = frames_filled;
+    }
+
+    // Portal activated (all 12 frames filled)
+    if ((prog.stage4_flags & 16u) == 0u && frames_filled >= 12u) {
+        reward += 5.0;  // Major milestone: portal is ready
+        prog.stage4_flags |= 16u;
+    }
+
+    return reward;
+}
+
+bool stage4_complete(uint inv_offset, ProgressState prog) {
+    // Completion: Portal activated (all 12 frames filled)
+    // Fallback: has 12+ pearls AND portal is activated
+    return (prog.stage4_flags & 16u) != 0u;
+}
+
+// ============================================================================
+// REWARD COMPUTATION - STAGE 5: STRONGHOLD FINDING
+// ============================================================================
+
+float compute_stage5_reward(
+    uint env_id,
+    uint inv_offset,
+    Player p,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ---- Eyes of ender crafted ----
+    uint eyes = countItem(inv_offset, ITEM_EYE_OF_ENDER);
+    if (eyes > prog.eyes_crafted) {
+        uint new_eyes = eyes - prog.eyes_crafted;
+        reward += float(new_eyes) * 0.1;
+
+        // First eye bonus
+        if (prog.eyes_crafted == 0u && eyes > 0u) {
+            reward += 0.2;
+            prog.stage5_flags |= 1u;
+        }
+
+        prog.eyes_crafted = eyes;
+    }
+
+    // ---- Stronghold found (would be set by world gen) ----
+    // For now check if player is at stronghold Y level (underground)
+    if ((prog.stage5_flags & 2u) == 0u &&
+        p.dimension == DIM_OVERWORLD &&
+        p.position.y < 40.0) {
+        // Could be near stronghold, give exploration bonus
+        reward += 0.05;
+    }
+
+    // ---- Portal room found and activated ----
+    // This would be detected by the portal activation system
+    // When portal is activated, stage6_flags bit 0 gets set
+
+    return reward;
+}
+
+bool stage5_complete(uint inv_offset, ProgressState prog) {
+    // Completion: Portal activated (checked via stage5_flags bit 2)
+    // Or has 12+ eyes and is underground (rough proxy)
+    return (prog.stage5_flags & 4u) != 0u;
+}
+
+// ============================================================================
+// REWARD COMPUTATION - STAGE 6: DRAGON FIGHT
+// ============================================================================
+
+float compute_stage6_reward(
+    uint env_id,
+    uint inv_offset,
+    Player p,
+    DragonState dragon,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ---- Entered The End ----
+    if ((prog.stage6_flags & 1u) == 0u && p.dimension == DIM_END) {
+        reward += 0.5;
+        prog.stage6_flags |= 1u;
+    }
+
+    // ---- Crystal destruction ----
+    uint current_crystals = bitCount(dragon.crystals_alive);
+    uint destroyed = MAX_CRYSTALS - current_crystals;
+
+    if (destroyed > prog.crystals_destroyed) {
+        uint new_destroyed = destroyed - prog.crystals_destroyed;
+        reward += float(new_destroyed) * 0.5;
+
+        // First crystal bonus
+        if (prog.crystals_destroyed == 0u && destroyed > 0u) {
+            reward += 0.3;
+            prog.stage6_flags |= 2u;
+        }
+
+        prog.crystals_destroyed = destroyed;
+    }
+
+    // ---- Dragon damage ----
+    float dragon_health_lost = prog.prev_dragon_health - dragon.health;
+    if (dragon_health_lost > 0.0) {
+        reward += dragon_health_lost * 0.01;  // +0.01 per HP damage
+        prog.dragon_damage_dealt += dragon_health_lost;
+        prog.prev_dragon_health = dragon.health;
+    }
+
+    // ---- Dragon kill ----
+    if (prog.dragon_killed == 0u && dragon.health <= 0.0) {
+        reward += 10.0;  // Massive reward for dragon kill
+        prog.dragon_killed = 1u;
+
+        // Time bonus
+        uint elapsed_ticks = pc.tick - prog.start_tick;
+        uint elapsed_seconds = elapsed_ticks / 20u;
+
+        if (elapsed_seconds < 300u) {        // Under 5 min
+            reward += 5.0;
+        }
+        if (elapsed_seconds < 600u) {        // Under 10 min
+            reward += 3.0;
+        }
+        if (elapsed_seconds < 900u) {        // Under 15 min
+            reward += 2.0;
+        }
+    }
+
+    // ---- Bed placement near dragon (one-cycle strat) ----
+    if (hasItem(inv_offset, ITEM_BED) && p.dimension == DIM_END) {
+        // Beds are valuable in The End
+        reward += 0.1;
+    }
+
+    // ---- Positioning reward: being near fountain when dragon perches ----
+    if (dragon.phase == 4u) {  // PERCHING
+        float dist_to_fountain = length(p.position);  // Fountain at origin
+        if (dist_to_fountain < 10.0) {
+            reward += 0.1;  // Positioning bonus
+        }
+    }
+
+    return reward;
+}
+
+bool stage6_complete(ProgressState prog) {
+    return prog.dragon_killed != 0u;
+}
+
+// ============================================================================
+// MAIN REWARD FUNCTION
+// ============================================================================
+
+float compute_reward(
+    uint env_id,
+    uint inv_offset,
+    Player prev_player,
+    Player curr_player,
+    DragonState dragon,
+    uint stage,
+    inout ProgressState prog
+) {
+    float reward = 0.0;
+
+    // ---- Base penalties (all stages) ----
+
+    // Time penalty (encourages efficiency)
+    reward -= 0.0001;
+
+    // Death penalty
+    if (curr_player.health <= 0.0) {
+        reward -= 1.0;
+        prog.total_deaths += 1u;
+        return reward;  // No further rewards on death
+    }
+
+    // Damage taken penalty
+    float damage_taken = prog.prev_health - curr_player.health;
+    if (damage_taken > 0.0) {
+        reward -= damage_taken * 0.01;
+    }
+    prog.prev_health = curr_player.health;
+
+    // ---- Dimension change bonuses ----
+    if (curr_player.dimension != prog.prev_dimension) {
+        if (curr_player.dimension == DIM_NETHER && prog.prev_dimension == DIM_OVERWORLD) {
+            reward += 0.3;  // Entered nether
+        }
+        if (curr_player.dimension == DIM_END) {
+            reward += 0.5;  // Entered the end
+        }
+        prog.prev_dimension = curr_player.dimension;
+    }
+
+    // ---- Stage-specific rewards ----
+    switch (stage) {
+        case 1u:
+            reward += compute_stage1_reward(env_id, inv_offset, curr_player, prog);
+            if (stage1_complete(inv_offset, prog)) {
+                reward += 2.0;  // Stage completion bonus
+                stage_complete[env_id] = 1u;
+            }
+            break;
+
+        case 2u:
+            reward += compute_stage2_reward(env_id, inv_offset, curr_player, prog);
+            if (stage2_complete(inv_offset, prog)) {
+                reward += 2.0;
+                stage_complete[env_id] = 1u;
+            }
+            break;
+
+        case 3u:
+            reward += compute_stage3_reward(env_id, inv_offset, curr_player, prog);
+            if (stage3_complete(inv_offset, prog)) {
+                reward += 3.0;
+                stage_complete[env_id] = 1u;
+            }
+            break;
+
+        case 4u:
+            reward += compute_stage4_reward(env_id, inv_offset, curr_player, prog);
+            if (stage4_complete(inv_offset, prog)) {
+                reward += 5.0;  // Portal activated - ready for End
+                stage_complete[env_id] = 1u;
+            }
+            break;
+
+        case 5u:
+            reward += compute_stage5_reward(env_id, inv_offset, curr_player, prog);
+            if (stage5_complete(inv_offset, prog)) {
+                reward += 3.0;
+                stage_complete[env_id] = 1u;
+            }
+            break;
+
+        case 6u:
+            reward += compute_stage6_reward(env_id, inv_offset, curr_player, dragon, prog);
+            if (stage6_complete(prog)) {
+                // Full game completion bonuses
+                uint total_ticks = pc.tick - prog.start_tick;
+                uint total_minutes = total_ticks / (20u * 60u);
+
+                if (total_minutes < 10u) {
+                    reward += 50.0;  // World record pace
+                } else if (total_minutes < 15u) {
+                    reward += 20.0;
+                } else if (total_minutes < 20u) {
+                    reward += 10.0;
+                } else if (total_minutes < 30u) {
+                    reward += 5.0;
+                }
+
+                stage_complete[env_id] = 1u;
+                dones[env_id] = 1u;
+            }
+            break;
+    }
+
+    return reward;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+
+    if (env_id >= pc.num_envs) return;
+
+    // Load state
+    Player curr = players[env_id];
+    ProgressState prog = progress[env_id];
+    uint inv_offset = getInventoryOffset(env_id);
+
+    // Create "previous" player state from progress tracking
+    Player prev;
+    prev.health = prog.prev_health;
+    prev.dimension = prog.prev_dimension;
+
+    // Load dragon state (only relevant for stage 6)
+    DragonState dragon;
+    if (pc.curriculum_stage == 6u) {
+        dragon = dragons[env_id];
+    } else {
+        dragon.health = 200.0;
+        dragon.phase = 0u;
+        dragon.crystals_alive = 0x3FFu;  // All 10 alive
+    }
+
+    // Initialize progress if needed
+    if (prog.start_tick == 0u) {
+        prog.start_tick = pc.tick;
+        prog.prev_health = curr.health;
+        prog.prev_dragon_health = 200.0;
+        prog.prev_dimension = curr.dimension;
+        // Stage 4: initialize stronghold distance tracking
+        if (pc.curriculum_stage == 4u) {
+            prog.prev_stronghold_dist = distToNearestStronghold(curr.position);
+        }
+    }
+
+    // Compute reward
+    float reward = compute_reward(
+        env_id,
+        inv_offset,
+        prev,
+        curr,
+        dragon,
+        pc.curriculum_stage,
+        prog
+    );
+
+    // Write outputs
+    rewards[env_id] += reward;  // Accumulate (may be called multiple times per tick)
+    progress[env_id] = prog;
+}

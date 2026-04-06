@@ -1,0 +1,143 @@
+id: 2
+name: Resource Gathering
+description: >-
+  Master resource collection and crafting progression. Mine ores, smelt them
+  in furnaces, and craft iron/diamond equipment. Build a basic shelter for
+  safety during night.
+objectives:
+  - Mine 32 cobblestone
+  - Mine 16 iron ore
+  - Mine 3 diamonds
+  - Build a furnace
+  - Smelt iron ingots
+  - Craft iron pickaxe
+  - Craft iron sword
+  - Build basic shelter (enclosed space)
+spawn:
+  biome: plains
+  time_of_day: 0
+  weather: clear
+  random_position: true
+  position: null
+  inventory:
+    wooden_pickaxe: 1
+    wooden_sword: 1
+    oak_log: 16
+  health: 20.0
+  hunger: 20.0
+rewards:
+  sparse_reward: 15.0
+  dense_rewards:
+    cobblestone_mined: 0.02
+    coal_mined: 0.1
+    iron_ore_mined: 0.3
+    gold_ore_mined: 0.2
+    diamond_mined: 1.0
+    redstone_mined: 0.1
+    lapis_mined: 0.1
+    stone_pickaxe_crafted: 0.3
+    stone_sword_crafted: 0.2
+    furnace_crafted: 0.5
+    iron_ingot_smelted: 0.2
+    iron_pickaxe_crafted: 0.8
+    iron_sword_crafted: 0.8
+    iron_armor_crafted: 0.5
+    diamond_pickaxe_crafted: 1.5
+    diamond_sword_crafted: 1.5
+    block_placed: 0.01
+    shelter_built: 2.0
+    bed_crafted: 0.5
+    vertical_mining: 0.05
+    cave_found: 0.3
+    ore_vein_found: 0.2
+  penalty_per_death: -1.5
+  penalty_per_tick: -0.0001
+  exploration_bonus: 0.02
+termination:
+  max_ticks: 48000
+  max_deaths: 7
+  success_conditions:
+    - objective:mine_cobblestone >= 32
+    - objective:mine_iron >= 16
+    - objective:mine_diamond >= 3
+    - inventory:iron_pickaxe >= 1
+    - inventory:iron_sword >= 1
+    - objective:shelter_built == True
+  failure_conditions:
+    - deaths >= max_deaths
+    - ticks >= max_ticks
+prerequisites:
+  - 1
+difficulty: 3
+expected_episodes: 1000
+action_space:
+  - move_forward
+  - move_backward
+  - move_left
+  - move_right
+  - jump
+  - sprint
+  - sneak
+  - camera_pitch
+  - camera_yaw
+  - attack
+  - use
+  - hotbar_1
+  - hotbar_2
+  - hotbar_3
+  - hotbar_4
+  - hotbar_5
+  - hotbar_6
+  - hotbar_7
+  - hotbar_8
+  - hotbar_9
+  - drop_item
+  - open_inventory
+  - craft
+  - smelt
+  - place_block
+observation_space:
+  - position
+  - velocity
+  - health
+  - hunger
+  - inventory
+  - nearby_entities
+  - nearby_blocks
+  - block_below
+  - light_level
+  - y_level
+  - time_of_day
+  - is_day
+  - equipped_item
+  - damage_source
+  - shelter_status
+  - iron_ore_count
+  - iron_ingot_count
+  - diamond_count
+  - obsidian_count
+  - iron_ore_nearby
+  - diamond_ore_nearby
+  - obsidian_nearby
+  - ore_vein_direction
+curriculum_threshold: 0.65
+shader_set:
+  - furnace_tick
+  - item_physics
+  - block_updates
+metadata:
+  min_y_for_iron: 64
+  min_y_for_diamond: 16
+  optimal_diamond_y: 11
+  difficulty: normal
+  target_completion_time: 36000
+  advancement_threshold: 0.75
+  min_obsidian_episodes: 5
+  progress_keys:
+    - iron_ore_mined
+    - iron_ingot_smelted
+    - diamond_mined
+    - obsidian_mined
+    - iron_pickaxe_crafted
+    - diamond_pickaxe_crafted
+    - shelter_built

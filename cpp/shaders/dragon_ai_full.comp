@@ -1,0 +1,705 @@
+#version 450
+
+// MC 1.8.9 Ender Dragon AI - Accurate Phase Implementation
+// In 1.8.9, the dragon ONLY circles and performs dive attacks.
+// NO perching on fountain, NO breath attack (those were added in 1.9).
+// The dragon heals from end crystals and takes 10 damage when a connected crystal is destroyed.
+// MoltenVK compatible - all bindings in single descriptor set
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint stage;
+    uint num_envs;
+    uint tick;
+    uint random_seed;
+} pc;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Physics
+const float GRAVITY = -0.08;
+const float DRAG_AIR = 0.98;
+
+// Dragon phases (MC 1.8.9 - NO perching or breath attack)
+const uint PHASE_CIRCLING = 0u;
+const uint PHASE_STRAFING = 1u;   // Dive attack passes
+const uint PHASE_CHARGING = 2u;   // Direct charge at player
+const uint PHASE_DYING = 3u;      // Death animation
+
+// Dragon movement parameters
+const float CIRCLE_RADIUS_MIN = 50.0;
+const float CIRCLE_RADIUS_MAX = 80.0;
+const float CIRCLE_ALTITUDE_MIN = 70.0;
+const float CIRCLE_ALTITUDE_MAX = 90.0;
+const float CIRCLE_SPEED = 0.03;
+
+const float STRAFE_SPEED = 2.5;
+const float STRAFE_DIVE_ANGLE = 0.3;
+const float STRAFE_PULL_UP_HEIGHT = 40.0;
+
+const float CHARGE_SPEED = 4.0;
+const float CHARGE_DIVE_ANGLE = 0.5;
+
+// MC 1.8.9: No landing/perching, dragon only circles and attacks
+
+// Dragon body
+const float DRAGON_MAX_HEALTH = 200.0;
+const float DRAGON_BODY_RADIUS = 4.0;
+const float DRAGON_HEAD_RADIUS = 2.5;
+const vec3 DRAGON_HEAD_OFFSET = vec3(0.0, 0.0, 6.0);
+
+// Damage values
+const float HEAD_DAMAGE_MULT = 4.0;
+const float BODY_DAMAGE_MULT = 1.0;
+const float WING_KNOCKBACK = 12.0;
+const float CHARGE_DAMAGE = 5.0;
+
+// Phase transition probabilities (per tick)
+const float CIRCLE_TO_STRAFE_CHANCE = 0.003;  // ~60% over 5-10 seconds
+const float CIRCLE_TO_CHARGE_CHANCE = 0.0015; // ~30% if player far
+const float CIRCLE_TO_PERCH_CHANCE = 0.0005;  // ~10% or forced if no crystals
+const float MIN_CIRCLE_TIME = 100u;           // 5 seconds minimum
+const float MAX_CIRCLE_TIME = 200u;           // 10 seconds maximum
+
+// Strafe parameters
+const uint MIN_STRAFE_ATTACKS = 3u;
+const uint MAX_STRAFE_ATTACKS = 5u;
+
+// Arena bounds
+const float ARENA_RADIUS = 100.0;
+const float FOUNTAIN_RADIUS = 5.0;
+const vec3 FOUNTAIN_CENTER = vec3(0.0, 64.0, 0.0);
+
+// Crystal count
+const uint NUM_CRYSTALS = 10u;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct Dragon {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+
+    float health;
+    uint phase;
+    uint phase_timer;
+    uint subphase;
+
+    vec3 target_position;
+    float circle_angle;
+
+    float circle_radius;
+    float circle_altitude;
+    uint strafe_attacks;
+    uint strafe_attack_count;
+
+    float breath_timer;
+    uint perch_timer;
+    uint attack_cooldown;
+    uint damage_taken_while_perched;
+
+    float wing_angle;
+    float body_pitch;
+    float roll;
+    uint flags;
+};
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint invincibility_timer;
+    uint attack_cooldown;
+    uint weapon_slot;
+    float arrow_charge;
+    uint arrows;
+    uint reserved[2];
+};
+
+struct Crystal {
+    vec3 position;
+    float is_alive;
+};
+
+struct GameState {
+    uint tick_number;
+    uint game_flags;
+    uint random_seed;
+    float delta_time;
+    uint crystals_destroyed;
+    uint dragon_hits;
+    uint player_deaths;
+    float best_dragon_damage;
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer DragonBuffer {
+    Dragon dragons[];
+};
+
+layout(set = 0, binding = 1) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 2) buffer CrystalBuffer {
+    Crystal crystals[];
+};
+
+layout(set = 0, binding = 3) buffer GameStateBuffer {
+    GameState game_states[];
+};
+
+layout(set = 0, binding = 4) buffer RewardBuffer {
+    float rewards[];
+};
+
+layout(set = 0, binding = 5) buffer DoneBuffer {
+    uint dones[];
+};
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+float rand_range(inout uint seed, float a, float b) {
+    return a + rand(seed) * (b - a);
+}
+
+float clamp01(float x) { return clamp(x, 0.0, 1.0); }
+
+float ease_out_cubic(float t) {
+    return 1.0 - pow(1.0 - t, 3.0);
+}
+
+float ease_in_out_quad(float t) {
+    return t < 0.5 ? 2.0 * t * t : 1.0 - pow(-2.0 * t + 2.0, 2.0) / 2.0;
+}
+
+// Smooth steering toward target position
+vec3 steer_toward(vec3 current_pos, vec3 current_vel, vec3 target, float max_speed, float turn_rate) {
+    vec3 desired = target - current_pos;
+    float dist = length(desired);
+    if (dist < 0.001) return current_vel;
+
+    desired = normalize(desired) * max_speed;
+    vec3 steering = desired - current_vel;
+    float steer_len = length(steering);
+    if (steer_len > turn_rate) {
+        steering = steering / steer_len * turn_rate;
+    }
+    return current_vel + steering;
+}
+
+// Count alive crystals for an environment
+uint count_alive_crystals(uint env_id) {
+    uint base = env_id * NUM_CRYSTALS;
+    uint count = 0u;
+    for (uint i = 0u; i < NUM_CRYSTALS; i++) {
+        if (crystals[base + i].is_alive > 0.5) count++;
+    }
+    return count;
+}
+
+// Update dragon facing based on velocity
+void update_dragon_facing(inout Dragon d) {
+    float speed = length(d.velocity);
+    if (speed > 0.01) {
+        // Yaw from XZ direction
+        d.yaw = degrees(atan(d.velocity.x, d.velocity.z));
+        // Pitch from vertical component
+        d.body_pitch = degrees(asin(clamp(-d.velocity.y / speed, -1.0, 1.0)));
+        // Roll based on turn rate (derivative of yaw)
+        d.roll = clamp(d.velocity.x * 5.0, -30.0, 30.0);
+    }
+    // Wing flap animation
+    d.wing_angle = sin(float(pc.tick) * 0.15) * 25.0;
+}
+
+// ============================================================================
+// PHASE BEHAVIORS
+// ============================================================================
+
+// CIRCLING: Fly around fountain in a circle, pick next phase (MC 1.8.9)
+void phase_circling(inout Dragon d, Player p, uint env_id, inout uint seed) {
+    d.phase_timer++;
+
+    // Update circle angle
+    d.circle_angle += CIRCLE_SPEED;
+    if (d.circle_angle > 6.283185) d.circle_angle -= 6.283185;
+
+    // Vary altitude with sine wave for more natural movement
+    float altitude_wave = sin(d.circle_angle * 2.0) * 10.0;
+    float target_altitude = mix(CIRCLE_ALTITUDE_MIN, CIRCLE_ALTITUDE_MAX,
+                                (sin(d.circle_angle * 0.5) + 1.0) * 0.5) + altitude_wave;
+
+    // Calculate target position on circle
+    d.target_position = vec3(
+        FOUNTAIN_CENTER.x + cos(d.circle_angle) * d.circle_radius,
+        target_altitude,
+        FOUNTAIN_CENTER.z + sin(d.circle_angle) * d.circle_radius
+    );
+
+    // Steer toward target
+    d.velocity = steer_toward(d.position, d.velocity, d.target_position, CIRCLE_SPEED * 50.0, 0.08);
+
+    // Phase transitions (after minimum circle time) - MC 1.8.9: only strafe/charge
+    if (d.phase_timer >= MIN_CIRCLE_TIME) {
+        vec3 to_player = p.position - d.position;
+        float player_dist = length(to_player);
+
+        // Random phase selection
+        float roll = rand(seed);
+
+        // 70% chance: STRAFING (dive attack on player)
+        if (roll < 0.007 && d.phase_timer >= MIN_CIRCLE_TIME) {
+            d.phase = PHASE_STRAFING;
+            d.phase_timer = 0u;
+            d.strafe_attacks = 0u;
+            d.strafe_attack_count = uint(rand_range(seed, float(MIN_STRAFE_ATTACKS), float(MAX_STRAFE_ATTACKS)));
+            d.subphase = 0u;  // 0 = diving, 1 = pulling up
+            return;
+        }
+
+        // 30% chance: CHARGING (if player is far, >40 blocks)
+        if (roll < 0.01 && player_dist > 40.0) {
+            d.phase = PHASE_CHARGING;
+            d.phase_timer = 0u;
+            d.target_position = p.position + vec3(0.0, 2.0, 0.0);
+            return;
+        }
+
+        // Force strafe transition after max circle time
+        if (d.phase_timer >= MAX_CIRCLE_TIME) {
+            d.phase = PHASE_STRAFING;
+            d.phase_timer = 0u;
+            d.strafe_attacks = 0u;
+            d.strafe_attack_count = uint(rand_range(seed, float(MIN_STRAFE_ATTACKS), float(MAX_STRAFE_ATTACKS)));
+            d.subphase = 0u;
+        }
+    }
+}
+                d.subphase = 0u;
+            } else {
+                d.perch_timer = PERCH_DURATION_TICKS;
+                d.breath_timer = 0.0;
+                d.damage_taken_while_perched = 0u;
+                d.target_position = FOUNTAIN_CENTER + vec3(0.0, 4.0, 0.0);
+            }
+        }
+    }
+}
+
+// STRAFING: Attack player while flying past, multiple passes
+void phase_strafing(inout Dragon d, Player p, uint env_id, inout uint seed) {
+    d.phase_timer++;
+
+    vec3 to_player = p.position - d.position;
+    float player_dist = length(to_player);
+
+    if (d.subphase == 0u) {
+        // Diving toward player
+        vec3 attack_target = p.position + vec3(0.0, 2.0, 0.0);
+
+        // Lead the target based on player velocity
+        attack_target += p.velocity * (player_dist / STRAFE_SPEED) * 0.5;
+
+        d.target_position = attack_target;
+        d.velocity = steer_toward(d.position, d.velocity, d.target_position, STRAFE_SPEED, 0.12);
+
+        // Add downward component for dive
+        if (d.position.y > attack_target.y + 10.0) {
+            d.velocity.y -= STRAFE_DIVE_ANGLE;
+        }
+
+        // Check if close enough to count as attack
+        if (player_dist < 8.0) {
+            d.strafe_attacks++;
+            d.subphase = 1u;  // Switch to pull-up
+            d.attack_cooldown = 20u;  // Cooldown before next attack
+        }
+
+        // Timeout - if we've been diving too long, pull up anyway
+        if (d.phase_timer > 60u) {
+            d.subphase = 1u;
+        }
+    } else {
+        // Pulling up after attack
+        d.target_position = d.position + vec3(
+            -sin(radians(d.yaw)) * 30.0,
+            STRAFE_PULL_UP_HEIGHT - d.position.y + 20.0,
+            cos(radians(d.yaw)) * 30.0
+        );
+
+        d.velocity = steer_toward(d.position, d.velocity, d.target_position, STRAFE_SPEED * 0.8, 0.1);
+
+        // Once high enough, check if we should do another pass
+        if (d.position.y > STRAFE_PULL_UP_HEIGHT) {
+            if (d.strafe_attacks < d.strafe_attack_count) {
+                // More attacks to do
+                d.subphase = 0u;
+                d.phase_timer = 0u;
+            } else {
+                // Done strafing, return to circling
+                d.phase = PHASE_CIRCLING;
+                d.phase_timer = 0u;
+                d.circle_radius = rand_range(seed, CIRCLE_RADIUS_MIN, CIRCLE_RADIUS_MAX);
+                d.circle_altitude = rand_range(seed, CIRCLE_ALTITUDE_MIN, CIRCLE_ALTITUDE_MAX);
+            }
+        }
+    }
+}
+
+// CHARGING: High-speed dive at player, causes wing damage
+void phase_charging(inout Dragon d, Player p, uint env_id, inout uint seed) {
+    d.phase_timer++;
+
+    vec3 to_player = p.position - d.position;
+    float player_dist = length(to_player);
+
+    // Update target to track player with some lead
+    d.target_position = p.position + p.velocity * 0.5 + vec3(0.0, 1.5, 0.0);
+
+    // High speed steering
+    d.velocity = steer_toward(d.position, d.velocity, d.target_position, CHARGE_SPEED, 0.15);
+
+    // Steep dive angle
+    if (d.position.y > d.target_position.y + 5.0) {
+        d.velocity.y -= CHARGE_DIVE_ANGLE * 0.5;
+    }
+
+    // End charge conditions:
+    // 1. Passed the player (overshot)
+    float closing_speed = -dot(normalize(to_player), d.velocity);
+    bool overshot = closing_speed < 0.0 && player_dist < 15.0;
+
+    // 2. Very close to player (hit)
+    bool hit_player = player_dist < 5.0;
+
+    // 3. Too low (about to hit ground)
+    bool too_low = d.position.y < FOUNTAIN_CENTER.y + 10.0;
+
+    // 4. Timeout
+    bool timeout = d.phase_timer > 100u;
+
+    if (overshot || hit_player || too_low || timeout) {
+        d.phase = PHASE_CIRCLING;
+        d.phase_timer = 0u;
+        d.circle_radius = rand_range(seed, CIRCLE_RADIUS_MIN, CIRCLE_RADIUS_MAX);
+
+        // Force upward after charge
+        d.velocity.y = abs(d.velocity.y) + 1.0;
+    }
+}
+
+// DEPRECATED: MC 1.9+ only - PERCHING phase does not exist in MC 1.8.9
+// The dragon never lands on the fountain in 1.8.9
+#if 0  // Disabled for MC 1.8.9 accuracy
+void phase_perching(inout Dragon d, Player p, uint env_id, inout uint seed) {
+    d.phase_timer++;
+
+    vec3 perch_target = FOUNTAIN_CENTER + vec3(0.0, 4.0, 0.0);
+    float dist_to_perch = length(d.position - perch_target);
+
+    // Still landing?
+    if (dist_to_perch > 2.0) {
+        d.velocity = steer_toward(d.position, d.velocity, perch_target, LANDING_SPEED, 0.1);
+
+        // Slow down as we approach
+        float approach_factor = clamp01(dist_to_perch / 20.0);
+        d.velocity *= mix(0.5, 1.0, approach_factor);
+    } else {
+        // Landed - minimal movement, face nearest player
+        d.velocity *= 0.1;
+        d.position = mix(d.position, perch_target, 0.1);
+
+        // Face toward player
+        vec3 to_player = p.position - d.position;
+        float player_dist = length(to_player.xz);
+        if (player_dist > 1.0) {
+            float target_yaw = degrees(atan(to_player.x, to_player.z));
+            d.yaw = mix(d.yaw, target_yaw, 0.05);  // Slow turn
+        }
+
+        // Breath attack
+        d.breath_timer += 1.0;
+
+        // Check if player is in breath cone
+        vec3 dragon_forward = vec3(-sin(radians(d.yaw)), 0.0, cos(radians(d.yaw)));
+        float player_in_front = dot(normalize(to_player.xzy), dragon_forward);
+
+        // Breath attack hits if player is:
+        // - Within range
+        // - In front of dragon (within ~60 degree cone)
+        // - Timer says so (damage every ~0.5 seconds)
+        if (player_dist < PERCH_BREATH_RANGE &&
+            player_in_front > 0.5 &&
+            uint(d.breath_timer) % 10u == 0u &&
+            p.invincibility_timer == 0u) {
+            // Damage handled in combat stage
+        }
+
+        // Decrement perch timer
+        if (d.perch_timer > 0u) {
+            d.perch_timer--;
+        }
+
+        // Leave conditions:
+        // 1. Timer expired (10 seconds)
+        // 2. Took heavy damage (>50 damage while perched)
+        bool timer_expired = d.perch_timer == 0u;
+        bool heavy_damage = d.damage_taken_while_perched > 50u;
+
+        if (timer_expired || heavy_damage) {
+            d.phase = PHASE_LEAVING;
+            d.phase_timer = 0u;
+            d.breath_timer = 0.0;
+        }
+    }
+}
+#endif  // MC 1.8.9 - phase_perching disabled
+
+// DEPRECATED: MC 1.9+ only - LEAVING phase does not exist in MC 1.8.9
+#if 0  // Disabled for MC 1.8.9 accuracy
+void phase_leaving(inout Dragon d, Player p, uint env_id, inout uint seed) {
+    d.phase_timer++;
+
+    // Target: high altitude above fountain
+    d.target_position = vec3(
+        FOUNTAIN_CENTER.x + cos(d.circle_angle) * 20.0,
+        TAKEOFF_TARGET_HEIGHT,
+        FOUNTAIN_CENTER.z + sin(d.circle_angle) * 20.0
+    );
+
+    d.velocity = steer_toward(d.position, d.velocity, d.target_position, TAKEOFF_SPEED, 0.08);
+
+    // Boost upward
+    d.velocity.y += 0.05;
+
+    // Once high enough, return to circling
+    if (d.position.y > TAKEOFF_TARGET_HEIGHT - 5.0) {
+        d.phase = PHASE_CIRCLING;
+        d.phase_timer = 0u;
+        d.circle_radius = rand_range(seed, CIRCLE_RADIUS_MIN, CIRCLE_RADIUS_MAX);
+        d.circle_altitude = rand_range(seed, CIRCLE_ALTITUDE_MIN, CIRCLE_ALTITUDE_MAX);
+    }
+
+    // Timeout - force transition
+    if (d.phase_timer > 100u) {
+        d.phase = PHASE_CIRCLING;
+        d.phase_timer = 0u;
+    }
+}
+#endif  // MC 1.8.9 - phase_leaving disabled
+
+// DYING: Death animation at fountain, terminal state
+void phase_dying(inout Dragon d, uint env_id) {
+    d.phase_timer++;
+
+    // Fly toward fountain center
+    float death_progress = float(d.phase_timer) / 200.0;  // 10 second death animation
+
+    if (death_progress < 0.3) {
+        // Phase 1: Fly to fountain
+        d.target_position = FOUNTAIN_CENTER + vec3(0.0, 20.0, 0.0);
+        d.velocity = steer_toward(d.position, d.velocity, d.target_position, 1.5, 0.05);
+    } else if (death_progress < 0.7) {
+        // Phase 2: Rise up while spinning
+        d.target_position = FOUNTAIN_CENTER + vec3(0.0, 50.0 * ease_out_cubic((death_progress - 0.3) / 0.4), 0.0);
+        d.velocity = steer_toward(d.position, d.velocity, d.target_position, 1.0, 0.03);
+        d.yaw += 5.0;  // Spin
+    } else if (death_progress < 1.0) {
+        // Phase 3: Explode (handled by particle system)
+        d.velocity *= 0.9;
+    } else {
+        // Done - dragon fully dead
+        d.position = vec3(0.0, -1000.0, 0.0);  // Move off-world
+    }
+}
+
+// ============================================================================
+// MAIN AI UPDATE
+// ============================================================================
+
+void update_dragon_ai(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    Dragon d = dragons[env_id];
+    Player p = players[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = hash(gs.random_seed ^ env_id ^ pc.tick);
+
+    // Skip if dragon is dead and animation complete
+    if (d.health <= 0.0 && d.phase != PHASE_DYING) {
+        d.phase = PHASE_DYING;
+        d.phase_timer = 0u;
+    }
+
+    // Process current phase
+    switch (d.phase) {
+        case PHASE_CIRCLING:
+            phase_circling(d, p, env_id, seed);
+            break;
+
+        case PHASE_STRAFING:
+            phase_strafing(d, p, env_id, seed);
+            break;
+
+        case PHASE_CHARGING:
+            phase_charging(d, p, env_id, seed);
+            break;
+
+        // MC 1.8.9: PHASE_PERCHING and PHASE_LEAVING do not exist
+        // case PHASE_PERCHING:
+        //     phase_perching(d, p, env_id, seed);
+        //     break;
+        // case PHASE_LEAVING:
+        //     phase_leaving(d, p, env_id, seed);
+        //     break;
+
+        case PHASE_DYING:
+            phase_dying(d, env_id);
+            break;
+    }
+
+    // Apply velocity
+    d.position += d.velocity;
+
+    // Arena bounds (keep within End island)
+    vec2 from_center = d.position.xz - FOUNTAIN_CENTER.xz;
+    float dist_from_center = length(from_center);
+    if (dist_from_center > ARENA_RADIUS) {
+        d.position.xz = FOUNTAIN_CENTER.xz + normalize(from_center) * ARENA_RADIUS;
+        // Steer back toward center
+        vec3 to_center = vec3(-from_center.x, 0.0, -from_center.y);
+        d.velocity += normalize(to_center) * 0.1;
+    }
+
+    // Height bounds
+    d.position.y = clamp(d.position.y, FOUNTAIN_CENTER.y + 5.0, 120.0);
+
+    // Apply drag
+    d.velocity *= DRAG_AIR;
+
+    // Update facing
+    update_dragon_facing(d);
+
+    // Decrement cooldowns
+    if (d.attack_cooldown > 0u) d.attack_cooldown--;
+
+    // Write back
+    dragons[env_id] = d;
+    game_states[env_id].random_seed = seed;
+}
+
+// ============================================================================
+// COMBAT PROCESSING
+// ============================================================================
+
+void process_dragon_combat(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    Dragon d = dragons[env_id];
+    Player p = players[env_id];
+
+    if (d.health <= 0.0 || d.phase == PHASE_DYING) return;
+    if ((p.flags & 8u) != 0u) return;  // Player dead
+
+    vec3 to_player = p.position - d.position;
+    float player_dist = length(to_player);
+
+    // Contact damage based on phase
+    if (p.invincibility_timer == 0u) {
+        // Charging: high damage + wing knockback
+        if (d.phase == PHASE_CHARGING && player_dist < 6.0 && d.attack_cooldown == 0u) {
+            p.health = max(0.0, p.health - CHARGE_DAMAGE);
+            p.invincibility_timer = 10u;
+
+            // Heavy knockback in charge direction
+            vec3 kb = normalize(d.velocity) * WING_KNOCKBACK;
+            kb.y = 0.5;
+            p.velocity += kb;
+
+            d.attack_cooldown = 20u;
+            rewards[env_id] -= 5.0;
+        }
+
+        // Strafing: moderate damage during dive
+        if (d.phase == PHASE_STRAFING && d.subphase == 0u && player_dist < 5.0 && d.attack_cooldown == 0u) {
+            p.health = max(0.0, p.health - 3.0);
+            p.invincibility_timer = 10u;
+
+            vec3 kb = normalize(d.velocity) * 8.0;
+            kb.y = 0.4;
+            p.velocity += kb;
+
+            d.attack_cooldown = 20u;
+            rewards[env_id] -= 3.0;
+        }
+
+        // MC 1.8.9: No perching/breath attack - dragon never lands
+        // Perching breath attack damage removed (1.9+ feature)
+
+        // General body collision (any phase)
+        if (player_dist < DRAGON_BODY_RADIUS + 1.0 && d.attack_cooldown == 0u) {
+            p.health = max(0.0, p.health - 2.0);
+            p.invincibility_timer = 10u;
+
+            // Push player away
+            vec3 kb = normalize(to_player) * 5.0;
+            kb.y = 0.3;
+            p.velocity += kb;
+        }
+    }
+
+    // Player death check
+    if (p.health <= 0.0) {
+        p.flags |= 8u;  // FLAG_DEAD
+        dones[env_id] = 1u;
+        rewards[env_id] -= 50.0;
+    }
+
+    players[env_id] = p;
+    dragons[env_id] = d;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0u: update_dragon_ai(env_id); break;
+        case 1u: process_dragon_combat(env_id); break;
+    }
+}

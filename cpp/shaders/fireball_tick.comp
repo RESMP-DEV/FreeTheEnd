@@ -1,0 +1,311 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Fireball Projectile Mechanics
+// ============================================================================
+// Implements blaze fireball behavior:
+// - Travels in straight line with slight arc (gravity)
+// - 5 fire damage on hit + sets target on fire
+// - Can be deflected by melee hit (reflects back at shooter)
+// - Destroyed on block collision
+// ============================================================================
+
+// Fireball constants
+const float FIREBALL_SPEED = 0.9;
+const float FIREBALL_GRAVITY = 0.02;           // Slight arc
+const float FIREBALL_DAMAGE = 5.0;
+const uint FIREBALL_FIRE_DURATION = 100;       // 5 seconds of fire
+const float FIREBALL_HITBOX_RADIUS = 0.3125;   // Standard small fireball hitbox
+const float DEFLECTION_RANGE = 3.0;            // Range at which player can deflect
+const float DEFLECTION_SPEED_MULT = 1.5;       // Speed multiplier when deflected
+const uint FIREBALL_MAX_LIFETIME = 200;        // 10 seconds max
+
+// Fireball flags
+const uint FB_FLAG_ACTIVE = 1 << 0;
+const uint FB_FLAG_DEFLECTED = 1 << 1;
+const uint FB_FLAG_HIT_ENTITY = 1 << 2;
+const uint FB_FLAG_HIT_BLOCK = 1 << 3;
+const uint FB_FLAG_EXPIRED = 1 << 4;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct Fireball {
+    vec3 position;
+    float speed;
+    vec3 velocity;
+    uint source_entity;      // Original shooter
+    uint target_entity;      // Current target (changes on deflect)
+    uint lifetime;
+    uint flags;
+    uint _pad;
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+    vec3 velocity;           // For leading shots
+    float hitbox_radius;
+};
+
+// Damage output for CPU processing
+struct DamageOutput {
+    uint source_entity;
+    uint target_entity;
+    float damage;
+    uint damage_type;        // 0=normal, 1=fire
+    uint fire_duration;
+    uint _pad[3];
+};
+
+// Deflection input (from player attacks)
+struct DeflectionAttempt {
+    vec3 position;
+    vec3 direction;          // Direction player is facing
+    uint entity_id;          // Player/entity attempting deflection
+    float range;
+    uint tick;
+    uint _pad;
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer FireballBuffer {
+    uint fireball_count;
+    Fireball fireballs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer DamageOutputBuffer {
+    uint damage_count;
+    DamageOutput damages[];
+};
+
+layout(set = 0, binding = 4) buffer readonly DeflectionBuffer {
+    uint deflection_count;
+    DeflectionAttempt deflections[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint entity_count;
+    uint tick;
+    float delta_time;
+    uint random_seed;
+    vec3 player_pos;
+    float _pad;
+} pc;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+// ============================================================================
+// World Queries
+// ============================================================================
+
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+// ============================================================================
+// Entity Queries
+// ============================================================================
+
+bool check_entity_collision(vec3 fb_pos, float radius, uint exclude_id, out uint hit_id, out vec3 hit_pos) {
+    float closest_dist = 1e10;
+    hit_id = 0xFFFFFFFF;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == exclude_id) continue;
+
+        vec3 entity_pos = entities[i].position;
+        float entity_radius = entities[i].hitbox_radius;
+        if (entity_radius < 0.1) entity_radius = 0.4;  // Default hitbox
+
+        float dist = distance(fb_pos, entity_pos);
+        float combined_radius = radius + entity_radius;
+
+        if (dist < combined_radius && dist < closest_dist) {
+            closest_dist = dist;
+            hit_id = entities[i].entity_id;
+            hit_pos = entity_pos;
+        }
+    }
+
+    return hit_id != 0xFFFFFFFF;
+}
+
+// ============================================================================
+// Deflection Logic
+// ============================================================================
+
+bool check_deflection(inout Fireball fb, uint fb_idx) {
+    for (uint i = 0; i < deflection_count; i++) {
+        DeflectionAttempt def = deflections[i];
+
+        // Check if this deflection attempt is recent enough
+        if (pc.tick - def.tick > 5) continue;
+
+        // Check distance to fireball
+        float dist = distance(fb.position, def.position);
+        if (dist > def.range) continue;
+
+        // Check if player is facing the fireball (within 90 degrees)
+        vec3 to_fireball = normalize_safe(fb.position - def.position);
+        float facing_dot = dot(to_fireball, def.direction);
+        if (facing_dot < 0.0) continue;  // Must be facing toward fireball
+
+        // Deflect!
+        // Reverse direction toward the original shooter or in player's facing direction
+        fb.velocity = def.direction * length(fb.velocity) * DEFLECTION_SPEED_MULT;
+
+        // Swap source and target
+        uint old_source = fb.source_entity;
+        fb.source_entity = def.entity_id;  // Player is now the "shooter"
+        fb.target_entity = old_source;     // Original shooter is now target
+
+        fb.flags |= FB_FLAG_DEFLECTED;
+
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Damage Output
+// ============================================================================
+
+void queue_damage(uint source, uint target, float damage, uint fire_duration) {
+    uint idx = atomicAdd(damage_count, 1);
+    if (idx < 256) {
+        damages[idx].source_entity = source;
+        damages[idx].target_entity = target;
+        damages[idx].damage = damage;
+        damages[idx].damage_type = 1;  // Fire damage
+        damages[idx].fire_duration = fire_duration;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= fireball_count) return;
+
+    Fireball fb = fireballs[idx];
+
+    // Skip inactive fireballs
+    if ((fb.flags & FB_FLAG_ACTIVE) == 0) return;
+    if ((fb.flags & (FB_FLAG_HIT_ENTITY | FB_FLAG_HIT_BLOCK | FB_FLAG_EXPIRED)) != 0) return;
+
+    uint seed = idx ^ pc.random_seed ^ pc.tick;
+    float dt = pc.delta_time;
+
+    // Increment lifetime
+    fb.lifetime++;
+    if (fb.lifetime > FIREBALL_MAX_LIFETIME) {
+        fb.flags |= FB_FLAG_EXPIRED;
+        fb.flags &= ~FB_FLAG_ACTIVE;
+        fireballs[idx] = fb;
+        return;
+    }
+
+    // Check for deflection attempts
+    check_deflection(fb, idx);
+
+    // Apply gravity (slight arc)
+    fb.velocity.y -= FIREBALL_GRAVITY * dt * 20.0;
+
+    // Move fireball
+    vec3 new_pos = fb.position + fb.velocity * dt * 20.0;
+
+    // Check block collision along path
+    vec3 dir = normalize_safe(fb.velocity);
+    float travel_dist = distance(fb.position, new_pos);
+    uint steps = max(uint(travel_dist * 4.0), 1);
+
+    for (uint step = 0; step <= steps; step++) {
+        float t = float(step) / float(steps);
+        vec3 check_pos = mix(fb.position, new_pos, t);
+        ivec3 block_pos = world_to_block(check_pos);
+
+        if (is_solid(get_block_at(block_pos))) {
+            // Hit a block
+            fb.flags |= FB_FLAG_HIT_BLOCK;
+            fb.flags &= ~FB_FLAG_ACTIVE;
+            fb.position = check_pos;
+            fireballs[idx] = fb;
+            return;
+        }
+    }
+
+    // Check entity collision
+    uint exclude = fb.source_entity;
+    uint hit_id;
+    vec3 hit_pos;
+
+    if (check_entity_collision(new_pos, FIREBALL_HITBOX_RADIUS, exclude, hit_id, hit_pos)) {
+        // Hit an entity - deal damage
+        queue_damage(fb.source_entity, hit_id, FIREBALL_DAMAGE, FIREBALL_FIRE_DURATION);
+
+        fb.flags |= FB_FLAG_HIT_ENTITY;
+        fb.flags &= ~FB_FLAG_ACTIVE;
+        fb.position = hit_pos;
+        fireballs[idx] = fb;
+        return;
+    }
+
+    // Update position
+    fb.position = new_pos;
+    fireballs[idx] = fb;
+}

@@ -1,0 +1,683 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// ============================================================================
+// Minecraft 1.8.9 Fire Mechanics Compute Shader
+//
+// Implements:
+// 1. Fire block spread on flammable blocks
+// 2. Entity burning state tracking
+// 3. Fire damage (1 HP per second while burning)
+// 4. Fire extinguishing (water, soul sand, sneaking)
+// 5. Fire resistance effect immunity
+//
+// Burning durations (MC 1.8.9):
+//   - Blaze fireball: 5 seconds (100 ticks)
+//   - Standing in fire block: Continuous (8 ticks added per tick in fire)
+//   - Lava contact: 15 seconds (300 ticks) after leaving
+//   - Fire aspect I: 4 seconds, II: 8 seconds
+// ============================================================================
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Block IDs (MC 1.8.9)
+// ============================================================================
+
+const uint BLOCK_AIR = 0;
+const uint BLOCK_STONE = 1;
+const uint BLOCK_GRASS = 2;
+const uint BLOCK_DIRT = 3;
+const uint BLOCK_COBBLESTONE = 4;
+const uint BLOCK_PLANKS = 5;
+const uint BLOCK_LOG = 17;
+const uint BLOCK_LEAVES = 18;
+const uint BLOCK_SPONGE = 19;
+const uint BLOCK_WOOL = 35;
+const uint BLOCK_TNT = 46;
+const uint BLOCK_BOOKSHELF = 47;
+const uint BLOCK_FIRE = 51;
+const uint BLOCK_NETHERRACK = 87;
+const uint BLOCK_SOUL_SAND = 88;
+const uint BLOCK_WATER = 8;
+const uint BLOCK_WATER_FLOWING = 9;
+const uint BLOCK_LAVA = 10;
+const uint BLOCK_LAVA_FLOWING = 11;
+const uint BLOCK_FENCE = 85;
+const uint BLOCK_FENCE_GATE = 107;
+const uint BLOCK_WOODEN_STAIRS = 53;
+const uint BLOCK_WOODEN_SLAB = 126;
+const uint BLOCK_HAY_BLOCK = 170;
+const uint BLOCK_CARPET = 171;
+const uint BLOCK_COAL_BLOCK = 173;
+
+// ============================================================================
+// Fire spread constants (MC 1.8.9 values)
+// ============================================================================
+
+// Flammability: chance to catch fire from adjacent fire (0-300 scale)
+// Burn rate: chance to be destroyed by fire per update (0-100 scale)
+
+const uint SPREAD_CHANCE_BASE = 250;  // Base chance out of 250 for fire spread
+const float FIRE_DAMAGE_PER_SECOND = 1.0;  // 1 HP per second
+const float TICKS_PER_SECOND = 20.0;
+
+// Burn time in ticks
+const float BURN_TIME_BLAZE_FIREBALL = 100.0;   // 5 seconds
+const float BURN_TIME_LAVA = 300.0;             // 15 seconds
+const float BURN_TIME_FIRE_BLOCK = 8.0;         // Added each tick in fire
+const float BURN_TIME_FIRE_ASPECT_I = 80.0;     // 4 seconds
+const float BURN_TIME_FIRE_ASPECT_II = 160.0;   // 8 seconds
+
+// Fire ages: fire blocks have age 0-15, destroyed at 15 unless on netherrack
+const uint FIRE_MAX_AGE = 15;
+
+// ============================================================================
+// Entity flags
+// ============================================================================
+
+const uint FLAG_ON_GROUND = 1 << 0;
+const uint FLAG_IN_WATER = 1 << 1;
+const uint FLAG_IN_LAVA = 1 << 2;
+const uint FLAG_SNEAKING = 1 << 3;
+const uint FLAG_SPRINTING = 1 << 4;
+const uint FLAG_IS_BURNING = 1 << 6;
+const uint FLAG_FIRE_IMMUNE = 1 << 7;   // Blaze, magma cube, etc.
+
+// Status effect IDs
+const uint EFFECT_FIRE_RESISTANCE = 12;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct EntityFireState {
+    float burn_time_remaining;   // Ticks remaining on fire (0 = not burning)
+    float fire_damage_accum;     // Accumulator for 1 HP/second timing
+    uint flags;                  // Entity flags
+    uint status_effects_packed;  // Bit flags for active effects (bit 12 = fire resist)
+    vec3 position;
+    float _pad;
+};
+
+struct FireBlockUpdate {
+    ivec3 position;
+    uint age;              // Fire age 0-15
+    uint should_spread;    // 1 = attempt spread this tick
+    uint should_destroy;   // 1 = block was destroyed by fire
+    uint _pad[2];
+};
+
+struct BlockModification {
+    ivec3 position;
+    uint new_block_id;
+    uint new_metadata;
+    uint modification_type;
+    uint source;
+    uint _pad;
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+// Entity fire state (read/write)
+layout(std430, set = 0, binding = 0) buffer EntityFireBuffer {
+    EntityFireState entities[];
+} entity_fire;
+
+// Health buffer
+layout(std430, set = 0, binding = 1) buffer HealthBuffer {
+    float health[];
+} health_buf;
+
+// Equipment/armor data (for fire protection calculation)
+layout(std430, set = 0, binding = 2) readonly buffer EquipmentBuffer {
+    uint equipment_packed[];  // Same encoding as damage.glsl
+} equipment_buf;
+
+// Fire block positions for spread calculation
+layout(std430, set = 0, binding = 3) buffer FireBlockBuffer {
+    uint fire_block_count;
+    uint _pad[3];
+    FireBlockUpdate fire_blocks[];
+} fire_blocks_buf;
+
+// World voxel data (read)
+layout(std430, set = 0, binding = 4) readonly buffer WorldBuffer {
+    uvec2 grid_size;
+    uint grid_height;
+    uint _pad;
+    uint voxels[];  // Packed block_id, metadata
+} world_buf;
+
+// Block modification output
+layout(std430, set = 0, binding = 5) buffer BlockModBuffer {
+    uint modification_count;
+    uint _pad[3];
+    BlockModification modifications[];
+} block_mods;
+
+layout(push_constant) uniform PushConstants {
+    uint entity_count;
+    uint max_fire_blocks;
+    uint max_modifications;
+    float tick_delta;
+    uint current_tick;
+    uint random_seed;
+    uint game_difficulty;  // 0=peaceful, 1=easy, 2=normal, 3=hard
+    uint do_fire_spread;   // 1 = gamerule doFireTick enabled
+} pc;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+uint random_uint(inout uint seed, uint max_val) {
+    seed = pcg_hash(seed);
+    return seed % (max_val + 1);
+}
+
+bool inBounds(ivec3 pos) {
+    return pos.x >= 0 && pos.y >= 0 && pos.z >= 0 &&
+           pos.x < int(world_buf.grid_size.x) &&
+           pos.y < int(world_buf.grid_height) &&
+           pos.z < int(world_buf.grid_size.y);
+}
+
+uint posToIndex(ivec3 pos) {
+    return uint(pos.y) * world_buf.grid_size.x * world_buf.grid_size.y +
+           uint(pos.z) * world_buf.grid_size.x +
+           uint(pos.x);
+}
+
+uint getBlockAt(ivec3 pos) {
+    if (!inBounds(pos)) return BLOCK_AIR;
+    uint idx = posToIndex(pos);
+    return world_buf.voxels[idx] & 0xFFu;
+}
+
+uint getBlockMetadata(ivec3 pos) {
+    if (!inBounds(pos)) return 0;
+    uint idx = posToIndex(pos);
+    return (world_buf.voxels[idx] >> 8) & 0xFu;
+}
+
+ivec3 worldToBlock(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+// ============================================================================
+// Fire Mechanics Functions
+// ============================================================================
+
+// Check if entity has fire resistance effect
+bool hasFireResistance(uint status_effects_packed) {
+    return (status_effects_packed & (1u << EFFECT_FIRE_RESISTANCE)) != 0;
+}
+
+// Check if entity is immune to fire damage
+bool isFireImmune(uint flags, uint status_effects_packed) {
+    return (flags & FLAG_FIRE_IMMUNE) != 0 || hasFireResistance(status_effects_packed);
+}
+
+// Check if block is water
+bool isWater(uint block_id) {
+    return block_id == BLOCK_WATER || block_id == BLOCK_WATER_FLOWING;
+}
+
+// Check if block is lava
+bool isLava(uint block_id) {
+    return block_id == BLOCK_LAVA || block_id == BLOCK_LAVA_FLOWING;
+}
+
+// Check if position is in water
+bool isPositionInWater(vec3 pos) {
+    ivec3 block_pos = worldToBlock(pos);
+    return isWater(getBlockAt(block_pos));
+}
+
+// Check if standing on soul sand (extinguishes fire in some versions)
+bool isOnSoulSand(vec3 pos) {
+    ivec3 below = worldToBlock(pos) + ivec3(0, -1, 0);
+    return getBlockAt(below) == BLOCK_SOUL_SAND;
+}
+
+// Get flammability of a block (0 = not flammable, higher = more flammable)
+uint getFlammability(uint block_id) {
+    switch (block_id) {
+        case BLOCK_PLANKS:
+        case BLOCK_FENCE:
+        case BLOCK_FENCE_GATE:
+        case BLOCK_WOODEN_STAIRS:
+        case BLOCK_WOODEN_SLAB:
+            return 20;  // Wood
+        case BLOCK_LOG:
+            return 5;   // Logs catch slowly
+        case BLOCK_LEAVES:
+            return 60;  // Leaves burn fast
+        case BLOCK_WOOL:
+        case BLOCK_CARPET:
+            return 60;  // Wool burns fast
+        case BLOCK_BOOKSHELF:
+            return 30;
+        case BLOCK_TNT:
+            return 0;   // TNT doesn't burn, it explodes
+        case BLOCK_HAY_BLOCK:
+            return 60;
+        case BLOCK_COAL_BLOCK:
+            return 5;
+        case BLOCK_GRASS:
+        case BLOCK_DIRT:
+            return 0;   // Not flammable
+        default:
+            return 0;
+    }
+}
+
+// Get burn rate of a block (chance to be destroyed per tick)
+uint getBurnRate(uint block_id) {
+    switch (block_id) {
+        case BLOCK_PLANKS:
+        case BLOCK_FENCE:
+        case BLOCK_FENCE_GATE:
+        case BLOCK_WOODEN_STAIRS:
+        case BLOCK_WOODEN_SLAB:
+            return 5;
+        case BLOCK_LOG:
+            return 5;
+        case BLOCK_LEAVES:
+            return 100;  // Leaves destroyed quickly
+        case BLOCK_WOOL:
+        case BLOCK_CARPET:
+            return 100;
+        case BLOCK_BOOKSHELF:
+            return 20;
+        case BLOCK_HAY_BLOCK:
+            return 20;
+        case BLOCK_COAL_BLOCK:
+            return 5;
+        default:
+            return 0;
+    }
+}
+
+// Check if fire can exist at this position (needs air and adjacent flammable/netherrack)
+bool canFireExistAt(ivec3 pos) {
+    uint block = getBlockAt(pos);
+    if (block != BLOCK_AIR && block != BLOCK_FIRE) return false;
+
+    // Check if on netherrack (eternal fire)
+    uint below = getBlockAt(pos + ivec3(0, -1, 0));
+    if (below == BLOCK_NETHERRACK) return true;
+
+    // Check for adjacent flammable blocks
+    ivec3 offsets[6] = ivec3[6](
+        ivec3(0, -1, 0), ivec3(0, 1, 0),
+        ivec3(-1, 0, 0), ivec3(1, 0, 0),
+        ivec3(0, 0, -1), ivec3(0, 0, 1)
+    );
+
+    for (int i = 0; i < 6; i++) {
+        uint adjacent = getBlockAt(pos + offsets[i]);
+        if (getFlammability(adjacent) > 0) return true;
+    }
+
+    return false;
+}
+
+// Queue a block modification
+void queueBlockMod(ivec3 pos, uint new_block, uint metadata, uint mod_type) {
+    uint idx = atomicAdd(block_mods.modification_count, 1);
+    if (idx < pc.max_modifications) {
+        block_mods.modifications[idx].position = pos;
+        block_mods.modifications[idx].new_block_id = new_block;
+        block_mods.modifications[idx].new_metadata = metadata;
+        block_mods.modifications[idx].modification_type = mod_type;
+        block_mods.modifications[idx].source = 0xFFFFFFFF;  // Fire source
+    }
+}
+
+// ============================================================================
+// Fire Protection Enchantment (from equipment)
+// ============================================================================
+
+// Extract fire protection EPF from packed equipment
+// Equipment encoding uses bits 14-17 for fire protection level
+int getFireProtectionEPF(uint equipment_packed) {
+    // Fire protection provides EPF = level * 2
+    // We store the total across all armor pieces
+    // For this implementation, assume bits 14-17 store total fire prot level (0-16)
+    uint fire_prot_level = (equipment_packed >> 14) & 0xFu;
+    return int(fire_prot_level) * 2;  // Each level = 2 EPF
+}
+
+// Reduce fire damage using fire protection
+// Fire protection reduces fire damage by (EPF * 4)%, max 80%
+float applyFireProtection(float damage, int fire_prot_epf) {
+    float reduction = min(float(fire_prot_epf) * 4.0 / 100.0, 0.8);
+    return damage * (1.0 - reduction);
+}
+
+// Fire protection also reduces burn time
+float applyFireProtectionToBurnTime(float burn_time, int fire_prot_epf) {
+    // Each level reduces burn time by 15%
+    float reduction = min(float(fire_prot_epf) * 0.15 / 2.0, 0.8);  // /2 because EPF is 2*level
+    return burn_time * (1.0 - reduction);
+}
+
+// ============================================================================
+// Main Entry Points
+// ============================================================================
+
+// Process entity fire state (main entry for entity processing)
+void processEntityFire(uint entity_idx) {
+    if (entity_idx >= pc.entity_count) return;
+
+    EntityFireState state = entity_fire.entities[entity_idx];
+    uint equip = equipment_buf.equipment_packed[entity_idx];
+    float current_health = health_buf.health[entity_idx];
+
+    uint seed = pc.random_seed ^ entity_idx ^ pc.current_tick;
+    float dt = pc.tick_delta;
+
+    // Check if immune to fire
+    bool immune = isFireImmune(state.flags, state.status_effects_packed);
+
+    // Get fire protection EPF
+    int fire_prot_epf = getFireProtectionEPF(equip);
+
+    // ========================================================================
+    // Check for fire sources
+    // ========================================================================
+
+    ivec3 entity_block = worldToBlock(state.position);
+    uint block_at_entity = getBlockAt(entity_block);
+    uint block_at_feet = getBlockAt(entity_block + ivec3(0, -1, 0));
+
+    bool in_fire_block = (block_at_entity == BLOCK_FIRE);
+    bool in_lava = isLava(block_at_entity) || isLava(block_at_feet);
+    bool in_water = (state.flags & FLAG_IN_WATER) != 0 || isPositionInWater(state.position);
+    bool is_sneaking = (state.flags & FLAG_SNEAKING) != 0;
+    bool on_soul_sand = isOnSoulSand(state.position);
+
+    // ========================================================================
+    // Apply fire ignition sources
+    // ========================================================================
+
+    if (!immune) {
+        // Standing in fire block: add burn time each tick
+        if (in_fire_block) {
+            float add_time = BURN_TIME_FIRE_BLOCK;
+            add_time = applyFireProtectionToBurnTime(add_time, fire_prot_epf);
+            state.burn_time_remaining = max(state.burn_time_remaining, add_time);
+            // Cap at 8 seconds continuous burn from standing in fire
+            state.burn_time_remaining = min(state.burn_time_remaining, 160.0);
+        }
+
+        // Contact with lava: 15 seconds burn time
+        if (in_lava) {
+            float add_time = BURN_TIME_LAVA;
+            add_time = applyFireProtectionToBurnTime(add_time, fire_prot_epf);
+            state.burn_time_remaining = max(state.burn_time_remaining, add_time);
+        }
+    }
+
+    // ========================================================================
+    // Fire extinguishing conditions
+    // ========================================================================
+
+    // Water extinguishes fire immediately
+    if (in_water) {
+        state.burn_time_remaining = 0.0;
+        state.fire_damage_accum = 0.0;
+    }
+
+    // Soul sand extinguishes fire (when on top of it, some modded behavior)
+    // In vanilla 1.8.9 this doesn't actually extinguish, but we include for completeness
+    // if (on_soul_sand) {
+    //     state.burn_time_remaining = 0.0;
+    // }
+
+    // Sneaking in fire reduces burn time faster (not vanilla, but good QoL)
+    // Actually in vanilla, sneaking doesn't affect fire. Removed.
+
+    // ========================================================================
+    // Process burn damage
+    // ========================================================================
+
+    if (state.burn_time_remaining > 0.0 && !immune) {
+        // Tick down burn time
+        state.burn_time_remaining -= dt * TICKS_PER_SECOND;
+        if (state.burn_time_remaining < 0.0) {
+            state.burn_time_remaining = 0.0;
+        }
+
+        // Accumulate damage timer (1 HP per second = every 20 ticks)
+        state.fire_damage_accum += dt * TICKS_PER_SECOND;
+
+        // Apply damage every 20 ticks (1 second)
+        if (state.fire_damage_accum >= TICKS_PER_SECOND) {
+            state.fire_damage_accum -= TICKS_PER_SECOND;
+
+            // Calculate fire damage with fire protection
+            float damage = FIRE_DAMAGE_PER_SECOND;
+            damage = applyFireProtection(damage, fire_prot_epf);
+
+            // In peaceful mode, no fire damage
+            if (pc.game_difficulty > 0) {
+                current_health = max(0.0, current_health - damage);
+            }
+        }
+
+        // Set burning flag
+        state.flags |= FLAG_IS_BURNING;
+    } else {
+        // Not burning
+        state.flags &= ~FLAG_IS_BURNING;
+        state.fire_damage_accum = 0.0;
+    }
+
+    // Fire resistance clears burning state
+    if (immune) {
+        state.burn_time_remaining = 0.0;
+        state.fire_damage_accum = 0.0;
+        state.flags &= ~FLAG_IS_BURNING;
+    }
+
+    // ========================================================================
+    // Lava direct damage (separate from burning)
+    // ========================================================================
+
+    if (in_lava && !immune && pc.game_difficulty > 0) {
+        // Lava deals 4 damage per half second (8 damage per second)
+        // This is in addition to the burning damage
+        state.fire_damage_accum += dt * TICKS_PER_SECOND;
+        if (state.fire_damage_accum >= 10.0) {  // Every 10 ticks (0.5s)
+            state.fire_damage_accum = 0.0;
+            float lava_damage = 4.0;
+            lava_damage = applyFireProtection(lava_damage, fire_prot_epf);
+            current_health = max(0.0, current_health - lava_damage);
+        }
+    }
+
+    // Write back
+    entity_fire.entities[entity_idx] = state;
+    health_buf.health[entity_idx] = current_health;
+}
+
+// ============================================================================
+// Fire Block Spread Processing
+// ============================================================================
+
+void processFireBlockSpread(uint fire_idx) {
+    if (fire_idx >= fire_blocks_buf.fire_block_count) return;
+    if (pc.do_fire_spread == 0) return;  // gamerule doFireTick
+
+    FireBlockUpdate fire = fire_blocks_buf.fire_blocks[fire_idx];
+    ivec3 pos = fire.position;
+
+    uint seed = pc.random_seed ^ uint(pos.x * 73856093) ^ uint(pos.y * 19349663) ^ uint(pos.z * 83492791);
+
+    // Check if fire still exists
+    if (getBlockAt(pos) != BLOCK_FIRE) {
+        fire.should_destroy = 1;
+        fire_blocks_buf.fire_blocks[fire_idx] = fire;
+        return;
+    }
+
+    // Get block below
+    uint below = getBlockAt(pos + ivec3(0, -1, 0));
+    bool eternal = (below == BLOCK_NETHERRACK);
+
+    // Age the fire
+    if (!eternal && random_uint(seed, 3) == 0) {
+        fire.age = min(fire.age + 1, FIRE_MAX_AGE);
+    }
+
+    // Fire dies at max age (unless eternal)
+    if (fire.age >= FIRE_MAX_AGE && !eternal) {
+        queueBlockMod(pos, BLOCK_AIR, 0, 0);
+        fire.should_destroy = 1;
+        fire_blocks_buf.fire_blocks[fire_idx] = fire;
+        return;
+    }
+
+    // Check if fire can still exist (has fuel)
+    if (!canFireExistAt(pos) && !eternal) {
+        // Small chance to die without fuel
+        if (random_uint(seed, 4) == 0) {
+            queueBlockMod(pos, BLOCK_AIR, 0, 0);
+            fire.should_destroy = 1;
+            fire_blocks_buf.fire_blocks[fire_idx] = fire;
+            return;
+        }
+    }
+
+    // ========================================================================
+    // Fire spread attempt
+    // ========================================================================
+
+    // Spread to adjacent flammable blocks
+    ivec3 spread_offsets[6] = ivec3[6](
+        ivec3(0, 1, 0),   // Up (fire rises)
+        ivec3(-1, 0, 0), ivec3(1, 0, 0),
+        ivec3(0, 0, -1), ivec3(0, 0, 1),
+        ivec3(0, -1, 0)   // Down (less likely)
+    );
+
+    for (int i = 0; i < 6; i++) {
+        ivec3 spread_pos = pos + spread_offsets[i];
+
+        if (!inBounds(spread_pos)) continue;
+        if (getBlockAt(spread_pos) != BLOCK_AIR) continue;
+
+        // Check for adjacent flammable blocks
+        ivec3 check_offsets[6] = ivec3[6](
+            ivec3(0, -1, 0), ivec3(0, 1, 0),
+            ivec3(-1, 0, 0), ivec3(1, 0, 0),
+            ivec3(0, 0, -1), ivec3(0, 0, 1)
+        );
+
+        uint max_flammability = 0;
+        for (int j = 0; j < 6; j++) {
+            ivec3 adj_pos = spread_pos + check_offsets[j];
+            uint adj_block = getBlockAt(adj_pos);
+            max_flammability = max(max_flammability, getFlammability(adj_block));
+        }
+
+        if (max_flammability > 0) {
+            // Higher flammability = higher spread chance
+            uint spread_chance = max_flammability + (fire.age / 2);
+
+            // Fire spreads up easier
+            if (i == 0) spread_chance += 50;
+
+            // Random spread check
+            if (random_uint(seed, SPREAD_CHANCE_BASE) < spread_chance) {
+                queueBlockMod(spread_pos, BLOCK_FIRE, 0, 1);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Burn adjacent blocks (chance to destroy them)
+    // ========================================================================
+
+    for (int i = 0; i < 6; i++) {
+        ivec3 adj_pos = pos + spread_offsets[i];
+        if (!inBounds(adj_pos)) continue;
+
+        uint adj_block = getBlockAt(adj_pos);
+        uint burn_rate = getBurnRate(adj_block);
+
+        if (burn_rate > 0) {
+            // Higher age = higher burn chance
+            uint burn_chance = burn_rate + (fire.age * 2);
+
+            if (random_uint(seed, 300) < burn_chance) {
+                // Block destroyed by fire - either becomes fire or air
+                if (random_uint(seed, 3) == 0 && canFireExistAt(adj_pos)) {
+                    queueBlockMod(adj_pos, BLOCK_FIRE, 0, 1);
+                } else {
+                    queueBlockMod(adj_pos, BLOCK_AIR, 0, 0);
+                }
+            }
+        }
+
+        // Special case: TNT ignites instead of burning
+        if (adj_block == BLOCK_TNT) {
+            // Queue TNT ignition (handled by separate system)
+            queueBlockMod(adj_pos, BLOCK_AIR, 0, 2);  // mod_type 2 = TNT ignite
+        }
+    }
+
+    // Update fire block state
+    fire_blocks_buf.fire_blocks[fire_idx] = fire;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Process entities first
+    if (idx < pc.entity_count) {
+        processEntityFire(idx);
+    }
+
+    // Then process fire blocks (offset by entity count)
+    uint fire_idx = idx - pc.entity_count;
+    if (idx >= pc.entity_count && fire_idx < fire_blocks_buf.fire_block_count) {
+        // Only process fire spread every few ticks (MC uses random tick)
+        if ((pc.current_tick + fire_idx) % 30 == 0) {
+            processFireBlockSpread(fire_idx);
+        }
+    }
+}
+
+// ============================================================================
+// External API: Add burn time to entity (called from other shaders)
+// ============================================================================
+
+// To be called from mob_ai_blaze.comp or projectile system:
+// void igniteEntity(uint entity_idx, float burn_ticks) {
+//     EntityFireState state = entity_fire.entities[entity_idx];
+//     if (!isFireImmune(state.flags, state.status_effects_packed)) {
+//         state.burn_time_remaining = max(state.burn_time_remaining, burn_ticks);
+//         entity_fire.entities[entity_idx] = state;
+//     }
+// }

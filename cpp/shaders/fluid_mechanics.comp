@@ -1,0 +1,879 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Fluid Mechanics Compute Shader
+// Handles water/lava flow, fluid-block interactions, obsidian formation, and bucket mechanics
+//
+// Key mechanics implemented:
+// - Water source block propagation (infinite sources when 2+ adjacent)
+// - Lava source block detection
+// - Water + Lava = Cobblestone (flowing) or Obsidian (source)
+// - Bucket interactions (fill/empty)
+// - Obsidian breaking time (15s diamond pickaxe, 250s by hand)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// BLOCK CONSTANTS (Minecraft 1.8.9 IDs)
+// ============================================================================
+
+const uint BLOCK_AIR = 0;
+const uint BLOCK_STONE = 1;
+const uint BLOCK_COBBLESTONE = 4;
+const uint BLOCK_WATER_FLOWING = 8;
+const uint BLOCK_WATER_SOURCE = 9;
+const uint BLOCK_LAVA_FLOWING = 10;
+const uint BLOCK_LAVA_SOURCE = 11;
+const uint BLOCK_GRAVEL = 13;
+const uint BLOCK_SAND = 12;
+const uint BLOCK_OBSIDIAN = 49;
+const uint BLOCK_NETHERRACK = 87;
+
+// Item IDs
+const uint ITEM_BUCKET_EMPTY = 325;
+const uint ITEM_BUCKET_WATER = 326;
+const uint ITEM_BUCKET_LAVA = 327;
+const uint ITEM_DIAMOND_PICKAXE = 278;
+const uint ITEM_IRON_PICKAXE = 257;
+const uint ITEM_STONE_PICKAXE = 274;
+const uint ITEM_WOODEN_PICKAXE = 270;
+const uint ITEM_GOLDEN_PICKAXE = 285;
+
+// ============================================================================
+// FLUID CONSTANTS
+// ============================================================================
+
+// Flow distance (max spread from source)
+const uint WATER_FLOW_DISTANCE = 7;      // Blocks
+const uint LAVA_FLOW_DISTANCE_OVER = 3;  // Overworld lava
+const uint LAVA_FLOW_DISTANCE_NETH = 7;  // Nether lava
+
+// Tick rates (game ticks per flow update)
+const uint WATER_TICK_RATE = 5;
+const uint LAVA_TICK_RATE_OVER = 30;     // Overworld
+const uint LAVA_TICK_RATE_NETH = 10;     // Nether
+
+// Metadata encoding: bits 0-2 = flow level (0=source, 1-7=flowing), bit 3 = falling
+const uint META_LEVEL_MASK = 0x07;
+const uint META_FALLING_BIT = 0x08;
+
+// ============================================================================
+// OBSIDIAN BREAKING CONSTANTS
+// ============================================================================
+
+// Base hardness of obsidian: 50.0
+// Break time formula: hardness * 1.5 / toolMultiplier (no tool = 1.0)
+// Diamond pickaxe multiplier: 8.0, so 50 * 1.5 / 8 = 9.375s (game uses 9.4s)
+// Actually MC uses: 50 * 5 / toolSpeed = 250s bare hand, 9.4s diamond pick
+
+const float OBSIDIAN_BASE_BREAK_TIME = 250.0;  // Seconds with bare hand
+const float DIAMOND_PICK_MULTIPLIER = 8.33;    // ~30x faster = 250/8.33 = 30, but wiki says 9.4s...
+// Correction: Diamond pick against obsidian = 9.4s (official)
+// Formula: 1.5 * hardness / tool_multiplier = 1.5 * 50 / 8 = 9.375 (server uses 9.4)
+const float OBSIDIAN_DIAMOND_BREAK_TIME = 9.4;
+const float OBSIDIAN_HAND_BREAK_TIME = 250.0;  // 4+ minutes by hand
+
+// Nether portal requirements
+const uint PORTAL_MIN_OBSIDIAN = 10;     // Minimum for functional portal (corners optional)
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct FluidBlock {
+    ivec3 position;
+    uint block_id;       // BLOCK_WATER_* or BLOCK_LAVA_*
+    uint metadata;       // Flow level + falling flag
+    uint tick_scheduled; // Game tick when next update should occur
+    uint dimension;      // 0=overworld, 1=nether, 2=end
+    uint _pad;
+};
+
+struct FluidUpdate {
+    ivec3 position;
+    uint old_block_id;
+    uint new_block_id;
+    uint new_metadata;
+    uint update_type;    // 0=flow, 1=source_form, 2=interaction, 3=removal
+    uint _pad;
+};
+
+struct BucketAction {
+    uint agent_id;
+    ivec3 target_pos;
+    uint held_item;      // Bucket type in hand
+    uint action_type;    // 0=fill_bucket, 1=empty_bucket
+    uint result_item;    // Resulting item (filled/empty bucket)
+    uint success;        // 1 if successful
+};
+
+struct BreakProgress {
+    ivec3 position;
+    uint block_id;
+    float accumulated_time;  // Seconds of breaking
+    float required_time;     // Total time needed
+    uint agent_id;
+    uint tool_item;
+};
+
+struct VoxelData {
+    uint block_id;
+    uint metadata;
+};
+
+// ============================================================================
+// BUFFER BINDINGS
+// ============================================================================
+
+// Set 0: World voxel data
+layout(set = 0, binding = 0, std430) buffer VoxelGridBuffer {
+    uvec2 grid_size;     // X, Z dimensions
+    uint grid_height;    // Y dimension
+    uint _pad;
+    VoxelData voxels[];
+} voxel_grid;
+
+// Set 0: Fluid blocks to process
+layout(set = 0, binding = 1, std430) buffer FluidBlockBuffer {
+    uint fluid_count;
+    uint _pad[3];
+    FluidBlock fluids[];
+} fluid_blocks;
+
+// Set 0: Fluid updates output
+layout(set = 0, binding = 2, std430) buffer FluidUpdateBuffer {
+    uint update_count;
+    uint _pad[3];
+    FluidUpdate updates[];
+} fluid_updates;
+
+// Set 1: Bucket actions
+layout(set = 1, binding = 0, std430) buffer BucketActionBuffer {
+    uint action_count;
+    uint _pad[3];
+    BucketAction actions[];
+} bucket_actions;
+
+// Set 1: Break progress tracking
+layout(set = 1, binding = 1, std430) buffer BreakProgressBuffer {
+    uint break_count;
+    uint _pad[3];
+    BreakProgress breaks[];
+} break_progress;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint current_tick;
+    uint dimension;          // Current dimension
+    uint max_updates;
+    float delta_time;
+    uint stage;              // 0=fluid_tick, 1=bucket, 2=breaking
+    uint _pad[3];
+} pc;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+uint posToIndex(ivec3 pos) {
+    return uint(pos.y) * voxel_grid.grid_size.x * voxel_grid.grid_size.y +
+           uint(pos.z) * voxel_grid.grid_size.x +
+           uint(pos.x);
+}
+
+bool inBounds(ivec3 pos) {
+    return pos.x >= 0 && pos.y >= 0 && pos.z >= 0 &&
+           pos.x < int(voxel_grid.grid_size.x) &&
+           pos.y < int(voxel_grid.grid_height) &&
+           pos.z < int(voxel_grid.grid_size.y);
+}
+
+VoxelData getVoxel(ivec3 pos) {
+    if (!inBounds(pos)) {
+        VoxelData empty;
+        empty.block_id = BLOCK_AIR;
+        empty.metadata = 0;
+        return empty;
+    }
+    return voxel_grid.voxels[posToIndex(pos)];
+}
+
+void setVoxel(ivec3 pos, uint block_id, uint metadata) {
+    if (!inBounds(pos)) return;
+    uint idx = posToIndex(pos);
+    voxel_grid.voxels[idx].block_id = block_id;
+    voxel_grid.voxels[idx].metadata = metadata;
+}
+
+// Neighbor offsets (horizontal + vertical)
+const ivec3 HORIZONTAL_NEIGHBORS[4] = ivec3[4](
+    ivec3(1, 0, 0),
+    ivec3(-1, 0, 0),
+    ivec3(0, 0, 1),
+    ivec3(0, 0, -1)
+);
+
+const ivec3 ALL_NEIGHBORS[6] = ivec3[6](
+    ivec3(0, -1, 0),  // Down
+    ivec3(0, 1, 0),   // Up
+    ivec3(1, 0, 0),   // East
+    ivec3(-1, 0, 0),  // West
+    ivec3(0, 0, 1),   // South
+    ivec3(0, 0, -1)   // North
+);
+
+// ============================================================================
+// FLUID TYPE CHECKS
+// ============================================================================
+
+bool isWater(uint block_id) {
+    return block_id == BLOCK_WATER_FLOWING || block_id == BLOCK_WATER_SOURCE;
+}
+
+bool isWaterSource(uint block_id) {
+    return block_id == BLOCK_WATER_SOURCE;
+}
+
+bool isLava(uint block_id) {
+    return block_id == BLOCK_LAVA_FLOWING || block_id == BLOCK_LAVA_SOURCE;
+}
+
+bool isLavaSource(uint block_id) {
+    return block_id == BLOCK_LAVA_SOURCE;
+}
+
+bool isFluid(uint block_id) {
+    return isWater(block_id) || isLava(block_id);
+}
+
+bool isFluidSource(uint block_id) {
+    return isWaterSource(block_id) || isLavaSource(block_id);
+}
+
+// Check if block can be replaced by fluid
+bool canFluidReplace(uint block_id) {
+    if (block_id == BLOCK_AIR) return true;
+    // Fluid can replace tall grass, flowers, etc.
+    if (block_id == 31 || block_id == 32) return true;  // Tall grass, dead bush
+    if (block_id == 37 || block_id == 38) return true;  // Flowers
+    if (block_id == 39 || block_id == 40) return true;  // Mushrooms
+    if (block_id == 104 || block_id == 105) return true; // Stems
+    return false;
+}
+
+// Check if block is solid (blocks fluid flow)
+bool isSolidForFluid(uint block_id) {
+    if (block_id == BLOCK_AIR) return false;
+    if (isFluid(block_id)) return false;
+    if (canFluidReplace(block_id)) return false;
+    return true;
+}
+
+// ============================================================================
+// WATER-LAVA INTERACTION
+// ============================================================================
+
+// Determines what happens when water meets lava
+// Returns: block_id of result (OBSIDIAN, COBBLESTONE, or 0 for no change)
+uint getFluidInteractionResult(uint water_id, uint water_meta, uint lava_id, uint lava_meta) {
+    bool water_is_source = isWaterSource(water_id);
+    bool lava_is_source = isLavaSource(lava_id);
+
+    // Water flows into lava source = Obsidian
+    if (lava_is_source) {
+        return BLOCK_OBSIDIAN;
+    }
+
+    // Water flows into flowing lava = Cobblestone
+    if (isLava(lava_id) && !lava_is_source) {
+        return BLOCK_COBBLESTONE;
+    }
+
+    // Lava flows into water = Cobblestone (stone in some versions, but 1.8.9 = cobble)
+    // Note: Lava on top of water creates stone, horizontal = cobblestone
+    // For simplicity, we use cobblestone for horizontal interactions
+    return BLOCK_COBBLESTONE;
+}
+
+// Check for water-lava interaction at position
+void checkFluidInteraction(ivec3 pos, uint fluid_id) {
+    bool is_water = isWater(fluid_id);
+    bool is_lava = isLava(fluid_id);
+
+    // Check all neighbors for opposite fluid type
+    for (int i = 0; i < 6; i++) {
+        ivec3 neighbor_pos = pos + ALL_NEIGHBORS[i];
+        VoxelData neighbor = getVoxel(neighbor_pos);
+
+        // Water meets lava?
+        if (is_water && isLava(neighbor.block_id)) {
+            uint result = BLOCK_COBBLESTONE;
+
+            // If lava is source block, create obsidian at lava position
+            if (isLavaSource(neighbor.block_id)) {
+                result = BLOCK_OBSIDIAN;
+
+                // Queue update for lava position (becomes obsidian)
+                uint idx = atomicAdd(fluid_updates.update_count, 1);
+                if (idx < pc.max_updates) {
+                    fluid_updates.updates[idx].position = neighbor_pos;
+                    fluid_updates.updates[idx].old_block_id = neighbor.block_id;
+                    fluid_updates.updates[idx].new_block_id = BLOCK_OBSIDIAN;
+                    fluid_updates.updates[idx].new_metadata = 0;
+                    fluid_updates.updates[idx].update_type = 2; // Interaction
+                }
+            } else {
+                // Flowing lava becomes cobblestone
+                uint idx = atomicAdd(fluid_updates.update_count, 1);
+                if (idx < pc.max_updates) {
+                    fluid_updates.updates[idx].position = neighbor_pos;
+                    fluid_updates.updates[idx].old_block_id = neighbor.block_id;
+                    fluid_updates.updates[idx].new_block_id = BLOCK_COBBLESTONE;
+                    fluid_updates.updates[idx].new_metadata = 0;
+                    fluid_updates.updates[idx].update_type = 2;
+                }
+            }
+        }
+
+        // Lava meets water?
+        if (is_lava && isWater(neighbor.block_id)) {
+            // Lava flowing into water = cobblestone at THIS position (lava turns to stone)
+            // Only if this is flowing lava (source handled above)
+            if (!isLavaSource(fluid_id)) {
+                uint idx = atomicAdd(fluid_updates.update_count, 1);
+                if (idx < pc.max_updates) {
+                    fluid_updates.updates[idx].position = pos;
+                    fluid_updates.updates[idx].old_block_id = fluid_id;
+                    fluid_updates.updates[idx].new_block_id = BLOCK_COBBLESTONE;
+                    fluid_updates.updates[idx].new_metadata = 0;
+                    fluid_updates.updates[idx].update_type = 2;
+                }
+                return; // This fluid block is now stone, stop processing
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WATER SOURCE FORMATION
+// ============================================================================
+
+// Check if a water block should become a source (infinite water)
+// Rule: Flowing water with 2+ adjacent water sources becomes a source
+bool shouldBecomeWaterSource(ivec3 pos) {
+    VoxelData current = getVoxel(pos);
+
+    // Must be flowing water (not already a source)
+    if (current.block_id != BLOCK_WATER_FLOWING) return false;
+
+    // Must be level 0 (full block) or level 1
+    uint level = current.metadata & META_LEVEL_MASK;
+    if (level > 1) return false;
+
+    // Count adjacent water sources
+    uint source_count = 0;
+    for (int i = 0; i < 4; i++) {
+        VoxelData neighbor = getVoxel(pos + HORIZONTAL_NEIGHBORS[i]);
+        if (isWaterSource(neighbor.block_id)) {
+            source_count++;
+        }
+    }
+
+    // Need 2+ sources to create infinite water
+    return source_count >= 2;
+}
+
+// ============================================================================
+// FLUID FLOW PROPAGATION
+// ============================================================================
+
+// Get effective flow distance for fluid type
+uint getFlowDistance(uint block_id, uint dimension) {
+    if (isWater(block_id)) {
+        return WATER_FLOW_DISTANCE;
+    }
+    // Lava flows further in nether
+    return (dimension == 1) ? LAVA_FLOW_DISTANCE_NETH : LAVA_FLOW_DISTANCE_OVER;
+}
+
+// Calculate flow direction (simplified - flows to lowest neighbor)
+ivec3 calculateFlowDirection(ivec3 pos, uint block_id, uint metadata) {
+    uint level = metadata & META_LEVEL_MASK;
+    uint flow_dist = getFlowDistance(block_id, pc.dimension);
+
+    // Check if can flow down first
+    VoxelData below = getVoxel(pos + ivec3(0, -1, 0));
+    if (!isSolidForFluid(below.block_id) && !isFluid(below.block_id)) {
+        return ivec3(0, -1, 0);
+    }
+    if (isFluid(below.block_id)) {
+        // Can flow into same-type fluid with higher level
+        uint below_level = below.metadata & META_LEVEL_MASK;
+        if ((isWater(block_id) && isWater(below.block_id)) ||
+            (isLava(block_id) && isLava(below.block_id))) {
+            if (below_level > level) {
+                return ivec3(0, -1, 0);
+            }
+        }
+    }
+
+    // Find horizontal direction with lowest level or air
+    ivec3 best_dir = ivec3(0);
+    int best_level = 8; // Higher than max
+
+    for (int i = 0; i < 4; i++) {
+        ivec3 neighbor_pos = pos + HORIZONTAL_NEIGHBORS[i];
+        VoxelData neighbor = getVoxel(neighbor_pos);
+
+        if (canFluidReplace(neighbor.block_id)) {
+            if (best_level > 8) {
+                best_dir = HORIZONTAL_NEIGHBORS[i];
+                best_level = 8;
+            }
+        } else if ((isWater(block_id) && isWater(neighbor.block_id)) ||
+                   (isLava(block_id) && isLava(neighbor.block_id))) {
+            int n_level = int(neighbor.metadata & META_LEVEL_MASK);
+            if (n_level > int(level) && n_level < best_level) {
+                best_dir = HORIZONTAL_NEIGHBORS[i];
+                best_level = n_level;
+            }
+        }
+    }
+
+    return best_dir;
+}
+
+// ============================================================================
+// BUCKET MECHANICS
+// ============================================================================
+
+// Process bucket fill (empty bucket + fluid source = filled bucket)
+void processBucketFill(uint action_idx) {
+    BucketAction action = bucket_actions.actions[action_idx];
+
+    if (action.held_item != ITEM_BUCKET_EMPTY) {
+        bucket_actions.actions[action_idx].success = 0;
+        return;
+    }
+
+    VoxelData target = getVoxel(action.target_pos);
+
+    // Can only pick up source blocks
+    if (isWaterSource(target.block_id)) {
+        // Remove water source, give water bucket
+        setVoxel(action.target_pos, BLOCK_AIR, 0);
+        bucket_actions.actions[action_idx].result_item = ITEM_BUCKET_WATER;
+        bucket_actions.actions[action_idx].success = 1;
+
+        // Queue update
+        uint idx = atomicAdd(fluid_updates.update_count, 1);
+        if (idx < pc.max_updates) {
+            fluid_updates.updates[idx].position = action.target_pos;
+            fluid_updates.updates[idx].old_block_id = target.block_id;
+            fluid_updates.updates[idx].new_block_id = BLOCK_AIR;
+            fluid_updates.updates[idx].new_metadata = 0;
+            fluid_updates.updates[idx].update_type = 3; // Removal
+        }
+    }
+    else if (isLavaSource(target.block_id)) {
+        // Remove lava source, give lava bucket
+        setVoxel(action.target_pos, BLOCK_AIR, 0);
+        bucket_actions.actions[action_idx].result_item = ITEM_BUCKET_LAVA;
+        bucket_actions.actions[action_idx].success = 1;
+
+        uint idx = atomicAdd(fluid_updates.update_count, 1);
+        if (idx < pc.max_updates) {
+            fluid_updates.updates[idx].position = action.target_pos;
+            fluid_updates.updates[idx].old_block_id = target.block_id;
+            fluid_updates.updates[idx].new_block_id = BLOCK_AIR;
+            fluid_updates.updates[idx].new_metadata = 0;
+            fluid_updates.updates[idx].update_type = 3;
+        }
+    }
+    else {
+        bucket_actions.actions[action_idx].success = 0;
+    }
+}
+
+// Process bucket empty (filled bucket + valid surface = empty bucket + fluid)
+void processBucketEmpty(uint action_idx) {
+    BucketAction action = bucket_actions.actions[action_idx];
+
+    VoxelData target = getVoxel(action.target_pos);
+
+    // Check if we can place fluid here
+    if (!canFluidReplace(target.block_id) && !isFluid(target.block_id)) {
+        bucket_actions.actions[action_idx].success = 0;
+        return;
+    }
+
+    uint new_block = BLOCK_AIR;
+
+    if (action.held_item == ITEM_BUCKET_WATER) {
+        // Check for lava interaction first
+        VoxelData current = getVoxel(action.target_pos);
+        if (isLavaSource(current.block_id)) {
+            // Pouring water on lava source = obsidian
+            new_block = BLOCK_OBSIDIAN;
+        } else if (isLava(current.block_id)) {
+            // Pouring water on flowing lava = cobblestone
+            new_block = BLOCK_COBBLESTONE;
+        } else {
+            // Normal water placement
+            new_block = BLOCK_WATER_SOURCE;
+        }
+        bucket_actions.actions[action_idx].result_item = ITEM_BUCKET_EMPTY;
+        bucket_actions.actions[action_idx].success = 1;
+    }
+    else if (action.held_item == ITEM_BUCKET_LAVA) {
+        // Check for water interaction
+        VoxelData current = getVoxel(action.target_pos);
+        if (isWater(current.block_id)) {
+            // Pouring lava on water = cobblestone
+            new_block = BLOCK_COBBLESTONE;
+        } else {
+            // Normal lava placement
+            new_block = BLOCK_LAVA_SOURCE;
+        }
+        bucket_actions.actions[action_idx].result_item = ITEM_BUCKET_EMPTY;
+        bucket_actions.actions[action_idx].success = 1;
+    }
+    else {
+        bucket_actions.actions[action_idx].success = 0;
+        return;
+    }
+
+    // Apply the block change
+    uint new_meta = (new_block == BLOCK_WATER_SOURCE || new_block == BLOCK_LAVA_SOURCE) ? 0 : 0;
+    setVoxel(action.target_pos, new_block, new_meta);
+
+    // Queue update for neighbor recalculation
+    uint idx = atomicAdd(fluid_updates.update_count, 1);
+    if (idx < pc.max_updates) {
+        fluid_updates.updates[idx].position = action.target_pos;
+        fluid_updates.updates[idx].old_block_id = target.block_id;
+        fluid_updates.updates[idx].new_block_id = new_block;
+        fluid_updates.updates[idx].new_metadata = new_meta;
+        fluid_updates.updates[idx].update_type = 1; // Source formation
+    }
+}
+
+// ============================================================================
+// OBSIDIAN BREAKING MECHANICS
+// ============================================================================
+
+// Get break time for obsidian with given tool
+float getObsidianBreakTime(uint tool_item) {
+    // Only diamond pickaxe can efficiently mine obsidian
+    // Other pickaxes can mine it but take much longer
+    // No pickaxe = bare hand = 250 seconds
+
+    switch (tool_item) {
+        case ITEM_DIAMOND_PICKAXE:
+            return OBSIDIAN_DIAMOND_BREAK_TIME;  // 9.4 seconds
+        case ITEM_IRON_PICKAXE:
+            return 41.7;   // Iron: 41.7 seconds (can mine but very slow)
+        case ITEM_GOLDEN_PICKAXE:
+            return 20.85;  // Gold: faster but can't harvest (drops nothing)
+        case ITEM_STONE_PICKAXE:
+            return 62.5;   // Stone: 62.5 seconds (can't harvest)
+        case ITEM_WOODEN_PICKAXE:
+            return 125.0;  // Wood: 125 seconds (can't harvest)
+        default:
+            return OBSIDIAN_HAND_BREAK_TIME;  // 250 seconds by hand
+    }
+}
+
+// Check if tool can harvest obsidian (get the drop)
+bool canHarvestObsidian(uint tool_item) {
+    // Only diamond pickaxe can harvest obsidian
+    return tool_item == ITEM_DIAMOND_PICKAXE;
+}
+
+// Process obsidian breaking progress
+void processBreakProgress(uint break_idx) {
+    BreakProgress bp = break_progress.breaks[break_idx];
+
+    if (bp.block_id != BLOCK_OBSIDIAN) return;
+
+    // Verify block is still obsidian
+    VoxelData current = getVoxel(bp.position);
+    if (current.block_id != BLOCK_OBSIDIAN) {
+        // Block changed, cancel breaking
+        break_progress.breaks[break_idx].accumulated_time = 0.0;
+        return;
+    }
+
+    // Get required break time for current tool
+    float required = getObsidianBreakTime(bp.tool_item);
+    break_progress.breaks[break_idx].required_time = required;
+
+    // Accumulate break time
+    float new_accumulated = bp.accumulated_time + pc.delta_time;
+    break_progress.breaks[break_idx].accumulated_time = new_accumulated;
+
+    // Check if broken
+    if (new_accumulated >= required) {
+        // Break the obsidian
+        setVoxel(bp.position, BLOCK_AIR, 0);
+
+        // Reset breaking progress
+        break_progress.breaks[break_idx].accumulated_time = 0.0;
+
+        // Queue update
+        uint idx = atomicAdd(fluid_updates.update_count, 1);
+        if (idx < pc.max_updates) {
+            fluid_updates.updates[idx].position = bp.position;
+            fluid_updates.updates[idx].old_block_id = BLOCK_OBSIDIAN;
+            fluid_updates.updates[idx].new_block_id = BLOCK_AIR;
+            fluid_updates.updates[idx].new_metadata = 0;
+            fluid_updates.updates[idx].update_type = 3; // Removal
+        }
+
+        // Note: Actual drop handling (obsidian item if diamond pick)
+        // should be done in inventory system
+    }
+}
+
+// ============================================================================
+// NETHER PORTAL CASTING HELPER
+// ============================================================================
+
+// Bucket casting method for speedrun portal:
+// 1. Build frame with dirt/cobblestone
+// 2. Pour water at top
+// 3. Pour lava at each position where you want obsidian
+// 4. Water converts lava to obsidian instantly
+// 5. Pick up water, repeat
+//
+// Minimum obsidian: 10 (corners can be any block)
+// Frame: 4 wide x 5 tall internal space
+//
+//   XX
+//  X  X
+//  X  X
+//  X  X
+//   XX
+//
+// Where X = obsidian (or any block for corners)
+
+// Validate if position is part of a valid portal frame
+// Returns: 1 if part of valid X-axis portal, 2 if Z-axis portal, 0 if not
+uint isValidPortalFrame(ivec3 corner, uint axis) {
+    // Portal frame dimensions: 4 wide x 5 tall (internal 2x3)
+    // axis 0 = portal faces X direction (frame in XY plane)
+    // axis 1 = portal faces Z direction (frame in ZY plane)
+
+    uint obsidian_count = 0;
+
+    // Check bottom edge (2 blocks)
+    for (int i = 1; i <= 2; i++) {
+        ivec3 pos = corner + (axis == 0 ? ivec3(i, 0, 0) : ivec3(0, 0, i));
+        VoxelData v = getVoxel(pos);
+        if (v.block_id == BLOCK_OBSIDIAN) obsidian_count++;
+    }
+
+    // Check top edge (2 blocks)
+    for (int i = 1; i <= 2; i++) {
+        ivec3 pos = corner + (axis == 0 ? ivec3(i, 4, 0) : ivec3(0, 4, i));
+        VoxelData v = getVoxel(pos);
+        if (v.block_id == BLOCK_OBSIDIAN) obsidian_count++;
+    }
+
+    // Check left edge (3 blocks)
+    for (int y = 1; y <= 3; y++) {
+        ivec3 pos = corner + ivec3(0, y, 0);
+        VoxelData v = getVoxel(pos);
+        if (v.block_id == BLOCK_OBSIDIAN) obsidian_count++;
+    }
+
+    // Check right edge (3 blocks)
+    for (int y = 1; y <= 3; y++) {
+        ivec3 pos = corner + (axis == 0 ? ivec3(3, y, 0) : ivec3(0, y, 3));
+        VoxelData v = getVoxel(pos);
+        if (v.block_id == BLOCK_OBSIDIAN) obsidian_count++;
+    }
+
+    // Need at least 10 obsidian (corners optional)
+    return (obsidian_count >= PORTAL_MIN_OBSIDIAN) ? (axis + 1) : 0;
+}
+
+// ============================================================================
+// MAIN FLUID TICK
+// ============================================================================
+
+void tickFluid(uint fluid_idx) {
+    if (fluid_idx >= fluid_blocks.fluid_count) return;
+
+    FluidBlock fb = fluid_blocks.fluids[fluid_idx];
+
+    // Check if it's time to update this fluid
+    if (fb.tick_scheduled > pc.current_tick) return;
+
+    // Verify fluid still exists
+    VoxelData current = getVoxel(fb.position);
+    if (!isFluid(current.block_id)) return;
+
+    // Check for fluid interactions first
+    checkFluidInteraction(fb.position, current.block_id);
+
+    // Re-read in case interaction changed the block
+    current = getVoxel(fb.position);
+    if (!isFluid(current.block_id)) return;
+
+    // Check for water source formation (infinite water)
+    if (current.block_id == BLOCK_WATER_FLOWING) {
+        if (shouldBecomeWaterSource(fb.position)) {
+            setVoxel(fb.position, BLOCK_WATER_SOURCE, 0);
+
+            uint idx = atomicAdd(fluid_updates.update_count, 1);
+            if (idx < pc.max_updates) {
+                fluid_updates.updates[idx].position = fb.position;
+                fluid_updates.updates[idx].old_block_id = BLOCK_WATER_FLOWING;
+                fluid_updates.updates[idx].new_block_id = BLOCK_WATER_SOURCE;
+                fluid_updates.updates[idx].new_metadata = 0;
+                fluid_updates.updates[idx].update_type = 1; // Source formation
+            }
+            return;
+        }
+    }
+
+    // Calculate flow propagation
+    uint level = current.metadata & META_LEVEL_MASK;
+    uint flow_dist = getFlowDistance(current.block_id, pc.dimension);
+    bool is_source = isFluidSource(current.block_id);
+
+    // Source blocks always try to spread (level 0)
+    // Flowing blocks spread up to flow_dist
+    if (!is_source && level >= flow_dist) {
+        // This flowing block has reached max distance, remove it if not supported
+        bool has_source_above = false;
+        VoxelData above = getVoxel(fb.position + ivec3(0, 1, 0));
+        if ((isWater(current.block_id) && isWater(above.block_id)) ||
+            (isLava(current.block_id) && isLava(above.block_id))) {
+            has_source_above = true;
+        }
+
+        if (!has_source_above) {
+            // Check horizontal neighbors for lower level (source)
+            bool has_source = false;
+            for (int i = 0; i < 4; i++) {
+                VoxelData neighbor = getVoxel(fb.position + HORIZONTAL_NEIGHBORS[i]);
+                if ((isWater(current.block_id) && isWater(neighbor.block_id)) ||
+                    (isLava(current.block_id) && isLava(neighbor.block_id))) {
+                    uint n_level = neighbor.metadata & META_LEVEL_MASK;
+                    if (n_level < level || isFluidSource(neighbor.block_id)) {
+                        has_source = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!has_source) {
+                // Remove unsupported fluid
+                setVoxel(fb.position, BLOCK_AIR, 0);
+                uint idx = atomicAdd(fluid_updates.update_count, 1);
+                if (idx < pc.max_updates) {
+                    fluid_updates.updates[idx].position = fb.position;
+                    fluid_updates.updates[idx].old_block_id = current.block_id;
+                    fluid_updates.updates[idx].new_block_id = BLOCK_AIR;
+                    fluid_updates.updates[idx].new_metadata = 0;
+                    fluid_updates.updates[idx].update_type = 3;
+                }
+            }
+        }
+        return;
+    }
+
+    // Calculate next flow level
+    uint next_level = is_source ? 1 : (level + 1);
+    uint flowing_type = isWater(current.block_id) ? BLOCK_WATER_FLOWING : BLOCK_LAVA_FLOWING;
+
+    // Try to flow down first (always preferred)
+    VoxelData below = getVoxel(fb.position + ivec3(0, -1, 0));
+    if (canFluidReplace(below.block_id)) {
+        // Check for lava-water interaction when flowing down
+        if (isWater(current.block_id) && isLava(below.block_id)) {
+            uint result = isLavaSource(below.block_id) ? BLOCK_OBSIDIAN : BLOCK_COBBLESTONE;
+            setVoxel(fb.position + ivec3(0, -1, 0), result, 0);
+        } else if (isLava(current.block_id) && isWater(below.block_id)) {
+            setVoxel(fb.position + ivec3(0, -1, 0), BLOCK_COBBLESTONE, 0);
+        } else {
+            // Normal downward flow (level 0 with falling flag)
+            setVoxel(fb.position + ivec3(0, -1, 0), flowing_type, META_FALLING_BIT);
+        }
+
+        uint idx = atomicAdd(fluid_updates.update_count, 1);
+        if (idx < pc.max_updates) {
+            fluid_updates.updates[idx].position = fb.position + ivec3(0, -1, 0);
+            fluid_updates.updates[idx].old_block_id = below.block_id;
+            fluid_updates.updates[idx].new_block_id = flowing_type;
+            fluid_updates.updates[idx].new_metadata = META_FALLING_BIT;
+            fluid_updates.updates[idx].update_type = 0;
+        }
+        return; // Only flow in one direction per tick
+    }
+
+    // Flow horizontally if can't go down
+    if (next_level <= flow_dist) {
+        for (int i = 0; i < 4; i++) {
+            ivec3 neighbor_pos = fb.position + HORIZONTAL_NEIGHBORS[i];
+            VoxelData neighbor = getVoxel(neighbor_pos);
+
+            if (canFluidReplace(neighbor.block_id)) {
+                // Check for lava-water interaction
+                if (isWater(current.block_id) && isLava(neighbor.block_id)) {
+                    uint result = isLavaSource(neighbor.block_id) ? BLOCK_OBSIDIAN : BLOCK_COBBLESTONE;
+                    setVoxel(neighbor_pos, result, 0);
+                } else if (isLava(current.block_id) && isWater(neighbor.block_id)) {
+                    setVoxel(neighbor_pos, BLOCK_COBBLESTONE, 0);
+                } else {
+                    setVoxel(neighbor_pos, flowing_type, next_level);
+                }
+
+                uint idx = atomicAdd(fluid_updates.update_count, 1);
+                if (idx < pc.max_updates) {
+                    fluid_updates.updates[idx].position = neighbor_pos;
+                    fluid_updates.updates[idx].old_block_id = neighbor.block_id;
+                    fluid_updates.updates[idx].new_block_id = flowing_type;
+                    fluid_updates.updates[idx].new_metadata = next_level;
+                    fluid_updates.updates[idx].update_type = 0;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0:
+            // Stage 0: Fluid tick processing
+            tickFluid(gid);
+            break;
+
+        case 1:
+            // Stage 1: Bucket action processing
+            if (gid < bucket_actions.action_count) {
+                BucketAction action = bucket_actions.actions[gid];
+                if (action.action_type == 0) {
+                    processBucketFill(gid);
+                } else {
+                    processBucketEmpty(gid);
+                }
+            }
+            break;
+
+        case 2:
+            // Stage 2: Breaking progress (primarily for obsidian)
+            if (gid < break_progress.break_count) {
+                processBreakProgress(gid);
+            }
+            break;
+    }
+}

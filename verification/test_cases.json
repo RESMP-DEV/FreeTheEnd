@@ -1,0 +1,5078 @@
+{
+  "matrix_dimensions": {
+    "raw_damage": [
+      1,
+      2,
+      4,
+      6,
+      8,
+      10,
+      15,
+      20
+    ],
+    "armor": [
+      0,
+      2,
+      4,
+      8,
+      12,
+      16,
+      20
+    ],
+    "protection_levels": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "resistance_levels": [
+      0,
+      1,
+      2
+    ]
+  },
+  "total_cases": 840,
+  "test_cases": [
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 1,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 2,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 4,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 6,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 8,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 10,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 15,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 0,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 2,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 4,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 8,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 12,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 16,
+      "protection_level": 4,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 0,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 1,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 2,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 3,
+      "resistance_level": 2
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 0
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 1
+    },
+    {
+      "raw_damage": 20,
+      "armor": 20,
+      "protection_level": 4,
+      "resistance_level": 2
+    }
+  ]
+}

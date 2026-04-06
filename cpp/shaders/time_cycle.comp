@@ -1,0 +1,438 @@
+#version 450
+
+// Time Cycle - Day/night cycle, light levels, and mob spawning rules
+// Implements MC 1.8.9 time mechanics:
+//   - 24000 tick day cycle (20 tps = 20 real minutes per day)
+//   - Dawn: 0, Noon: 6000, Dusk: 12000, Midnight: 18000
+//   - Light levels affect mob spawning and undead burning
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Time of day constants (in ticks)
+const uint TICKS_PER_DAY = 24000;
+const uint TICK_DAWN = 0;
+const uint TICK_NOON = 6000;
+const uint TICK_DUSK = 12000;
+const uint TICK_MIDNIGHT = 18000;
+
+// Light transition periods
+const uint TICK_SUNRISE_START = 23000;  // Light starts increasing
+const uint TICK_SUNRISE_END = 167;      // Full daylight
+const uint TICK_SUNSET_START = 12000;   // Light starts decreasing
+const uint TICK_SUNSET_END = 13000;     // Full darkness
+
+// Light level constants
+const uint MAX_SKY_LIGHT = 15;
+const uint MIN_SKY_LIGHT = 4;           // Moonlight at night
+const uint HOSTILE_SPAWN_LIGHT_MAX = 7; // Hostiles spawn at light <= 7
+const uint PASSIVE_SPAWN_LIGHT_MIN = 9; // Passives spawn at light >= 9
+const uint UNDEAD_BURN_LIGHT_MIN = 12;  // Undead burn at sky light >= 12
+
+// Mob type flags for burning check
+const uint MOB_FLAG_UNDEAD = 1u << 0;        // Zombie, skeleton, etc.
+const uint MOB_FLAG_BURNING_IMMUNE = 1u << 1; // Wither skeletons, phantoms
+const uint MOB_FLAG_WEARING_HELMET = 1u << 2; // Has head protection
+const uint MOB_FLAG_IN_WATER = 1u << 3;       // Currently in water
+const uint MOB_FLAG_IN_SHADOW = 1u << 4;      // Under block/in cave
+
+// Dimension IDs
+const uint DIM_OVERWORLD = 0;
+const uint DIM_NETHER = 1;
+const uint DIM_END = 2;
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct TimeState {
+    uint world_time;            // Current time in ticks (0-24000)
+    uint day_count;             // Number of days elapsed
+    float time_of_day;          // Normalized 0.0-1.0
+    uint is_day;                // Boolean: 1 = day, 0 = night
+    uint current_sky_light;     // Sky light level 0-15
+    uint moon_phase;            // 0-7 moon phase (affects slime spawns)
+    float sun_angle;            // Sun angle in radians
+    float ambient_light;        // Ambient light multiplier 0.0-1.0
+};
+
+struct MobState {
+    vec3 position;
+    float pad0;
+    uint mob_type;
+    uint flags;
+    float health;
+    float pad1;
+};
+
+struct SpawnCheck {
+    vec3 position;
+    float pad0;
+    uint chunk_x;
+    uint chunk_z;
+    uint biome;
+    uint block_light;           // Light from torches, lava, etc.
+    uint sky_light_access;      // 1 = can see sky, 0 = in cave
+    uint surface_block;         // Block type at spawn position
+    uint can_spawn_hostile;     // Output: 1 = valid hostile spawn
+    uint can_spawn_passive;     // Output: 1 = valid passive spawn
+};
+
+struct Observation {
+    float time_of_day;          // Normalized 0.0-1.0
+    uint is_day;                // Boolean
+    uint light_level_at_player; // Combined light level at player position
+    float sun_angle;            // For rendering
+    float moon_angle;           // For rendering
+    uint moon_phase;            // 0-7
+    float ambient_brightness;   // For rendering
+    uint _pad;
+};
+
+// ============================================================================
+// BUFFER BINDINGS
+// ============================================================================
+
+// Time state - updated each tick
+layout(std430, binding = 0) buffer TimeBuffer {
+    TimeState time_state;
+};
+
+// Mob buffer for undead burning checks
+layout(std430, binding = 1) buffer MobBuffer {
+    uint mob_count;
+    uint pad[3];
+    MobState mobs[];
+};
+
+// Spawn check buffer - positions to validate for mob spawning
+layout(std430, binding = 2) buffer SpawnCheckBuffer {
+    uint check_count;
+    uint pad2[3];
+    SpawnCheck spawn_checks[];
+};
+
+// Player state for observation output
+layout(std430, binding = 3) buffer PlayerBuffer {
+    vec3 player_position;
+    float pad3;
+    uint player_dimension;
+    uint player_block_light;    // Light level from blocks near player
+    uint player_sky_access;     // Can player see sky?
+    uint pad4;
+};
+
+// Observation output for RL agent
+layout(std430, binding = 4) buffer ObservationBuffer {
+    Observation obs;
+};
+
+// World blocks for sky access checks (simplified)
+layout(std430, binding = 5) readonly buffer WorldBuffer {
+    uint world_height;          // Y height of world
+    uint chunk_count;
+    uint pad5[2];
+    uint heightmap[];           // Highest solid block per xz column
+};
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint tick_delta;            // Ticks to advance (usually 1)
+    uint dimension;             // Current dimension
+    uint weather;               // 0 = clear, 1 = rain, 2 = thunder
+    uint flags;                 // Reserved
+} pc;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// PCG random hash
+uint pcg_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+// Smooth interpolation for light transitions
+float smoothstep_custom(float edge0, float edge1, float x) {
+    float t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// ============================================================================
+// TIME CALCULATION
+// ============================================================================
+
+// Calculate sky light level based on time of day
+uint calculate_sky_light(uint world_time) {
+    // Normalize time to 0-24000 range
+    uint time = world_time % TICKS_PER_DAY;
+
+    // Day time: full light
+    // 0 (dawn) to 12000 (dusk) is day
+    // 12000 (dusk) to 13000 is sunset transition
+    // 13000 to 23000 is night
+    // 23000 to 24000 (0) is sunrise transition
+
+    if (time < TICK_DUSK) {
+        // Daytime - full sky light
+        return MAX_SKY_LIGHT;
+    } else if (time < TICK_SUNSET_END) {
+        // Sunset transition (12000-13000)
+        float progress = float(time - TICK_SUNSET_START) / float(TICK_SUNSET_END - TICK_SUNSET_START);
+        float light = mix(float(MAX_SKY_LIGHT), float(MIN_SKY_LIGHT), smoothstep_custom(0.0, 1.0, progress));
+        return uint(round(light));
+    } else if (time < TICK_SUNRISE_START) {
+        // Night time - minimum light (moonlight)
+        return MIN_SKY_LIGHT;
+    } else {
+        // Sunrise transition (23000-24000)
+        float progress = float(time - TICK_SUNRISE_START) / float(TICKS_PER_DAY - TICK_SUNRISE_START);
+        float light = mix(float(MIN_SKY_LIGHT), float(MAX_SKY_LIGHT), smoothstep_custom(0.0, 1.0, progress));
+        return uint(round(light));
+    }
+}
+
+// Calculate if it's daytime
+bool is_daytime(uint world_time) {
+    uint time = world_time % TICKS_PER_DAY;
+    // Day is from tick 0 (dawn) to tick 12542 (when sky light drops below 12)
+    // For simplicity: day = 0-12000, night = 12000-24000
+    return time < TICK_DUSK || time >= TICK_SUNRISE_START;
+}
+
+// Calculate sun angle for rendering (0 = sunrise, PI/2 = noon, PI = sunset, 3PI/2 = midnight)
+float calculate_sun_angle(uint world_time) {
+    uint time = world_time % TICKS_PER_DAY;
+    // Map 0-24000 ticks to 0-2PI radians
+    // Dawn (0) should be sun at horizon (angle ~0 or ~PI depending on convention)
+    // Noon (6000) should be sun at zenith
+    return (float(time) / float(TICKS_PER_DAY)) * 6.28318530718;
+}
+
+// Calculate moon phase (0-7, changes every day)
+uint calculate_moon_phase(uint day_count) {
+    return day_count % 8;
+}
+
+// ============================================================================
+// MOB SPAWNING RULES
+// ============================================================================
+
+// Check if position is valid for hostile mob spawning
+bool can_spawn_hostile(uint block_light, uint sky_light, uint sky_access, uint world_time, uint dimension) {
+    // Nether and End: no day/night cycle, spawn anytime
+    if (dimension == DIM_NETHER || dimension == DIM_END) {
+        return block_light <= HOSTILE_SPAWN_LIGHT_MAX;
+    }
+
+    // Overworld:
+    // 1. Must have low light (block light <= 7)
+    // 2. Either: night time OR no sky access (cave)
+    if (block_light > HOSTILE_SPAWN_LIGHT_MAX) {
+        return false;
+    }
+
+    bool is_night = !is_daytime(world_time);
+    bool in_cave = sky_access == 0;
+
+    return is_night || in_cave;
+}
+
+// Check if position is valid for passive mob spawning
+bool can_spawn_passive(uint combined_light, uint dimension) {
+    // Passives need light level >= 9
+    // Only spawn in Overworld
+    if (dimension != DIM_OVERWORLD) {
+        return false;
+    }
+    return combined_light >= PASSIVE_SPAWN_LIGHT_MIN;
+}
+
+// Calculate combined light level (max of block light and sky light * time factor)
+uint calculate_combined_light(uint block_light, uint sky_light_access, uint current_sky_light) {
+    // If no sky access, only block light matters
+    if (sky_light_access == 0) {
+        return block_light;
+    }
+    // Otherwise, take max of block light and current sky light
+    return max(block_light, current_sky_light);
+}
+
+// ============================================================================
+// UNDEAD BURNING
+// ============================================================================
+
+// Check if an undead mob should burn
+bool should_undead_burn(MobState mob, uint current_sky_light, uint dimension) {
+    // Only burns in Overworld during day
+    if (dimension != DIM_OVERWORLD) {
+        return false;
+    }
+
+    // Check if mob is undead
+    if ((mob.flags & MOB_FLAG_UNDEAD) == 0) {
+        return false;
+    }
+
+    // Check immunities
+    if ((mob.flags & MOB_FLAG_BURNING_IMMUNE) != 0) {
+        return false;
+    }
+    if ((mob.flags & MOB_FLAG_WEARING_HELMET) != 0) {
+        return false;
+    }
+    if ((mob.flags & MOB_FLAG_IN_WATER) != 0) {
+        return false;
+    }
+    if ((mob.flags & MOB_FLAG_IN_SHADOW) != 0) {
+        return false;
+    }
+
+    // Burns if sky light is high enough
+    return current_sky_light >= UNDEAD_BURN_LIGHT_MIN;
+}
+
+// ============================================================================
+// MAIN ENTRY POINTS
+// ============================================================================
+
+void update_time() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    // Advance world time
+    time_state.world_time = (time_state.world_time + pc.tick_delta) % TICKS_PER_DAY;
+
+    // Update day count when crossing midnight
+    if (time_state.world_time < pc.tick_delta) {
+        time_state.day_count++;
+    }
+
+    // Calculate derived values
+    time_state.time_of_day = float(time_state.world_time) / float(TICKS_PER_DAY);
+    time_state.is_day = is_daytime(time_state.world_time) ? 1u : 0u;
+    time_state.current_sky_light = calculate_sky_light(time_state.world_time);
+    time_state.moon_phase = calculate_moon_phase(time_state.day_count);
+    time_state.sun_angle = calculate_sun_angle(time_state.world_time);
+
+    // Weather affects sky light
+    uint sky_light = time_state.current_sky_light;
+    if (pc.weather == 1) {
+        // Rain reduces sky light by ~3
+        sky_light = max(sky_light, 3u) - 3u;
+    } else if (pc.weather == 2) {
+        // Thunder reduces sky light significantly
+        sky_light = max(sky_light, 5u) - 5u;
+    }
+    time_state.current_sky_light = sky_light;
+
+    // Ambient light for rendering (0 = pitch black, 1 = full bright)
+    time_state.ambient_light = float(sky_light) / float(MAX_SKY_LIGHT);
+}
+
+void process_spawn_checks() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= check_count) return;
+
+    SpawnCheck check = spawn_checks[idx];
+
+    // Calculate effective light at spawn position
+    uint effective_sky_light = check.sky_light_access != 0 ? time_state.current_sky_light : 0u;
+    uint combined_light = max(check.block_light, effective_sky_light);
+
+    // Check hostile spawning rules
+    spawn_checks[idx].can_spawn_hostile = can_spawn_hostile(
+        check.block_light,
+        effective_sky_light,
+        check.sky_light_access,
+        time_state.world_time,
+        pc.dimension
+    ) ? 1u : 0u;
+
+    // Check passive spawning rules
+    spawn_checks[idx].can_spawn_passive = can_spawn_passive(combined_light, pc.dimension) ? 1u : 0u;
+}
+
+void process_undead_burning() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    if (should_undead_burn(mob, time_state.current_sky_light, pc.dimension)) {
+        // Apply burning damage (1 HP per second = 0.5 HP per 10 ticks)
+        // Actual damage application would be in a separate combat pass
+        // Here we just set a "burning" flag
+        mobs[idx].flags |= (1u << 16); // BURNING flag in upper bits
+    } else {
+        // Clear burning flag
+        mobs[idx].flags &= ~(1u << 16);
+    }
+}
+
+void update_observation() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    // Calculate light level at player position
+    uint player_sky_light = player_sky_access != 0 ? time_state.current_sky_light : 0u;
+    uint player_light = max(player_block_light, player_sky_light);
+
+    // Write observation for RL agent
+    obs.time_of_day = time_state.time_of_day;
+    obs.is_day = time_state.is_day;
+    obs.light_level_at_player = player_light;
+    obs.sun_angle = time_state.sun_angle;
+    obs.moon_angle = time_state.sun_angle + 3.14159265359; // Moon opposite sun
+    obs.moon_phase = time_state.moon_phase;
+    obs.ambient_brightness = time_state.ambient_light;
+}
+
+// Stage selector via push constant or specialization constant would be cleaner,
+// but for simplicity we use the global invocation ID pattern:
+// - Stage 0: Update time (single thread)
+// - Stage 1: Process spawn checks (parallel)
+// - Stage 2: Process undead burning (parallel)
+// - Stage 3: Update observation (single thread)
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    // All stages in sequence (would normally be separate dispatches)
+    // First pass: update time
+    if (gid == 0) {
+        update_time();
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    // Second pass: spawn checks
+    if (gid < check_count) {
+        process_spawn_checks();
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    // Third pass: undead burning
+    if (gid < mob_count) {
+        process_undead_burning();
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    // Fourth pass: observation
+    if (gid == 0) {
+        update_observation();
+    }
+}

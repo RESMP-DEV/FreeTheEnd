@@ -1,0 +1,746 @@
+#version 450
+
+/*
+ * quick_craft.comp - Context-sensitive quick crafting for RL speedrun training
+ *
+ * Single action crafts the most useful available item based on speedrun progression.
+ * Priority order optimized for "Free The End" (spawn to dragon kill):
+ *
+ *  1. Eyes of Ender (if have blaze powder + ender pearls)
+ *  2. Blaze powder (if have blaze rods, need eyes)
+ *  3. Iron pickaxe (if have iron ingots, need diamond/obsidian)
+ *  4. Stone pickaxe (if have cobblestone, need iron)
+ *  5. Wooden pickaxe (if have planks, need stone/cobble)
+ *  6. Crafting table (if none, have planks)
+ *  7. Planks (if have logs, need anything)
+ *  8. Sticks (if have planks, need tools)
+ *  9. Furnace (if have cobblestone, need smelting)
+ * 10. Bucket (if have iron ingots)
+ *
+ * Integrates with inventory_ops.comp slot layout and crafting.comp recipe system.
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// MINECRAFT 1.8.9 ITEM IDS
+// ============================================================================
+
+// Blocks
+const uint ITEM_OAK_LOG = 17;
+const uint ITEM_SPRUCE_LOG = 17;   // damage 1
+const uint ITEM_BIRCH_LOG = 17;    // damage 2
+const uint ITEM_JUNGLE_LOG = 17;   // damage 3
+const uint ITEM_COBBLESTONE = 4;
+const uint ITEM_STONE = 1;
+const uint ITEM_OBSIDIAN = 49;
+const uint ITEM_CRAFTING_TABLE = 58;
+const uint ITEM_FURNACE = 61;
+
+// Planks (all variants share ID with damage value)
+const uint ITEM_PLANKS = 5;
+const uint ITEM_OAK_PLANKS = 5;    // damage 0
+const uint ITEM_SPRUCE_PLANKS = 5; // damage 1
+const uint ITEM_BIRCH_PLANKS = 5;  // damage 2
+const uint ITEM_JUNGLE_PLANKS = 5; // damage 3
+
+// Materials
+const uint ITEM_STICK = 280;
+const uint ITEM_IRON_INGOT = 265;
+const uint ITEM_DIAMOND = 264;
+const uint ITEM_COAL = 263;
+
+// Tools
+const uint ITEM_WOODEN_PICKAXE = 270;
+const uint ITEM_STONE_PICKAXE = 274;
+const uint ITEM_IRON_PICKAXE = 257;
+const uint ITEM_DIAMOND_PICKAXE = 278;
+const uint ITEM_WOODEN_SWORD = 268;
+const uint ITEM_STONE_SWORD = 272;
+const uint ITEM_IRON_SWORD = 267;
+const uint ITEM_DIAMOND_SWORD = 276;
+
+// Nether/End items
+const uint ITEM_BLAZE_ROD = 369;
+const uint ITEM_BLAZE_POWDER = 377;
+const uint ITEM_ENDER_PEARL = 368;
+const uint ITEM_EYE_OF_ENDER = 381;
+
+// Utility
+const uint ITEM_BUCKET = 325;
+const uint ITEM_WATER_BUCKET = 326;
+const uint ITEM_LAVA_BUCKET = 327;
+
+// ============================================================================
+// RECIPE IDS (Internal - matches recipe_table indices)
+// ============================================================================
+
+const uint RECIPE_EYE_OF_ENDER = 1;
+const uint RECIPE_BLAZE_POWDER = 2;
+const uint RECIPE_IRON_PICKAXE = 3;
+const uint RECIPE_STONE_PICKAXE = 4;
+const uint RECIPE_WOODEN_PICKAXE = 5;
+const uint RECIPE_CRAFTING_TABLE = 6;
+const uint RECIPE_PLANKS = 7;
+const uint RECIPE_STICKS = 8;
+const uint RECIPE_FURNACE = 9;
+const uint RECIPE_BUCKET = 10;
+const uint RECIPE_IRON_SWORD = 11;
+const uint RECIPE_DIAMOND_PICKAXE = 12;
+const uint RECIPE_DIAMOND_SWORD = 13;
+
+// ============================================================================
+// INVENTORY LAYOUT (matches inventory_ops.comp)
+// ============================================================================
+
+const uint CRAFT_OUTPUT = 0;
+const uint CRAFT_INPUT_START = 1;
+const uint CRAFT_INPUT_END = 4;
+const uint ARMOR_START = 5;
+const uint ARMOR_END = 8;
+const uint MAIN_INV_START = 9;
+const uint MAIN_INV_END = 35;
+const uint HOTBAR_START = 36;
+const uint HOTBAR_END = 44;
+const uint OFFHAND = 45;
+
+const uint INV_SIZE = 46;
+const uint INV_STRIDE = 232;
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+// Inventory buffer (SSBO) - shared with other shaders
+layout(set = 0, binding = 0) buffer InventoryBuffer {
+    uint data[];
+} inventories;
+
+// Quick craft requests: agent_id, flags (bit 0 = has_crafting_table)
+layout(set = 0, binding = 1) buffer QuickCraftRequests {
+    uint requests[];
+} craft_requests;
+
+// Quick craft results: crafted_item_id, recipe_used, count, reserved
+layout(set = 0, binding = 2) buffer QuickCraftResults {
+    uint results[];
+} craft_results;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint num_agents;
+    uint num_requests;
+} push;
+
+// ============================================================================
+// INVENTORY ACCESS HELPERS (duplicated from inventory_ops.comp for standalone use)
+// ============================================================================
+
+uint getInventoryOffset(uint agent_id) {
+    return agent_id * (INV_STRIDE / 4);
+}
+
+uint readItemId(uint base_offset, uint slot) {
+    uint word_offset = base_offset + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return uint((slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16));
+}
+
+void writeItemId(uint base_offset, uint slot, uint item_id) {
+    uint word_offset = base_offset + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | uint(item_id);
+    } else {
+        word = (word & 0x0000FFFF) | (uint(item_id) << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+uint readCount(uint base_offset, uint slot) {
+    uint count_base = base_offset + 23;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    return uint((word >> shift) & 0xFF);
+}
+
+void writeCount(uint base_offset, uint slot, uint count) {
+    uint count_base = base_offset + 23;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    word = (word & ~(0xFF << shift)) | (uint(count) << shift);
+    inventories.data[word_offset] = word;
+}
+
+uint readDamage(uint base_offset, uint slot) {
+    uint damage_base = base_offset + 35;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return uint((slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16));
+}
+
+void writeDamage(uint base_offset, uint slot, uint damage) {
+    uint damage_base = base_offset + 35;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | uint(damage);
+    } else {
+        word = (word & 0x0000FFFF) | (uint(damage) << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+void clearSlot(uint base_offset, uint slot) {
+    writeItemId(base_offset, slot, 0);
+    writeCount(base_offset, slot, 0);
+    writeDamage(base_offset, slot, 0);
+}
+
+// ============================================================================
+// INVENTORY QUERY HELPERS
+// ============================================================================
+
+// Count total of item_id across all inventory slots
+uint countItem(uint base_offset, uint item_id) {
+    uint total = 0;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        if (readItemId(base_offset, i) == item_id) {
+            total += readCount(base_offset, i);
+        }
+    }
+    return total;
+}
+
+// Check if player has at least 'required' of item_id
+bool hasItems(uint base_offset, uint item_id, uint required) {
+    return countItem(base_offset, item_id) >= required;
+}
+
+// Check if player has any wood logs (any type)
+uint countLogs(uint base_offset) {
+    uint total = 0;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        uint id = readItemId(base_offset, i);
+        // Log IDs: 17 (oak/spruce/birch/jungle), 162 (acacia/dark_oak in 1.7+)
+        if (id == 17 || id == 162) {
+            total += readCount(base_offset, i);
+        }
+    }
+    return total;
+}
+
+// Check if player has any planks (any type)
+uint countPlanks(uint base_offset) {
+    uint total = 0;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        if (readItemId(base_offset, i) == ITEM_PLANKS) {
+            total += readCount(base_offset, i);
+        }
+    }
+    return total;
+}
+
+// Check if player has a crafting table in inventory
+bool hasCraftingTable(uint base_offset) {
+    return hasItems(base_offset, ITEM_CRAFTING_TABLE, 1);
+}
+
+// Check if player has any pickaxe
+bool hasAnyPickaxe(uint base_offset) {
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        uint id = readItemId(base_offset, i);
+        if (id == ITEM_WOODEN_PICKAXE || id == ITEM_STONE_PICKAXE ||
+            id == ITEM_IRON_PICKAXE || id == ITEM_DIAMOND_PICKAXE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if player has wooden or better pickaxe
+bool hasWoodenPickaxeOrBetter(uint base_offset) {
+    return hasAnyPickaxe(base_offset);
+}
+
+// Check if player has stone or better pickaxe (can mine iron)
+bool hasStonePickaxeOrBetter(uint base_offset) {
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        uint id = readItemId(base_offset, i);
+        if (id == ITEM_STONE_PICKAXE || id == ITEM_IRON_PICKAXE ||
+            id == ITEM_DIAMOND_PICKAXE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if player has iron or better pickaxe (can mine diamond/obsidian)
+bool hasIronPickaxeOrBetter(uint base_offset) {
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        uint id = readItemId(base_offset, i);
+        if (id == ITEM_IRON_PICKAXE || id == ITEM_DIAMOND_PICKAXE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Find first empty slot in main inventory + hotbar
+int findEmptySlot(uint base_offset) {
+    // Try hotbar first (more accessible)
+    for (uint i = HOTBAR_START; i <= HOTBAR_END; i++) {
+        if (readItemId(base_offset, i) == 0) {
+            return int(i);
+        }
+    }
+    // Then main inventory
+    for (uint i = MAIN_INV_START; i <= MAIN_INV_END; i++) {
+        if (readItemId(base_offset, i) == 0) {
+            return int(i);
+        }
+    }
+    return -1;  // No empty slot
+}
+
+// Find slot containing item_id (returns first found or -1)
+int findItemSlot(uint base_offset, uint item_id) {
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        if (readItemId(base_offset, i) == item_id) {
+            return int(i);
+        }
+    }
+    return -1;
+}
+
+// ============================================================================
+// CRAFTING OPERATIONS (direct inventory manipulation)
+// ============================================================================
+
+// Consume items from inventory, returns true if successful
+bool consumeItems(uint base_offset, uint item_id, uint count) {
+    uint remaining = count;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == item_id) {
+            uint available = readCount(base_offset, i);
+            uint to_take = min(available, remaining);
+            if (available <= to_take) {
+                clearSlot(base_offset, i);
+            } else {
+                writeCount(base_offset, i, available - to_take);
+            }
+            remaining -= to_take;
+        }
+    }
+    return remaining == 0;
+}
+
+// Add items to inventory, returns count actually added
+uint addItems(uint base_offset, uint item_id, uint count) {
+    uint remaining = count;
+
+    // First try to stack with existing
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == item_id) {
+            uint current = readCount(base_offset, i);
+            uint space = 64 - current;  // Max stack
+            uint to_add = min(space, remaining);
+            if (to_add > 0) {
+                writeCount(base_offset, i, current + to_add);
+                remaining -= to_add;
+            }
+        }
+    }
+
+    // Then fill empty slots
+    for (uint i = HOTBAR_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == 0) {
+            uint to_add = min(64u, remaining);
+            writeItemId(base_offset, i, item_id);
+            writeCount(base_offset, i, to_add);
+            writeDamage(base_offset, i, 0);
+            remaining -= to_add;
+        }
+    }
+    for (uint i = MAIN_INV_START; i <= MAIN_INV_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == 0) {
+            uint to_add = min(64u, remaining);
+            writeItemId(base_offset, i, item_id);
+            writeCount(base_offset, i, to_add);
+            writeDamage(base_offset, i, 0);
+            remaining -= to_add;
+        }
+    }
+
+    return count - remaining;
+}
+
+// ============================================================================
+// QUICK CRAFT RECIPES (direct implementation for speed)
+// ============================================================================
+
+// Eye of Ender: 1 blaze powder + 1 ender pearl = 1 eye
+bool craftEyeOfEnder(uint base_offset) {
+    if (!hasItems(base_offset, ITEM_BLAZE_POWDER, 1) ||
+        !hasItems(base_offset, ITEM_ENDER_PEARL, 1)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_BLAZE_POWDER, 1);
+    consumeItems(base_offset, ITEM_ENDER_PEARL, 1);
+    addItems(base_offset, ITEM_EYE_OF_ENDER, 1);
+    return true;
+}
+
+// Blaze powder: 1 blaze rod = 2 blaze powder (shapeless)
+bool craftBlazePowder(uint base_offset) {
+    if (!hasItems(base_offset, ITEM_BLAZE_ROD, 1)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_BLAZE_ROD, 1);
+    addItems(base_offset, ITEM_BLAZE_POWDER, 2);
+    return true;
+}
+
+// Iron pickaxe: 3 iron + 2 sticks (requires crafting table)
+bool craftIronPickaxe(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (!hasItems(base_offset, ITEM_IRON_INGOT, 3) ||
+        !hasItems(base_offset, ITEM_STICK, 2)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_IRON_INGOT, 3);
+    consumeItems(base_offset, ITEM_STICK, 2);
+    addItems(base_offset, ITEM_IRON_PICKAXE, 1);
+    return true;
+}
+
+// Stone pickaxe: 3 cobblestone + 2 sticks (requires crafting table)
+bool craftStonePickaxe(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (!hasItems(base_offset, ITEM_COBBLESTONE, 3) ||
+        !hasItems(base_offset, ITEM_STICK, 2)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_COBBLESTONE, 3);
+    consumeItems(base_offset, ITEM_STICK, 2);
+    addItems(base_offset, ITEM_STONE_PICKAXE, 1);
+    return true;
+}
+
+// Wooden pickaxe: 3 planks + 2 sticks (requires crafting table)
+bool craftWoodenPickaxe(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (countPlanks(base_offset) < 3 ||
+        !hasItems(base_offset, ITEM_STICK, 2)) {
+        return false;
+    }
+
+    // Consume any planks
+    uint remaining = 3;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == ITEM_PLANKS) {
+            uint available = readCount(base_offset, i);
+            uint to_take = min(available, remaining);
+            if (available <= to_take) {
+                clearSlot(base_offset, i);
+            } else {
+                writeCount(base_offset, i, available - to_take);
+            }
+            remaining -= to_take;
+        }
+    }
+
+    consumeItems(base_offset, ITEM_STICK, 2);
+    addItems(base_offset, ITEM_WOODEN_PICKAXE, 1);
+    return true;
+}
+
+// Crafting table: 4 planks (2x2 in player grid)
+bool craftCraftingTable(uint base_offset) {
+    if (countPlanks(base_offset) < 4) {
+        return false;
+    }
+
+    uint remaining = 4;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == ITEM_PLANKS) {
+            uint available = readCount(base_offset, i);
+            uint to_take = min(available, remaining);
+            if (available <= to_take) {
+                clearSlot(base_offset, i);
+            } else {
+                writeCount(base_offset, i, available - to_take);
+            }
+            remaining -= to_take;
+        }
+    }
+
+    addItems(base_offset, ITEM_CRAFTING_TABLE, 1);
+    return true;
+}
+
+// Planks: 1 log = 4 planks (shapeless, 2x2 grid OK)
+bool craftPlanks(uint base_offset) {
+    int slot = -1;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END; i++) {
+        uint id = readItemId(base_offset, i);
+        if (id == 17 || id == 162) {  // Any log type
+            slot = int(i);
+            break;
+        }
+    }
+
+    if (slot < 0) return false;
+
+    uint count = readCount(base_offset, uint(slot));
+    if (count <= 1) {
+        clearSlot(base_offset, uint(slot));
+    } else {
+        writeCount(base_offset, uint(slot), count - 1);
+    }
+
+    addItems(base_offset, ITEM_PLANKS, 4);
+    return true;
+}
+
+// Sticks: 2 planks = 4 sticks (2x1 vertical)
+bool craftSticks(uint base_offset) {
+    if (countPlanks(base_offset) < 2) {
+        return false;
+    }
+
+    uint remaining = 2;
+    for (uint i = MAIN_INV_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base_offset, i) == ITEM_PLANKS) {
+            uint available = readCount(base_offset, i);
+            uint to_take = min(available, remaining);
+            if (available <= to_take) {
+                clearSlot(base_offset, i);
+            } else {
+                writeCount(base_offset, i, available - to_take);
+            }
+            remaining -= to_take;
+        }
+    }
+
+    addItems(base_offset, ITEM_STICK, 4);
+    return true;
+}
+
+// Furnace: 8 cobblestone (requires crafting table)
+bool craftFurnace(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (!hasItems(base_offset, ITEM_COBBLESTONE, 8)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_COBBLESTONE, 8);
+    addItems(base_offset, ITEM_FURNACE, 1);
+    return true;
+}
+
+// Bucket: 3 iron (requires crafting table)
+bool craftBucket(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (!hasItems(base_offset, ITEM_IRON_INGOT, 3)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_IRON_INGOT, 3);
+    addItems(base_offset, ITEM_BUCKET, 1);
+    return true;
+}
+
+// Iron sword: 2 iron + 1 stick (requires crafting table)
+bool craftIronSword(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (!hasItems(base_offset, ITEM_IRON_INGOT, 2) ||
+        !hasItems(base_offset, ITEM_STICK, 1)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_IRON_INGOT, 2);
+    consumeItems(base_offset, ITEM_STICK, 1);
+    addItems(base_offset, ITEM_IRON_SWORD, 1);
+    return true;
+}
+
+// Diamond pickaxe: 3 diamond + 2 sticks (requires crafting table)
+bool craftDiamondPickaxe(uint base_offset, bool has_table) {
+    if (!has_table) return false;
+    if (!hasItems(base_offset, ITEM_DIAMOND, 3) ||
+        !hasItems(base_offset, ITEM_STICK, 2)) {
+        return false;
+    }
+
+    consumeItems(base_offset, ITEM_DIAMOND, 3);
+    consumeItems(base_offset, ITEM_STICK, 2);
+    addItems(base_offset, ITEM_DIAMOND_PICKAXE, 1);
+    return true;
+}
+
+// ============================================================================
+// CONTEXT-SENSITIVE PRIORITY LOGIC
+// ============================================================================
+
+// Main quick craft function - returns crafted item ID (0 = nothing crafted)
+uint quickCraft(uint base_offset, bool has_crafting_table_nearby) {
+    // Access to crafting table = has one in inventory OR one placed nearby
+    bool has_table = hasCraftingTable(base_offset) || has_crafting_table_nearby;
+
+    // P1: Eyes of Ender - highest priority for End goal
+    // Craft if have both ingredients
+    if (hasItems(base_offset, ITEM_BLAZE_POWDER, 1) &&
+        hasItems(base_offset, ITEM_ENDER_PEARL, 1)) {
+        if (craftEyeOfEnder(base_offset)) return ITEM_EYE_OF_ENDER;
+    }
+
+    // P2: Blaze powder - need it for eyes
+    // Craft if have blaze rods and need more powder
+    if (hasItems(base_offset, ITEM_BLAZE_ROD, 1)) {
+        // Only craft if we have pearls waiting or don't have enough powder
+        uint pearls = countItem(base_offset, ITEM_ENDER_PEARL);
+        uint powder = countItem(base_offset, ITEM_BLAZE_POWDER);
+        if (pearls > powder) {  // Have pearls waiting for powder
+            if (craftBlazePowder(base_offset)) return ITEM_BLAZE_POWDER;
+        }
+    }
+
+    // P3: Diamond pickaxe - best mining tool, needed for obsidian efficiency
+    if (has_table && hasItems(base_offset, ITEM_DIAMOND, 3) &&
+        hasItems(base_offset, ITEM_STICK, 2)) {
+        if (craftDiamondPickaxe(base_offset, has_table)) return ITEM_DIAMOND_PICKAXE;
+    }
+
+    // P4: Iron pickaxe - can mine diamond and obsidian
+    // Craft if have iron but no iron+ pickaxe
+    if (!hasIronPickaxeOrBetter(base_offset) &&
+        hasItems(base_offset, ITEM_IRON_INGOT, 3) &&
+        hasItems(base_offset, ITEM_STICK, 2)) {
+        if (craftIronPickaxe(base_offset, has_table)) return ITEM_IRON_PICKAXE;
+    }
+
+    // P5: Stone pickaxe - can mine iron
+    // Craft if have cobblestone but no stone+ pickaxe
+    if (!hasStonePickaxeOrBetter(base_offset) &&
+        hasItems(base_offset, ITEM_COBBLESTONE, 3) &&
+        hasItems(base_offset, ITEM_STICK, 2)) {
+        if (craftStonePickaxe(base_offset, has_table)) return ITEM_STONE_PICKAXE;
+    }
+
+    // P6: Wooden pickaxe - first pickaxe, can mine stone
+    // Craft if have no pickaxe at all
+    if (!hasAnyPickaxe(base_offset) &&
+        countPlanks(base_offset) >= 3 &&
+        hasItems(base_offset, ITEM_STICK, 2)) {
+        if (craftWoodenPickaxe(base_offset, has_table)) return ITEM_WOODEN_PICKAXE;
+    }
+
+    // P7: Crafting table - enables 3x3 recipes
+    // Craft if don't have one and have planks
+    if (!hasCraftingTable(base_offset) && countPlanks(base_offset) >= 4) {
+        if (craftCraftingTable(base_offset)) return ITEM_CRAFTING_TABLE;
+    }
+
+    // P8: Planks - basic building block
+    // Craft if have logs and need planks for other recipes
+    if (countLogs(base_offset) > 0) {
+        uint planks = countPlanks(base_offset);
+        uint sticks = countItem(base_offset, ITEM_STICK);
+
+        // Need planks for: table (4), sticks (2), pickaxe (3)
+        bool need_planks = planks < 4 ||
+                           (sticks < 4 && planks < 6) ||
+                           (!hasAnyPickaxe(base_offset) && planks < 5);
+
+        if (need_planks) {
+            if (craftPlanks(base_offset)) return ITEM_PLANKS;
+        }
+    }
+
+    // P9: Sticks - needed for tools
+    // Craft if have planks but low on sticks
+    if (countPlanks(base_offset) >= 2) {
+        uint sticks = countItem(base_offset, ITEM_STICK);
+        bool need_sticks = (sticks < 2) ||
+                           (sticks < 4 && !hasAnyPickaxe(base_offset));
+
+        if (need_sticks) {
+            if (craftSticks(base_offset)) return ITEM_STICK;
+        }
+    }
+
+    // P10: Furnace - needed for smelting iron
+    // Craft if have cobblestone and iron ore (not implemented - would need ore tracking)
+    if (!hasItems(base_offset, ITEM_FURNACE, 1) &&
+        hasItems(base_offset, ITEM_COBBLESTONE, 8)) {
+        // Only craft if we're past early game (have stone pickaxe)
+        if (hasStonePickaxeOrBetter(base_offset)) {
+            if (craftFurnace(base_offset, has_table)) return ITEM_FURNACE;
+        }
+    }
+
+    // P11: Bucket - useful for lava/water
+    // Craft if have iron and already have iron pickaxe
+    if (!hasItems(base_offset, ITEM_BUCKET, 1) &&
+        hasItems(base_offset, ITEM_IRON_INGOT, 3) &&
+        hasIronPickaxeOrBetter(base_offset)) {
+        if (craftBucket(base_offset, has_table)) return ITEM_BUCKET;
+    }
+
+    // P12: Iron sword - combat upgrade
+    if (!hasItems(base_offset, ITEM_IRON_SWORD, 1) &&
+        hasItems(base_offset, ITEM_IRON_INGOT, 2) &&
+        hasItems(base_offset, ITEM_STICK, 1) &&
+        hasIronPickaxeOrBetter(base_offset)) {  // Only after iron pick
+        if (craftIronSword(base_offset, has_table)) return ITEM_IRON_SWORD;
+    }
+
+    // Fallback: craft more blaze powder if we have rods
+    if (hasItems(base_offset, ITEM_BLAZE_ROD, 1)) {
+        if (craftBlazePowder(base_offset)) return ITEM_BLAZE_POWDER;
+    }
+
+    return 0;  // Nothing to craft
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+void main() {
+    uint req_idx = gl_GlobalInvocationID.x;
+
+    if (req_idx >= push.num_requests) return;
+
+    // Request format: [agent_id, flags]
+    uint base = req_idx * 2;
+    uint agent_id = craft_requests.requests[base];
+    uint flags = craft_requests.requests[base + 1];
+
+    if (agent_id >= push.num_agents) {
+        // Invalid agent
+        craft_results.results[req_idx * 4] = 0;
+        craft_results.results[req_idx * 4 + 1] = 0;
+        craft_results.results[req_idx * 4 + 2] = 0;
+        craft_results.results[req_idx * 4 + 3] = 0;
+        return;
+    }
+
+    uint inv_offset = getInventoryOffset(agent_id);
+    bool has_table_nearby = (flags & 1u) != 0u;
+
+    uint crafted_item = quickCraft(inv_offset, has_table_nearby);
+
+    // Result format: [crafted_item_id, success, reserved, reserved]
+    craft_results.results[req_idx * 4] = crafted_item;
+    craft_results.results[req_idx * 4 + 1] = (crafted_item != 0) ? 1u : 0u;
+    craft_results.results[req_idx * 4 + 2] = 0;
+    craft_results.results[req_idx * 4 + 3] = 0;
+}

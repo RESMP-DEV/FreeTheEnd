@@ -1,0 +1,665 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_atomic_float : enable
+
+/*
+ * Optimized Dragon Fight Compute Shader
+ * Target: < 50us per step for 64 environments
+ *
+ * Key optimizations:
+ * 1. Single dispatch with fused stages (physics + AI + combat + obs)
+ * 2. Shared memory caching for player/dragon state
+ * 3. FP16 for storage, FP32 for compute (avoids precision issues)
+ * 4. Coalesced memory access patterns
+ * 5. Minimal divergence in combat logic
+ * 6. Precomputed pillar positions
+ */
+
+#include "memory_layout.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants for tick parameters
+layout(push_constant) uniform PushConstants {
+    uint tick;
+    uint random_seed;
+} pc;
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const float DRAGON_MAX_HEALTH = 200.0;
+const float DRAGON_MELEE_DAMAGE = 10.0;
+const float DRAGON_CHARGE_DAMAGE = 5.0;
+const float DRAGON_BREATH_DAMAGE = 6.0;
+const float DRAGON_CIRCLE_RADIUS = 75.0;
+const float DRAGON_SPEED = 1.5;
+
+const float SWORD_DAMAGE = 7.0;
+const float HAND_DAMAGE = 1.0;
+const float CRIT_MULTIPLIER = 1.5;
+const float KNOCKBACK_BASE = 0.4;
+const uint INVINCIBILITY_TICKS = 10;
+
+const uint DRAGON_CIRCLING = 0;
+const uint DRAGON_CHARGING = 2;
+const uint DRAGON_LANDING = 3;
+const uint DRAGON_PERCHING = 4;
+const uint DRAGON_TAKING_OFF = 5;
+const uint DRAGON_DEAD = 6;
+
+// =============================================================================
+// LOCAL STATE (registers, fast access)
+// =============================================================================
+
+// Player state (loaded from shared/global, modified, written back)
+vec3 l_player_pos;
+vec3 l_player_vel;
+float l_player_yaw;
+float l_player_pitch;
+float l_player_health;
+float l_player_hunger;
+uint l_player_flags;
+uint l_player_invincibility;
+uint l_player_attack_cd;
+uint l_player_weapon;
+uint l_player_arrows;
+float l_player_arrow_charge;
+
+// Dragon state
+vec3 l_dragon_pos;
+vec3 l_dragon_vel;
+float l_dragon_yaw;
+float l_dragon_pitch;
+float l_dragon_health;
+uint l_dragon_phase;
+uint l_dragon_phase_timer;
+uint l_dragon_perch_timer;
+float l_dragon_breath_timer;
+uint l_dragon_attack_cd;
+float l_dragon_circle_angle;
+vec3 l_dragon_target;
+
+// Input state
+vec3 l_input_movement;
+float l_look_delta_x;
+float l_look_delta_y;
+uint l_action;
+uint l_action_flags;
+
+// Environment
+uint l_crystals_mask;
+uint l_crystals_destroyed;
+
+// Random state
+uint l_random_seed;
+
+// =============================================================================
+// RANDOM NUMBER GENERATION
+// =============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand() {
+    l_random_seed = hash(l_random_seed);
+    return float(l_random_seed) / 4294967295.0;
+}
+
+// =============================================================================
+// LOAD/STORE FUNCTIONS
+// =============================================================================
+
+void load_all_state(uint env_id, uint local_id) {
+    // Initialize random
+    l_random_seed = hash(pc.random_seed ^ env_id ^ pc.tick);
+
+    // Load player position from unified buffer
+    uint pp_offset = player_position_offset(env_id, num_envs) / 4;
+    uvec4 pp_raw = uvec4(data[pp_offset], data[pp_offset+1], data[pp_offset+2], data[pp_offset+3]);
+    f16vec4 pp_xy = unpackHalf4x16(pp_raw.xy);
+    f16vec4 pp_z = unpackHalf4x16(pp_raw.zw);
+
+    l_player_pos = vec3(float(pp_xy.x), float(pp_xy.y), float(pp_z.x));
+    l_player_vel = vec3(float(pp_xy.z), float(pp_xy.w), float(pp_z.y));
+    l_player_yaw = float(pp_z.z);
+    l_player_pitch = float(pp_z.w);
+
+    // Load player state
+    uint ps_offset = player_state_offset(env_id, num_envs) / 4;
+    uvec4 ps_raw = uvec4(data[ps_offset], data[ps_offset+1], data[ps_offset+2], data[ps_offset+3]);
+    f16vec4 ps_health = unpackHalf4x16(ps_raw.xy);
+
+    l_player_health = float(ps_health.x);
+    l_player_hunger = float(ps_health.y);
+    // saturation, exhaustion in .z, .w (not used in fast path)
+
+    l_player_flags = ps_raw.z & 0xFFFFu;
+    uint timers = ps_raw.z >> 16;
+    l_player_invincibility = timers & 0xFFu;
+    l_player_attack_cd = (timers >> 8) & 0xFFu;
+
+    uint weapon_arrows = ps_raw.w & 0xFFFFu;
+    l_player_weapon = weapon_arrows & 0xFu;
+    l_player_arrows = (weapon_arrows >> 4) & 0xFFFu;
+    l_player_arrow_charge = float(unpackHalf2x16(ps_raw.w >> 16).x);
+
+    // Load dragon position
+    uint dp_offset = dragon_position_offset(env_id, num_envs) / 4;
+    uvec4 dp_raw = uvec4(data[dp_offset], data[dp_offset+1], data[dp_offset+2], data[dp_offset+3]);
+    f16vec4 dp_xy = unpackHalf4x16(dp_raw.xy);
+    f16vec4 dp_z = unpackHalf4x16(dp_raw.zw);
+
+    l_dragon_pos = vec3(float(dp_xy.x), float(dp_xy.y), float(dp_z.x));
+    l_dragon_vel = vec3(float(dp_xy.z), float(dp_xy.w), float(dp_z.y));
+    l_dragon_yaw = float(dp_z.z);
+    l_dragon_pitch = float(dp_z.w);
+
+    // Load dragon state
+    uint ds_offset = dragon_state_offset(env_id, num_envs) / 4;
+    uvec4 ds_raw0 = uvec4(data[ds_offset], data[ds_offset+1], data[ds_offset+2], data[ds_offset+3]);
+    uvec4 ds_raw1 = uvec4(data[ds_offset+4], data[ds_offset+5], data[ds_offset+6], data[ds_offset+7]);
+
+    l_dragon_health = float(unpackHalf2x16(ds_raw0.x).x);
+    uint phase_timer = ds_raw0.x >> 16;
+    l_dragon_phase = phase_timer & 0xFu;
+    l_dragon_phase_timer = (phase_timer >> 4) & 0xFFFu;
+
+    uint target_breath = ds_raw0.y & 0xFFFFu;
+    l_dragon_breath_timer = float(target_breath & 0xFFFu);
+
+    uint perch_attack = ds_raw0.y >> 16;
+    l_dragon_perch_timer = perch_attack & 0xFFFu;
+    l_dragon_attack_cd = (perch_attack >> 12) & 0xFu;
+
+    f16vec4 target_angle = unpackHalf4x16(ds_raw0.zw);
+    l_dragon_target = vec3(float(target_angle.x), float(target_angle.y), float(target_angle.z));
+    l_dragon_circle_angle = float(target_angle.w);
+
+    // Load crystal mask
+    uint cr_offset = crystal_offset(env_id, num_envs) / 4;
+    l_crystals_mask = data[cr_offset];
+    l_crystals_destroyed = bitCount(~l_crystals_mask & 0x3FFu);
+
+    // Load input
+    uint in_offset = input_offset(env_id, num_envs) / 4;
+    uvec4 in_raw = uvec4(data[in_offset], data[in_offset+1], data[in_offset+2], data[in_offset+3]);
+    f16vec4 in_move_look = unpackHalf4x16(in_raw.xy);
+
+    l_input_movement = vec3(float(in_move_look.x), float(in_move_look.y), float(in_move_look.z));
+    l_look_delta_x = float(in_move_look.w);
+    l_look_delta_y = float(unpackHalf2x16(in_raw.z).x);
+    l_action = in_raw.z >> 16;
+    l_action_flags = in_raw.w & 0xFFu;
+
+    // Cache in shared memory for cross-thread access
+    shared_player_pos_vel[local_id * 2] = pp_xy;
+    shared_player_pos_vel[local_id * 2 + 1] = pp_z;
+    shared_dragon_pos[local_id] = dp_xy;
+    shared_crystal_mask[local_id] = l_crystals_mask;
+
+    // Initialize reward/done
+    init_shared_reward_done(local_id);
+}
+
+void store_all_state(uint env_id, uint local_id) {
+    // Store player position
+    uint pp_offset = player_position_offset(env_id, num_envs) / 4;
+    f16vec4 pp_xy = f16vec4(float16_t(l_player_pos.x), float16_t(l_player_pos.y),
+                            float16_t(l_player_vel.x), float16_t(l_player_vel.y));
+    f16vec4 pp_z = f16vec4(float16_t(l_player_pos.z), float16_t(l_player_vel.z),
+                           float16_t(l_player_yaw), float16_t(l_player_pitch));
+    uvec2 packed_xy = packHalf4x16(pp_xy);
+    uvec2 packed_z = packHalf4x16(pp_z);
+    data[pp_offset] = packed_xy.x;
+    data[pp_offset+1] = packed_xy.y;
+    data[pp_offset+2] = packed_z.x;
+    data[pp_offset+3] = packed_z.y;
+
+    // Store player state
+    uint ps_offset = player_state_offset(env_id, num_envs) / 4;
+    f16vec4 ps_health = f16vec4(float16_t(l_player_health), float16_t(l_player_hunger),
+                                float16_t(0.0), float16_t(0.0));  // saturation, exhaustion
+    uvec2 packed_health = packHalf4x16(ps_health);
+    data[ps_offset] = packed_health.x;
+    data[ps_offset+1] = packed_health.y;
+
+    uint timers = (l_player_invincibility & 0xFFu) | ((l_player_attack_cd & 0xFFu) << 8);
+    data[ps_offset+2] = l_player_flags | (timers << 16);
+
+    uint weapon_arrows = (l_player_weapon & 0xFu) | ((l_player_arrows & 0xFFFu) << 4);
+    uint packed_arrow = packHalf2x16(vec2(l_player_arrow_charge, 0.0));
+    data[ps_offset+3] = weapon_arrows | (packed_arrow << 16);
+
+    // Store dragon position
+    uint dp_offset = dragon_position_offset(env_id, num_envs) / 4;
+    f16vec4 dp_xy = f16vec4(float16_t(l_dragon_pos.x), float16_t(l_dragon_pos.y),
+                            float16_t(l_dragon_vel.x), float16_t(l_dragon_vel.y));
+    f16vec4 dp_z = f16vec4(float16_t(l_dragon_pos.z), float16_t(l_dragon_vel.z),
+                           float16_t(l_dragon_yaw), float16_t(l_dragon_pitch));
+    uvec2 dp_packed_xy = packHalf4x16(dp_xy);
+    uvec2 dp_packed_z = packHalf4x16(dp_z);
+    data[dp_offset] = dp_packed_xy.x;
+    data[dp_offset+1] = dp_packed_xy.y;
+    data[dp_offset+2] = dp_packed_z.x;
+    data[dp_offset+3] = dp_packed_z.y;
+
+    // Store dragon state
+    uint ds_offset = dragon_state_offset(env_id, num_envs) / 4;
+    uint health_packed = packHalf2x16(vec2(l_dragon_health, 0.0));
+    uint phase_timer = (l_dragon_phase & 0xFu) | ((l_dragon_phase_timer & 0xFFFu) << 4);
+    data[ds_offset] = health_packed | (phase_timer << 16);
+
+    uint target_breath = uint(l_dragon_breath_timer) & 0xFFFu;
+    uint perch_attack = (l_dragon_perch_timer & 0xFFFu) | ((l_dragon_attack_cd & 0xFu) << 12);
+    data[ds_offset+1] = target_breath | (perch_attack << 16);
+
+    f16vec4 target_angle = f16vec4(float16_t(l_dragon_target.x), float16_t(l_dragon_target.y),
+                                   float16_t(l_dragon_target.z), float16_t(l_dragon_circle_angle));
+    uvec2 ta_packed = packHalf4x16(target_angle);
+    data[ds_offset+2] = ta_packed.x;
+    data[ds_offset+3] = ta_packed.y;
+
+    // Store crystal mask
+    uint cr_offset = crystal_offset(env_id, num_envs) / 4;
+    data[cr_offset] = l_crystals_mask;
+
+    // Flush rewards/dones
+    flush_reward_done(local_id, env_id);
+}
+
+// =============================================================================
+// PHYSICS (fused with input processing)
+// =============================================================================
+
+void process_physics(uint local_id) {
+    // Skip if dead
+    if ((l_player_flags & 8u) != 0u) return;
+
+    // Look update - deltas are already in degrees (5, 7.5, 45, 30 etc from action decoder)
+    l_player_yaw = mod(l_player_yaw + l_look_delta_x, 360.0);
+    l_player_pitch = clamp(l_player_pitch + l_look_delta_y, -90.0, 90.0);
+
+    // Movement vectors
+    float yaw_rad = radians(l_player_yaw);
+    vec3 forward = vec3(-sin(yaw_rad), 0.0, cos(yaw_rad));
+    vec3 right = vec3(cos(yaw_rad), 0.0, sin(yaw_rad));
+
+    vec3 move = forward * l_input_movement.z + right * l_input_movement.x;
+
+    // Speed modifiers
+    float speed = WALK_SPEED_FP16;
+    bool sprint = (l_action_flags & 2u) != 0u;
+    bool sneak = (l_action_flags & 4u) != 0u;
+    bool on_ground = (l_player_flags & 1u) != 0u;
+
+    if (sprint && !sneak) {
+        speed *= SPRINT_MULT_FP16;
+        l_player_flags |= 2u;
+    } else {
+        l_player_flags &= ~2u;
+    }
+
+    if (sneak) {
+        speed *= 0.3;
+        l_player_flags |= 4u;
+    } else {
+        l_player_flags &= ~4u;
+    }
+
+    // Apply movement
+    if (dot(move, move) > 0.000001) {
+        move = fast_normalize(move) * speed;
+        l_player_vel.x += move.x;
+        l_player_vel.z += move.z;
+    }
+
+    // Jump
+    bool jump = (l_action_flags & 1u) != 0u;
+    if (jump && on_ground) {
+        l_player_vel.y = JUMP_VEL_FP16;
+        l_player_flags &= ~1u;
+    }
+
+    // Gravity + drag
+    if (!on_ground) {
+        l_player_vel.y += GRAVITY_FP16;
+    }
+
+    float drag = on_ground ? DRAG_GROUND_FP16 : DRAG_AIR_FP16;
+    l_player_vel.x *= drag;
+    l_player_vel.z *= drag;
+    l_player_vel.y *= DRAG_AIR_FP16;
+
+    // Position update
+    l_player_pos += l_player_vel;
+
+    // Ground collision (simplified - flat at y=64)
+    if (l_player_pos.y < END_SPAWN_Y) {
+        l_player_pos.y = END_SPAWN_Y;
+        l_player_vel.y = 0.0;
+        l_player_flags |= 1u;
+    } else if (l_player_pos.y > END_SPAWN_Y + 0.1) {
+        l_player_flags &= ~1u;
+    }
+
+    // Void death
+    float dist_from_center = length(l_player_pos.xz);
+    if (l_player_pos.y <= -60.0 || (dist_from_center > END_ISLAND_RADIUS && l_player_pos.y < END_SPAWN_Y - 10.0)) {
+        l_player_health = 0.0;
+        l_player_flags |= 8u;
+        set_done(local_id);
+        add_reward(local_id, -50.0);
+    }
+
+    // Timers
+    if (l_player_invincibility > 0u) l_player_invincibility--;
+    if (l_player_attack_cd > 0u) l_player_attack_cd--;
+
+    // Bow charge
+    if (l_action == 2u && l_player_arrows > 0u && l_player_weapon == 2u) {
+        l_player_arrow_charge = min(l_player_arrow_charge + 0.05, 1.0);
+    }
+}
+
+// =============================================================================
+// DRAGON AI
+// =============================================================================
+
+void process_dragon_ai(uint local_id) {
+    if (l_dragon_health <= 0.0 || l_dragon_phase == DRAGON_DEAD) return;
+
+    vec3 to_player = l_player_pos - l_dragon_pos;
+    float player_dist = length(to_player);
+
+    l_dragon_phase_timer++;
+
+    switch (l_dragon_phase) {
+        case DRAGON_CIRCLING: {
+            l_dragon_circle_angle += 0.02;
+            l_dragon_target = vec3(
+                cos(l_dragon_circle_angle) * DRAGON_CIRCLE_RADIUS,
+                70.0 + sin(l_dragon_circle_angle * 2.0) * 15.0,
+                sin(l_dragon_circle_angle) * DRAGON_CIRCLE_RADIUS
+            );
+
+            if (player_dist < 40.0 && rand() < 0.02) {
+                l_dragon_phase = DRAGON_CHARGING;
+                l_dragon_phase_timer = 0u;
+                l_dragon_target = l_player_pos;
+            }
+
+            bool all_crystals_destroyed = (l_crystals_destroyed >= NUM_CRYSTALS);
+            bool random_perch = (l_dragon_phase_timer > 200u && rand() < 0.005);
+
+            if ((all_crystals_destroyed || random_perch) && rand() < 0.5) {
+                l_dragon_phase = DRAGON_LANDING;
+                l_dragon_phase_timer = 0u;
+                l_dragon_target = vec3(0.0, END_SPAWN_Y + 4.0, 0.0);
+            }
+            break;
+        }
+
+        case DRAGON_CHARGING: {
+            l_dragon_target = l_player_pos + vec3(0.0, 2.0, 0.0);
+            if (player_dist < 8.0 && l_dragon_attack_cd == 0u) {
+                l_dragon_attack_cd = 20u;
+            }
+            if (l_dragon_phase_timer > 60u || player_dist < 5.0) {
+                l_dragon_phase = DRAGON_CIRCLING;
+                l_dragon_phase_timer = 0u;
+            }
+            break;
+        }
+
+        case DRAGON_LANDING: {
+            l_dragon_target = vec3(0.0, END_SPAWN_Y + 4.0, 0.0);
+            if (fast_distance_sq(l_dragon_pos, l_dragon_target) < 9.0) {
+                l_dragon_phase = DRAGON_PERCHING;
+                l_dragon_phase_timer = 0u;
+                l_dragon_perch_timer = 200u;
+            }
+            break;
+        }
+
+        case DRAGON_PERCHING: {
+            l_dragon_target = vec3(0.0, END_SPAWN_Y + 4.0, 0.0);
+            l_dragon_breath_timer += 1.0;
+
+            l_dragon_perch_timer--;
+            if (l_dragon_perch_timer == 0u) {
+                l_dragon_phase = DRAGON_TAKING_OFF;
+                l_dragon_phase_timer = 0u;
+                l_dragon_breath_timer = 0.0;
+            }
+            break;
+        }
+
+        case DRAGON_TAKING_OFF: {
+            l_dragon_target = vec3(0.0, 90.0, 0.0);
+            if (l_dragon_pos.y > 80.0) {
+                l_dragon_phase = DRAGON_CIRCLING;
+                l_dragon_phase_timer = 0u;
+            }
+            break;
+        }
+    }
+
+    // Move toward target
+    vec3 to_target = l_dragon_target - l_dragon_pos;
+    float dist = length(to_target);
+    if (dist > 0.5) {
+        float speed = (l_dragon_phase == DRAGON_CHARGING) ? DRAGON_SPEED * 2.0 : DRAGON_SPEED;
+        l_dragon_vel = fast_normalize(to_target) * speed;
+        l_dragon_yaw = degrees(atan(to_target.x, to_target.z));
+        l_dragon_pitch = degrees(atan(-to_target.y, length(to_target.xz)));
+    } else {
+        l_dragon_vel = vec3(0.0);
+    }
+
+    l_dragon_pos += l_dragon_vel;
+    if (l_dragon_attack_cd > 0u) l_dragon_attack_cd--;
+}
+
+// =============================================================================
+// COMBAT
+// =============================================================================
+
+void process_combat(uint local_id) {
+    if ((l_player_flags & 8u) != 0u || l_dragon_health <= 0.0) return;
+
+    vec3 to_dragon = l_dragon_pos - l_player_pos;
+    float dragon_dist = length(to_dragon);
+
+    // Player attacks
+    if (l_action == 1u && l_player_attack_cd == 0u) {
+        l_player_attack_cd = 10u;
+
+        vec3 look_dir = vec3(
+            -sin(radians(l_player_yaw)) * cos(radians(l_player_pitch)),
+            -sin(radians(l_player_pitch)),
+            cos(radians(l_player_yaw)) * cos(radians(l_player_pitch))
+        );
+
+        float reach = (l_player_weapon == 1u) ? 4.5 : 3.5;
+        bool can_hit = dragon_dist <= reach && dot(fast_normalize(to_dragon), look_dir) > 0.5;
+        bool dragon_vulnerable = (l_dragon_phase == DRAGON_PERCHING);
+
+        if (can_hit) {
+            float damage = (l_player_weapon == 1u) ? SWORD_DAMAGE : HAND_DAMAGE;
+
+            // Critical hit
+            bool crit = l_player_vel.y < -0.1 && (l_player_flags & 1u) == 0u;
+            if (crit) {
+                damage *= CRIT_MULTIPLIER;
+                add_reward(local_id, 2.0);
+            }
+
+            if (dragon_vulnerable) {
+                l_dragon_health = max(0.0, l_dragon_health - damage);
+                add_reward(local_id, damage * 2.0);
+                l_dragon_vel += look_dir * 0.5;
+            } else {
+                add_reward(local_id, 0.1);
+            }
+        }
+
+        // Check crystal hit
+        for (uint i = 0u; i < NUM_CRYSTALS; i++) {
+            if ((l_crystals_mask & (1u << i)) == 0u) continue;
+
+            vec3 crystal_pos = PILLAR_POSITIONS[i];
+            vec3 to_crystal = crystal_pos - l_player_pos;
+            float crystal_dist = length(to_crystal);
+
+            if (crystal_dist <= reach && dot(fast_normalize(to_crystal), look_dir) > 0.3) {
+                l_crystals_mask &= ~(1u << i);
+                l_crystals_destroyed++;
+                add_reward(local_id, 10.0);
+                break;
+            }
+        }
+    }
+
+    // Dragon attacks player
+    vec3 to_player = l_player_pos - l_dragon_pos;
+    float player_dist = length(to_player);
+
+    // Charge damage
+    if (l_dragon_phase == DRAGON_CHARGING && player_dist < 6.0 &&
+        l_player_invincibility == 0u && l_dragon_attack_cd == 0u) {
+        l_player_health = max(0.0, l_player_health - DRAGON_CHARGE_DAMAGE);
+        l_player_invincibility = INVINCIBILITY_TICKS;
+        l_player_vel += fast_normalize(to_player) * KNOCKBACK_BASE * 10.0;
+        l_player_vel.y = max(l_player_vel.y, 0.4);
+        add_reward(local_id, -5.0);
+    }
+
+    // Breath damage
+    if (l_dragon_phase == DRAGON_PERCHING && l_dragon_breath_timer > 0.0) {
+        vec3 dragon_forward = vec3(-sin(radians(l_dragon_yaw)), 0.0, cos(radians(l_dragon_yaw)));
+        if (player_dist < 15.0 &&
+            dot(fast_normalize(to_player), dragon_forward) > 0.3 &&
+            l_player_invincibility == 0u) {
+            if (uint(l_dragon_breath_timer) % 10u == 0u) {
+                l_player_health = max(0.0, l_player_health - DRAGON_BREATH_DAMAGE);
+                l_player_invincibility = INVINCIBILITY_TICKS / 2u;
+                add_reward(local_id, -3.0);
+            }
+        }
+    }
+
+    // Melee
+    if (player_dist < 4.0 && l_player_invincibility == 0u && l_dragon_attack_cd == 0u) {
+        l_player_health = max(0.0, l_player_health - DRAGON_MELEE_DAMAGE);
+        l_player_invincibility = INVINCIBILITY_TICKS;
+        l_dragon_attack_cd = 20u;
+        l_player_vel += fast_normalize(to_player) * KNOCKBACK_BASE * 15.0;
+        l_player_vel.y = max(l_player_vel.y, 0.5);
+        add_reward(local_id, -8.0);
+    }
+
+    // Death checks
+    if (l_player_health <= 0.0) {
+        l_player_flags |= 8u;
+        set_done(local_id);
+        add_reward(local_id, -50.0);
+    }
+
+    if (l_dragon_health <= 0.0) {
+        l_dragon_phase = DRAGON_DEAD;
+        l_player_flags |= 16u;
+        set_done(local_id);
+        add_reward(local_id, 1000.0);
+    }
+}
+
+// =============================================================================
+// OBSERVATION EXTRACTION
+// =============================================================================
+
+void extract_observations(uint env_id, uint local_id) {
+    vec3 to_dragon = l_dragon_pos - l_player_pos;
+    float dragon_dist = length(to_dragon);
+    vec3 dragon_dir = dragon_dist > 0.1 ? to_dragon / dragon_dist : vec3(0.0);
+
+    // Find nearest crystal
+    float nearest_dist = 1000.0;
+    vec3 nearest_dir = vec3(0.0);
+    for (uint i = 0u; i < NUM_CRYSTALS; i++) {
+        if ((l_crystals_mask & (1u << i)) == 0u) continue;
+        vec3 to_crystal = PILLAR_POSITIONS[i] - l_player_pos;
+        float dist = length(to_crystal);
+        if (dist < nearest_dist) {
+            nearest_dist = dist;
+            nearest_dir = to_crystal / dist;
+        }
+    }
+
+    ObservationPacked obs;
+    pack_observation(
+        l_player_pos, l_player_vel, l_player_yaw, l_player_pitch,
+        l_player_health, l_player_hunger,
+        (l_player_flags & 1u) != 0u,
+        l_player_attack_cd == 0u,
+        l_player_weapon, l_player_arrows, l_player_arrow_charge,
+        l_dragon_pos, l_dragon_vel, l_dragon_health, l_dragon_phase,
+        dragon_dist, dragon_dir,
+        l_dragon_phase == DRAGON_PERCHING && dragon_dist < 5.0,
+        l_dragon_phase == DRAGON_CHARGING || l_dragon_phase == DRAGON_PERCHING,
+        NUM_CRYSTALS - l_crystals_destroyed, nearest_dist, nearest_dir,
+        l_dragon_health <= 0.0, length(l_player_pos.xz),
+        1.0 - float(pc.tick) / 24000.0,
+        DRAGON_MAX_HEALTH - l_dragon_health,
+        obs
+    );
+
+    store_observation(env_id, obs);
+
+    // Small time penalty
+    add_reward(local_id, -0.001);
+
+    // Proximity reward during perch
+    if (l_dragon_phase == DRAGON_PERCHING && dragon_dist < 15.0) {
+        add_reward(local_id, 0.01);
+    }
+}
+
+// =============================================================================
+// MAIN - Single Dispatch, All Stages Fused
+// =============================================================================
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint env_id = gl_GlobalInvocationID.x;
+
+    if (env_id >= num_envs) return;
+
+    // Load all state from global memory into registers + shared memory
+    load_all_state(env_id, local_id);
+
+    // Synchronize shared memory before cross-thread access
+    workgroup_sync();
+
+    // Fused processing: physics -> dragon AI -> combat -> observations
+    // All in registers, minimal memory traffic
+    process_physics(local_id);
+    process_dragon_ai(local_id);
+    process_combat(local_id);
+    extract_observations(env_id, local_id);
+
+    // Final sync before global write
+    workgroup_sync();
+
+    // Store all state back to global memory
+    store_all_state(env_id, local_id);
+}

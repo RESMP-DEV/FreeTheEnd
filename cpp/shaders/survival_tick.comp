@@ -1,0 +1,751 @@
+#version 450
+
+// =============================================================================
+// Survival Tick Shader - MoltenVK Compatible
+// Full overworld survival simulation with hostile mobs for Stage 1 training
+// All bindings in set 0 for Metal/MoltenVK compatibility
+// =============================================================================
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint stage;              // 0-5 for different simulation phases
+    uint num_envs;           // Number of parallel environments
+    uint tick;               // Current tick number
+    uint random_seed;        // Base random seed
+    uint game_stage;         // Curriculum stage (1=survival, 2=resource, etc.)
+    uint dimension;          // 0=overworld, 1=nether, 2=end
+    uint flags;              // Reserved flags
+    uint _pad;
+} pc;
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// Physics
+const float GRAVITY = -0.08;
+const float DRAG = 0.98;
+const float GROUND_DRAG = 0.6;
+const float WALK_SPEED = 0.1;
+const float SPRINT_MULTIPLIER = 1.3;
+const float JUMP_VELOCITY = 0.42;
+
+// Player flags
+const uint FLAG_ON_GROUND = 1u;
+const uint FLAG_SPRINTING = 2u;
+const uint FLAG_SNEAKING = 4u;
+
+// Mob constants
+const uint MAX_MOBS_PER_ENV = 32;
+const uint MOB_ZOMBIE = 0u;
+const uint MOB_SKELETON = 1u;
+const uint MOB_SPIDER = 2u;
+const uint MOB_CREEPER = 3u;
+
+// Mob AI states
+const uint AI_IDLE = 0u;
+const uint AI_WANDER = 1u;
+const uint AI_CHASE = 2u;
+const uint AI_ATTACK = 3u;
+
+// Combat
+const float ZOMBIE_DAMAGE = 3.0;
+const float SKELETON_DAMAGE = 3.0;
+const float SPIDER_DAMAGE = 2.0;
+const float CREEPER_DAMAGE = 24.0;
+const float MOB_ATTACK_RANGE = 2.0;
+const float MOB_AGGRO_RANGE = 16.0;
+const uint ATTACK_COOLDOWN_TICKS = 20;  // 1 second
+const uint HURT_IMMUNITY_TICKS = 10;    // 0.5 seconds
+
+// Spawning
+const float SPAWN_RADIUS_MIN = 16.0;
+const float SPAWN_RADIUS_MAX = 48.0;
+const uint MAX_HOSTILE_COUNT = 16;  // Per environment
+
+// Time (ticks in a day = 24000)
+const uint DAY_LENGTH = 24000u;
+const uint NIGHT_START = 13000u;
+const uint NIGHT_END = 23000u;
+
+// =============================================================================
+// STRUCTURES
+// =============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint dimension;
+    uint gamemode;
+    uint activeSlot;
+    uint flags;
+    ivec3 targetBlock;
+    uint targetBlockFace;
+    vec4 statusEffects[8];
+};
+
+struct InputState {
+    vec3 movement;
+    float lookDeltaX;
+    float lookDeltaY;
+    uint action;
+    uint actionData;
+    uint flags;
+};
+
+struct Mob {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float maxHealth;
+    uint mobType;
+    uint aiState;
+    uint targetEntity;
+    uint flags;
+    vec3 homePosition;
+    float aggroRange;
+    uint attackCooldown;
+    uint hurtTime;
+    uint stateTimer;
+    uint randomSeed;
+};
+
+struct GameState {
+    uint tickNumber;
+    uint gameFlags;
+    uint randomSeed;
+    float deltaTime;
+    uint dimension;
+    uint timeOfDay;
+    uint mobCount;
+    uint reserved;
+};
+
+// =============================================================================
+// BUFFER BINDINGS - All in set 0 for MoltenVK
+// =============================================================================
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) buffer InputBuffer {
+    InputState inputs[];
+};
+
+layout(set = 0, binding = 2) buffer MobBuffer {
+    // Layout: [mob_count_0, mob_count_1, ...] then [mobs for env 0...] [mobs for env 1...]
+    uint mob_counts[];
+} mob_data;
+
+layout(set = 0, binding = 3) buffer MobStateBuffer {
+    Mob mobs[];  // MAX_MOBS_PER_ENV * num_envs
+};
+
+layout(set = 0, binding = 4) buffer GameStateBuffer {
+    GameState game_states[];
+};
+
+layout(set = 0, binding = 5) buffer ObservationBuffer {
+    float observations[];  // 48 floats per env
+};
+
+layout(set = 0, binding = 6) buffer RewardBuffer {
+    float rewards[];
+};
+
+layout(set = 0, binding = 7) buffer DoneBuffer {
+    uint dones[];
+};
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+float rand_range(inout uint seed, float min_val, float max_val) {
+    return min_val + rand(seed) * (max_val - min_val);
+}
+
+bool is_night(uint time_of_day) {
+    return time_of_day >= NIGHT_START && time_of_day < NIGHT_END;
+}
+
+uint get_mob_index(uint env_id, uint mob_idx) {
+    return env_id * MAX_MOBS_PER_ENV + mob_idx;
+}
+
+// =============================================================================
+// STAGE 0: Setup / Initialization
+// =============================================================================
+
+void stage_setup(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    GameState gs = game_states[env_id];
+    gs.tickNumber = pc.tick;
+    gs.randomSeed = hash(pc.random_seed ^ env_id ^ pc.tick);
+    gs.timeOfDay = (gs.timeOfDay + 1u) % DAY_LENGTH;
+    
+    game_states[env_id] = gs;
+    rewards[env_id] = 0.0;
+}
+
+// =============================================================================
+// STAGE 1: Player Physics
+// =============================================================================
+
+void stage_player_physics(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    
+    // Look update
+    p.yaw += inp.lookDeltaX * 0.15;
+    p.pitch = clamp(p.pitch + inp.lookDeltaY * 0.15, -90.0, 90.0);
+    p.yaw = mod(p.yaw, 360.0);
+    if (p.yaw < 0.0) p.yaw += 360.0;
+    
+    // Movement direction
+    float yaw_rad = radians(p.yaw);
+    vec3 forward = vec3(-sin(yaw_rad), 0.0, cos(yaw_rad));
+    vec3 right = vec3(cos(yaw_rad), 0.0, sin(yaw_rad));
+    
+    vec3 move_dir = forward * inp.movement.z + right * inp.movement.x;
+    
+    float speed = WALK_SPEED;
+    bool sprinting = (inp.flags & FLAG_SPRINTING) != 0u;
+    bool on_ground = (p.flags & FLAG_ON_GROUND) != 0u;
+    
+    if (sprinting) {
+        speed *= SPRINT_MULTIPLIER;
+        p.flags |= FLAG_SPRINTING;
+    } else {
+        p.flags &= ~FLAG_SPRINTING;
+    }
+    
+    if (length(move_dir) > 0.001) {
+        move_dir = normalize(move_dir) * speed;
+        p.velocity.x += move_dir.x;
+        p.velocity.z += move_dir.z;
+    }
+    
+    // Jump
+    bool jump = (inp.flags & 1u) != 0u;
+    if (jump && on_ground) {
+        p.velocity.y = JUMP_VELOCITY;
+        p.flags &= ~FLAG_ON_GROUND;
+    }
+    
+    // Gravity
+    if (!on_ground) {
+        p.velocity.y += GRAVITY;
+    }
+    
+    // Drag
+    if (on_ground) {
+        p.velocity.x *= GROUND_DRAG;
+        p.velocity.z *= GROUND_DRAG;
+    } else {
+        p.velocity.x *= DRAG;
+        p.velocity.z *= DRAG;
+    }
+    p.velocity.y *= DRAG;
+    
+    // Position update
+    p.position += p.velocity;
+    
+    // Ground collision (y=64 in overworld)
+    float ground_y = 64.0;
+    if (p.position.y <= ground_y) {
+        p.position.y = ground_y;
+        p.velocity.y = 0.0;
+        p.flags |= FLAG_ON_GROUND;
+    }
+    
+    // Void death
+    if (p.position.y < -64.0) {
+        p.health = 0.0;
+        dones[env_id] = 1u;
+        rewards[env_id] -= 10.0;
+    }
+    
+    // Sprint exhaustion
+    if (sprinting && length(vec2(p.velocity.x, p.velocity.z)) > 0.01) {
+        p.exhaustion += 0.005;
+    }
+    
+    players[env_id] = p;
+}
+
+// =============================================================================
+// STAGE 2: Mob Spawning
+// =============================================================================
+
+void stage_mob_spawning(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    GameState gs = game_states[env_id];
+    Player p = players[env_id];
+    uint seed = gs.randomSeed;
+    
+    uint mob_count = mob_data.mob_counts[env_id];
+    
+    // Only spawn at night, with limits
+    if (!is_night(gs.timeOfDay) || mob_count >= MAX_HOSTILE_COUNT) {
+        game_states[env_id].randomSeed = seed;
+        return;
+    }
+    
+    // Spawn attempt every ~5 seconds (100 ticks)
+    if ((pc.tick + env_id * 17) % 100 != 0) {
+        return;
+    }
+    
+    // Random spawn position around player
+    float angle = rand(seed) * 6.28318;
+    float dist = rand_range(seed, SPAWN_RADIUS_MIN, SPAWN_RADIUS_MAX);
+    
+    vec3 spawn_pos = p.position;
+    spawn_pos.x += cos(angle) * dist;
+    spawn_pos.z += sin(angle) * dist;
+    spawn_pos.y = 64.0;  // Ground level
+    
+    // Select mob type
+    float roll = rand(seed);
+    uint mob_type;
+    if (roll < 0.4) {
+        mob_type = MOB_ZOMBIE;
+    } else if (roll < 0.7) {
+        mob_type = MOB_SKELETON;
+    } else if (roll < 0.9) {
+        mob_type = MOB_SPIDER;
+    } else {
+        mob_type = MOB_CREEPER;
+    }
+    
+    // Create mob
+    uint mob_idx = get_mob_index(env_id, mob_count);
+    Mob m;
+    m.position = spawn_pos;
+    m.yaw = rand(seed) * 360.0;
+    m.velocity = vec3(0.0);
+    m.pitch = 0.0;
+    m.mobType = mob_type;
+    m.aiState = AI_IDLE;
+    m.targetEntity = 0xFFFFFFFF;
+    m.flags = FLAG_ON_GROUND;
+    m.homePosition = spawn_pos;
+    m.aggroRange = MOB_AGGRO_RANGE;
+    m.attackCooldown = 0;
+    m.hurtTime = 0;
+    m.stateTimer = 0;
+    m.randomSeed = seed;
+    
+    // Set health based on type
+    if (mob_type == MOB_ZOMBIE) {
+        m.health = 20.0;
+        m.maxHealth = 20.0;
+    } else if (mob_type == MOB_SKELETON) {
+        m.health = 20.0;
+        m.maxHealth = 20.0;
+    } else if (mob_type == MOB_SPIDER) {
+        m.health = 16.0;
+        m.maxHealth = 16.0;
+    } else {
+        m.health = 20.0;
+        m.maxHealth = 20.0;
+    }
+    
+    mobs[mob_idx] = m;
+    mob_data.mob_counts[env_id] = mob_count + 1;
+    game_states[env_id].randomSeed = seed;
+}
+
+// =============================================================================
+// STAGE 3: Mob AI
+// =============================================================================
+
+void stage_mob_ai(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    uint mob_count = mob_data.mob_counts[env_id];
+    GameState gs = game_states[env_id];
+    
+    for (uint i = 0; i < mob_count && i < MAX_MOBS_PER_ENV; i++) {
+        uint mob_idx = get_mob_index(env_id, i);
+        Mob m = mobs[mob_idx];
+        
+        if (m.health <= 0.0) continue;
+        
+        uint seed = m.randomSeed;
+        
+        // Cooldown updates
+        if (m.attackCooldown > 0) m.attackCooldown--;
+        if (m.hurtTime > 0) m.hurtTime--;
+        
+        // Distance to player
+        vec3 to_player = p.position - m.position;
+        float dist = length(to_player);
+        
+        // AI state machine
+        if (dist < MOB_ATTACK_RANGE && m.attackCooldown == 0) {
+            m.aiState = AI_ATTACK;
+        } else if (dist < m.aggroRange) {
+            m.aiState = AI_CHASE;
+        } else if (m.aiState != AI_WANDER || m.stateTimer == 0) {
+            m.aiState = AI_WANDER;
+            m.stateTimer = 60 + uint(rand(seed) * 60.0);
+        }
+        
+        // Movement based on state
+        float move_speed = 0.06;
+        if (m.mobType == MOB_SPIDER) move_speed = 0.08;
+        
+        vec3 move_dir = vec3(0.0);
+        
+        if (m.aiState == AI_CHASE) {
+            if (dist > 0.1) {
+                move_dir = normalize(to_player);
+            }
+        } else if (m.aiState == AI_WANDER) {
+            float wander_angle = radians(m.yaw);
+            move_dir = vec3(-sin(wander_angle), 0.0, cos(wander_angle));
+            m.stateTimer--;
+            
+            // Random direction change
+            if (rand(seed) < 0.02) {
+                m.yaw += rand_range(seed, -45.0, 45.0);
+            }
+        }
+        
+        // Apply movement
+        m.velocity.x = move_dir.x * move_speed;
+        m.velocity.z = move_dir.z * move_speed;
+        
+        // Gravity
+        bool on_ground = (m.flags & FLAG_ON_GROUND) != 0u;
+        if (!on_ground) {
+            m.velocity.y += GRAVITY;
+        }
+        
+        // Jump over obstacles (simplified)
+        if (m.aiState == AI_CHASE && on_ground && rand(seed) < 0.05) {
+            m.velocity.y = 0.35;
+            m.flags &= ~FLAG_ON_GROUND;
+        }
+        
+        // Position update
+        m.position += m.velocity;
+        
+        // Ground collision
+        if (m.position.y <= 64.0) {
+            m.position.y = 64.0;
+            m.velocity.y = 0.0;
+            m.flags |= FLAG_ON_GROUND;
+        }
+        
+        // Face player when chasing
+        if (m.aiState == AI_CHASE || m.aiState == AI_ATTACK) {
+            m.yaw = degrees(atan(-to_player.x, to_player.z));
+        }
+        
+        m.randomSeed = seed;
+        mobs[mob_idx] = m;
+    }
+}
+
+// =============================================================================
+// STAGE 4: Combat Resolution
+// =============================================================================
+
+void stage_combat(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    uint mob_count = mob_data.mob_counts[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = gs.randomSeed;
+    
+    float total_mob_damage = 0.0;
+    
+    for (uint i = 0; i < mob_count && i < MAX_MOBS_PER_ENV; i++) {
+        uint mob_idx = get_mob_index(env_id, i);
+        Mob m = mobs[mob_idx];
+        
+        if (m.health <= 0.0) continue;
+        
+        vec3 to_player = p.position - m.position;
+        float dist = length(to_player);
+        
+        // Mob attacks player
+        if (m.aiState == AI_ATTACK && m.attackCooldown == 0 && dist < MOB_ATTACK_RANGE) {
+            float damage = 0.0;
+            
+            if (m.mobType == MOB_ZOMBIE) {
+                damage = ZOMBIE_DAMAGE;
+            } else if (m.mobType == MOB_SKELETON) {
+                damage = SKELETON_DAMAGE;
+            } else if (m.mobType == MOB_SPIDER) {
+                damage = SPIDER_DAMAGE;
+            } else if (m.mobType == MOB_CREEPER) {
+                // Creeper explodes (instant kill for simplicity)
+                damage = CREEPER_DAMAGE;
+                m.health = 0.0;  // Creeper dies
+            }
+            
+            total_mob_damage += damage;
+            m.attackCooldown = ATTACK_COOLDOWN_TICKS;
+        }
+        
+        // Player attacks mob
+        if (inp.action == 1u) {  // Attack action
+            vec3 look_dir;
+            float yaw_rad = radians(p.yaw);
+            float pitch_rad = radians(p.pitch);
+            look_dir.x = -sin(yaw_rad) * cos(pitch_rad);
+            look_dir.y = -sin(pitch_rad);
+            look_dir.z = cos(yaw_rad) * cos(pitch_rad);
+            
+            // Check if mob is in front of player
+            vec3 to_mob = m.position - p.position;
+            float mob_dist = length(to_mob);
+            
+            if (mob_dist < 4.0) {
+                vec3 to_mob_norm = normalize(to_mob);
+                float dot_product = dot(look_dir, to_mob_norm);
+                
+                if (dot_product > 0.5) {  // ~60 degree cone
+                    // Hit the mob
+                    float player_damage = 4.0;  // Fist damage
+                    m.health -= player_damage;
+                    m.hurtTime = HURT_IMMUNITY_TICKS;
+                    
+                    // Knockback
+                    vec3 knockback = to_mob_norm * 0.4;
+                    knockback.y = 0.2;
+                    m.velocity += knockback;
+                    
+                    // Reward for hitting mobs
+                    rewards[env_id] += 0.5;
+                    
+                    // Bonus for kill
+                    if (m.health <= 0.0) {
+                        rewards[env_id] += 2.0;
+                    }
+                }
+            }
+        }
+        
+        mobs[mob_idx] = m;
+    }
+    
+    // Apply mob damage to player
+    if (total_mob_damage > 0.0) {
+        p.health -= total_mob_damage;
+        rewards[env_id] -= total_mob_damage * 0.2;  // Penalty for taking damage
+        
+        // Knockback player away from nearest attacker
+        vec3 knockback = vec3(0.0);
+        float nearest_dist = 999.0;
+        for (uint i = 0; i < mob_count && i < MAX_MOBS_PER_ENV; i++) {
+            uint mob_idx = get_mob_index(env_id, i);
+            Mob m = mobs[mob_idx];
+            if (m.health <= 0.0) continue;
+            
+            float d = length(m.position - p.position);
+            if (d < nearest_dist && d < MOB_ATTACK_RANGE * 2.0) {
+                nearest_dist = d;
+                vec3 away = normalize(p.position - m.position);
+                knockback = away * 0.3;
+                knockback.y = 0.15;
+            }
+        }
+        p.velocity += knockback;
+    }
+    
+    // Check death
+    if (p.health <= 0.0) {
+        dones[env_id] = 1u;
+        rewards[env_id] -= 10.0;  // Death penalty
+    }
+    
+    players[env_id] = p;
+    game_states[env_id].randomSeed = seed;
+}
+
+// =============================================================================
+// STAGE 5: World Update and Observations
+// =============================================================================
+
+void stage_world_update(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    GameState gs = game_states[env_id];
+    uint mob_count = mob_data.mob_counts[env_id];
+    
+    // Hunger system
+    if (p.exhaustion >= 4.0) {
+        p.exhaustion -= 4.0;
+        if (p.saturation > 0.0) {
+            p.saturation = max(0.0, p.saturation - 1.0);
+        } else {
+            p.hunger = max(0.0, p.hunger - 1.0);
+        }
+    }
+    
+    // Health regen when full hunger
+    if (p.hunger >= 18.0 && p.health < 20.0) {
+        p.health = min(20.0, p.health + 0.05);
+        p.exhaustion += 0.1;
+    }
+    
+    // Starvation
+    if (p.hunger <= 0.0) {
+        p.health -= 0.1;
+        if (p.health <= 0.0) {
+            dones[env_id] = 1u;
+            rewards[env_id] -= 10.0;
+        }
+    }
+    
+    // Find nearest mob
+    float nearest_mob_dist = 100.0;
+    vec3 nearest_mob_dir = vec3(0.0, 0.0, 1.0);
+    float nearest_mob_health = 0.0;
+    uint nearby_mobs = 0;
+    
+    for (uint i = 0; i < mob_count && i < MAX_MOBS_PER_ENV; i++) {
+        uint mob_idx = get_mob_index(env_id, i);
+        Mob m = mobs[mob_idx];
+        if (m.health <= 0.0) continue;
+        
+        vec3 to_mob = m.position - p.position;
+        float d = length(to_mob);
+        
+        if (d < 32.0) nearby_mobs++;
+        
+        if (d < nearest_mob_dist) {
+            nearest_mob_dist = d;
+            nearest_mob_dir = normalize(to_mob);
+            nearest_mob_health = m.health / m.maxHealth;
+        }
+    }
+    
+    // Despawn mobs that are too far (>64 blocks)
+    uint valid_mobs = 0;
+    for (uint i = 0; i < mob_count && i < MAX_MOBS_PER_ENV; i++) {
+        uint src_idx = get_mob_index(env_id, i);
+        Mob m = mobs[src_idx];
+        
+        float d = length(m.position - p.position);
+        if (m.health > 0.0 && d < 64.0) {
+            // Keep this mob
+            uint dst_idx = get_mob_index(env_id, valid_mobs);
+            if (src_idx != dst_idx) {
+                mobs[dst_idx] = m;
+            }
+            valid_mobs++;
+        }
+    }
+    mob_data.mob_counts[env_id] = valid_mobs;
+    gs.mobCount = valid_mobs;
+    
+    // Build observation (48 floats)
+    uint obs_base = env_id * 48;
+    
+    // Position (normalized to [-128, 128] -> [0, 1])
+    observations[obs_base + 0] = (p.position.x + 128.0) / 256.0;
+    observations[obs_base + 1] = (p.position.y) / 256.0;
+    observations[obs_base + 2] = (p.position.z + 128.0) / 256.0;
+    
+    // Velocity (normalized)
+    observations[obs_base + 3] = clamp(p.velocity.x * 5.0 + 0.5, 0.0, 1.0);
+    observations[obs_base + 4] = clamp(p.velocity.y * 5.0 + 0.5, 0.0, 1.0);
+    observations[obs_base + 5] = clamp(p.velocity.z * 5.0 + 0.5, 0.0, 1.0);
+    
+    // Orientation
+    observations[obs_base + 6] = p.yaw / 360.0;
+    observations[obs_base + 7] = (p.pitch + 90.0) / 180.0;
+    
+    // Health/hunger
+    observations[obs_base + 8] = p.health / 20.0;
+    observations[obs_base + 9] = p.hunger / 20.0;
+    observations[obs_base + 10] = ((p.flags & FLAG_ON_GROUND) != 0u) ? 1.0 : 0.0;
+    observations[obs_base + 11] = 0.0;  // attack_ready placeholder
+    
+    // Combat info
+    observations[obs_base + 12] = clamp(nearest_mob_dist / 32.0, 0.0, 1.0);
+    observations[obs_base + 13] = nearest_mob_dir.x * 0.5 + 0.5;
+    observations[obs_base + 14] = nearest_mob_dir.z * 0.5 + 0.5;
+    observations[obs_base + 15] = nearest_mob_health;
+    
+    // Time/environment
+    observations[obs_base + 16] = float(gs.timeOfDay) / float(DAY_LENGTH);
+    observations[obs_base + 17] = is_night(gs.timeOfDay) ? 1.0 : 0.0;
+    observations[obs_base + 18] = float(nearby_mobs) / 16.0;
+    observations[obs_base + 19] = float(mob_count) / float(MAX_MOBS_PER_ENV);
+    
+    // Fill remaining with zeros
+    for (uint i = 20; i < 48; i++) {
+        observations[obs_base + i] = 0.0;
+    }
+    
+    // Survival rewards
+    // Small reward for staying alive
+    rewards[env_id] += 0.001;
+    
+    // Bonus for maintaining high health
+    if (p.health >= 15.0) {
+        rewards[env_id] += 0.002;
+    }
+    
+    // Small time penalty to encourage action
+    rewards[env_id] -= 0.0005;
+    
+    players[env_id] = p;
+    game_states[env_id] = gs;
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+    
+    switch (pc.stage) {
+        case 0u: stage_setup(env_id); break;
+        case 1u: stage_player_physics(env_id); break;
+        case 2u: stage_mob_spawning(env_id); break;
+        case 3u: stage_mob_ai(env_id); break;
+        case 4u: stage_combat(env_id); break;
+        case 5u: stage_world_update(env_id); break;
+    }
+}

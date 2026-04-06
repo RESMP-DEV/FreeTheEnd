@@ -1,0 +1,746 @@
+#version 450
+
+// =============================================================================
+// Survival Tick Shader V2 - MoltenVK Compatible
+// Full overworld survival simulation compatible with dragon_fight buffer layout
+// All bindings in set 0 for Metal/MoltenVK compatibility
+// =============================================================================
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants - MUST match dragon_fight_mvk.comp (16 bytes)
+layout(push_constant) uniform PushConstants {
+    uint stage;        // Simulation stage 0-5
+    uint num_envs;     // Parallel environments
+    uint tick;         // Current tick
+    uint random_seed;  // RNG seed
+} pc;
+
+// =============================================================================
+// CONSTANTS - Minecraft 1.8.9 accurate values
+// =============================================================================
+
+// Physics
+const float GRAVITY = -0.08;
+const float DRAG_AIR = 0.98;
+const float DRAG_GROUND = 0.6;
+const float WALK_SPEED = 0.1;
+const float SPRINT_MULT = 1.3;
+const float SNEAK_MULT = 0.3;
+const float JUMP_VEL = 0.42;
+const float PLAYER_WIDTH = 0.6;
+const float PLAYER_HEIGHT = 1.8;
+
+// Combat
+const float SWORD_DAMAGE = 7.0;
+const float HAND_DAMAGE = 1.0;
+const float KNOCKBACK_BASE = 0.4;
+const uint INVINCIBILITY_TICKS = 10;
+const uint PLAYER_ATTACK_COOLDOWN_TICKS = 10;
+const float CRIT_MULTIPLIER = 1.5;
+
+// Flags
+const uint FLAG_ON_GROUND = 1u;
+const uint FLAG_SPRINTING = 2u;
+const uint FLAG_SNEAKING = 4u;
+const uint FLAG_DEAD = 8u;
+
+// Mob types (stored in Crystal index pattern)
+const uint MOB_ZOMBIE = 0u;
+const uint MOB_SKELETON = 1u;
+const uint MOB_SPIDER = 2u;
+const uint MOB_CREEPER = 3u;
+const uint NUM_MOBS = 10;  // Matches NUM_CRYSTALS
+
+// Mob stats
+const float ZOMBIE_DAMAGE = 3.0;
+const float ZOMBIE_HEALTH = 20.0;
+const float SKELETON_DAMAGE = 3.0;
+const float SKELETON_HEALTH = 20.0;
+const float SPIDER_DAMAGE = 2.0;
+const float SPIDER_HEALTH = 16.0;
+const float CREEPER_DAMAGE = 24.0;
+const float CREEPER_HEALTH = 20.0;
+const float MOB_ATTACK_RANGE = 2.0;
+const float MOB_AGGRO_RANGE = 64.0;  // Must be >= SPAWN_RADIUS_MAX so mobs chase
+const float MOB_SPEED = 0.15;        // Faster to reach player in reasonable time
+
+// Spawning - spawn closer so combat happens
+const float SPAWN_RADIUS_MIN = 8.0;
+const float SPAWN_RADIUS_MAX = 24.0;
+const float GROUND_Y = 64.0;
+
+// Time - day/night cycle
+const uint DAY_LENGTH = 24000u;
+const uint NIGHT_START = 13000u;
+const uint NIGHT_END = 23000u;
+
+// =============================================================================
+// STRUCTURES - MUST match dragon_fight_mvk.comp / C++ exactly
+// =============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint invincibility_timer;
+    uint attack_cooldown;
+    uint weapon_slot;
+    float arrow_charge;
+    uint arrows;
+    uint beds;       // In survival: time_of_day low bits
+    uint bed_placed; // In survival: time_of_day high bits + mob_count
+};
+
+// Dragon struct repurposed for mob leader tracking
+struct MobLeader {
+    vec3 position;      // Nearest hostile position
+    float yaw;
+    vec3 velocity;      
+    float pitch;
+    float health;       // Sum of all mob health
+    uint phase;         // Mob count
+    uint phase_timer;   // Spawn timer
+    uint target_pillar; // Reserved
+    vec3 target_position;
+    float breath_timer;
+    uint perch_timer;   // Time of day
+    uint attack_cooldown;
+    uint flags;
+    float circle_angle;
+    uint reserved[3];
+};
+
+// Crystal struct repurposed for individual mob state
+struct Mob {
+    vec3 position;
+    float is_alive;  // > 0 = alive, stores health
+};
+
+struct InputState {
+    float movement_x;
+    float movement_y;
+    float movement_z;
+    float look_delta_x;
+    float look_delta_y;
+    uint action;
+    uint action_data;
+    uint flags;
+};
+
+struct GameState {
+    uint tick_number;
+    uint game_flags;
+    uint random_seed;
+    float delta_time;
+    uint crystals_destroyed;  // In survival: mobs killed
+    uint dragon_hits;         // In survival: player attacks
+    uint player_deaths;
+    float best_dragon_damage; // In survival: total damage dealt
+};
+
+// =============================================================================
+// BUFFER BINDINGS - Matches dragon_fight_mvk.comp exactly
+// =============================================================================
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 1) buffer InputBuffer {
+    InputState inputs[];
+};
+
+layout(set = 0, binding = 2) buffer MobLeaderBuffer {
+    MobLeader mob_leaders[];
+};
+
+layout(set = 0, binding = 3) buffer MobBuffer {
+    Mob mobs[];  // NUM_MOBS per environment
+};
+
+layout(set = 0, binding = 4) buffer GameStateBuffer {
+    GameState game_states[];
+};
+
+layout(set = 0, binding = 5) buffer ObservationBuffer {
+    float observations[];  // 48 floats per env
+};
+
+layout(set = 0, binding = 6) buffer RewardBuffer {
+    float rewards[];
+};
+
+layout(set = 0, binding = 7) buffer DoneBuffer {
+    uint dones[];
+};
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+float rand_range(inout uint seed, float min_val, float max_val) {
+    return min_val + rand(seed) * (max_val - min_val);
+}
+
+bool is_night(uint time_of_day) {
+    // Night: 13000-23000 (covers nighttime hours)
+    return time_of_day >= NIGHT_START && time_of_day < NIGHT_END;
+}
+
+uint get_mob_index(uint env_id, uint mob_idx) {
+    return env_id * NUM_MOBS + mob_idx;
+}
+
+uint get_mob_type(uint mob_idx) {
+    // Distribute mob types across the 10 slots
+    if (mob_idx < 4) return MOB_ZOMBIE;
+    if (mob_idx < 7) return MOB_SKELETON;
+    if (mob_idx < 9) return MOB_SPIDER;
+    return MOB_CREEPER;
+}
+
+float get_mob_damage(uint mob_type) {
+    if (mob_type == MOB_ZOMBIE) return ZOMBIE_DAMAGE;
+    if (mob_type == MOB_SKELETON) return SKELETON_DAMAGE;
+    if (mob_type == MOB_SPIDER) return SPIDER_DAMAGE;
+    return CREEPER_DAMAGE;
+}
+
+float get_mob_max_health(uint mob_type) {
+    if (mob_type == MOB_ZOMBIE) return ZOMBIE_HEALTH;
+    if (mob_type == MOB_SKELETON) return SKELETON_HEALTH;
+    if (mob_type == MOB_SPIDER) return SPIDER_HEALTH;
+    return CREEPER_HEALTH;
+}
+
+// =============================================================================
+// STAGE 0: Setup / Time Update
+// =============================================================================
+
+void stage_setup(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    GameState gs = game_states[env_id];
+    MobLeader ml = mob_leaders[env_id];
+    
+    gs.tick_number = pc.tick;
+    gs.random_seed = hash(pc.random_seed ^ env_id ^ pc.tick);
+    gs.delta_time = 0.05;  // 20 TPS
+    
+    // Update time of day - start at night so mobs spawn immediately
+    // Initialize to NIGHT_START if unset (0 means first tick)
+    if (ml.perch_timer == 0u && pc.tick == 0u) {
+        ml.perch_timer = NIGHT_START;
+    }
+    ml.perch_timer = (ml.perch_timer + 1u) % DAY_LENGTH;
+    
+    game_states[env_id] = gs;
+    mob_leaders[env_id] = ml;
+    rewards[env_id] = 0.0;
+}
+
+// =============================================================================
+// STAGE 1: Player Physics
+// =============================================================================
+
+void stage_player_physics(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    
+    // Check if dead
+    if ((p.flags & FLAG_DEAD) != 0u) return;
+    
+    // Update timers
+    if (p.invincibility_timer > 0u) p.invincibility_timer--;
+    if (p.attack_cooldown > 0u) p.attack_cooldown--;
+    
+    // Look update
+    p.yaw += inp.look_delta_x * 0.15;
+    p.pitch = clamp(p.pitch + inp.look_delta_y * 0.15, -90.0, 90.0);
+    p.yaw = mod(p.yaw, 360.0);
+    if (p.yaw < 0.0) p.yaw += 360.0;
+    
+    // Movement direction
+    float yaw_rad = radians(p.yaw);
+    vec3 forward = vec3(-sin(yaw_rad), 0.0, cos(yaw_rad));
+    vec3 right = vec3(cos(yaw_rad), 0.0, sin(yaw_rad));
+    
+    vec3 move_input = vec3(inp.movement_x, 0.0, inp.movement_z);
+    vec3 move_dir = forward * move_input.z + right * move_input.x;
+    
+    float speed = WALK_SPEED;
+    bool sprinting = (inp.flags & FLAG_SPRINTING) != 0u;
+    bool on_ground = (p.flags & FLAG_ON_GROUND) != 0u;
+    
+    if (sprinting && on_ground) {
+        speed *= SPRINT_MULT;
+        p.flags |= FLAG_SPRINTING;
+        // Exhaustion from sprinting
+        if (length(move_dir) > 0.01) {
+            p.exhaustion += 0.005;
+        }
+    } else {
+        p.flags &= ~FLAG_SPRINTING;
+    }
+    
+    if (length(move_dir) > 0.001) {
+        move_dir = normalize(move_dir) * speed;
+        p.velocity.x += move_dir.x;
+        p.velocity.z += move_dir.z;
+    }
+    
+    // Jump
+    bool jump = (inp.flags & 1u) != 0u;
+    if (jump && on_ground) {
+        p.velocity.y = JUMP_VEL;
+        p.flags &= ~FLAG_ON_GROUND;
+        p.exhaustion += 0.05;
+    }
+    
+    // Gravity
+    if (!on_ground) {
+        p.velocity.y += GRAVITY;
+    }
+    
+    // Drag
+    if (on_ground) {
+        p.velocity.x *= DRAG_GROUND;
+        p.velocity.z *= DRAG_GROUND;
+    } else {
+        p.velocity.x *= DRAG_AIR;
+        p.velocity.z *= DRAG_AIR;
+    }
+    p.velocity.y *= DRAG_AIR;
+    
+    // Position update
+    p.position += p.velocity;
+    
+    // Ground collision
+    if (p.position.y <= GROUND_Y) {
+        p.position.y = GROUND_Y;
+        p.velocity.y = 0.0;
+        p.flags |= FLAG_ON_GROUND;
+    }
+    
+    // Void death
+    if (p.position.y < -64.0) {
+        p.health = 0.0;
+        p.flags |= FLAG_DEAD;
+        dones[env_id] = 1u;
+        rewards[env_id] -= 10.0;
+    }
+    
+    // Hunger system
+    if (p.exhaustion >= 4.0) {
+        p.exhaustion -= 4.0;
+        if (p.saturation > 0.0) {
+            p.saturation = max(0.0, p.saturation - 1.0);
+        } else {
+            p.hunger = max(0.0, p.hunger - 1.0);
+        }
+    }
+    
+    // Natural regeneration
+    if (p.hunger >= 18.0 && p.health < 20.0) {
+        p.health = min(20.0, p.health + 0.01);
+        p.exhaustion += 0.03;
+    }
+    
+    // Starvation damage
+    if (p.hunger <= 0.0 && (pc.tick % 80u) == 0u) {
+        p.health -= 1.0;
+    }
+    
+    players[env_id] = p;
+}
+
+// =============================================================================
+// STAGE 2: Mob Spawning (night only)
+// =============================================================================
+
+void stage_mob_spawning(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    MobLeader ml = mob_leaders[env_id];
+    Player p = players[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = gs.random_seed;
+    
+    // Check if it's night
+    bool night = is_night(ml.perch_timer);
+    
+    // Count current mobs and find empty slot
+    uint mob_count = 0;
+    int empty_slot = -1;
+    
+    for (uint i = 0; i < NUM_MOBS; i++) {
+        uint idx = get_mob_index(env_id, i);
+        if (mobs[idx].is_alive > 0.0) {
+            mob_count++;
+        } else if (empty_slot < 0) {
+            empty_slot = int(i);
+        }
+    }
+    
+    ml.phase = mob_count;  // Store mob count
+    
+    // Spawn attempt every ~3 seconds at night
+    if (night && empty_slot >= 0 && (pc.tick + env_id * 13u) % 60u == 0u) {
+        if (rand(seed) < 0.3) {  // 30% spawn chance
+            // Random spawn position around player
+            float angle = rand(seed) * 6.28318;
+            float dist = rand_range(seed, SPAWN_RADIUS_MIN, SPAWN_RADIUS_MAX);
+            
+            uint idx = get_mob_index(env_id, uint(empty_slot));
+            Mob m;
+            m.position.x = p.position.x + cos(angle) * dist;
+            m.position.y = GROUND_Y;
+            m.position.z = p.position.z + sin(angle) * dist;
+            m.is_alive = get_mob_max_health(get_mob_type(uint(empty_slot)));
+            
+            mobs[idx] = m;
+            ml.phase++;
+        }
+    }
+    
+    // Despawn mobs during day (sunrise)
+    if (!night && mob_count > 0 && ml.perch_timer < 1000u) {
+        for (uint i = 0; i < NUM_MOBS; i++) {
+            uint idx = get_mob_index(env_id, i);
+            if (mobs[idx].is_alive > 0.0) {
+                // Mobs burn in sunlight
+                mobs[idx].is_alive -= 1.0;
+                if (mobs[idx].is_alive <= 0.0) {
+                    mobs[idx].is_alive = 0.0;
+                }
+            }
+        }
+    }
+    
+    gs.random_seed = seed;
+    game_states[env_id] = gs;
+    mob_leaders[env_id] = ml;
+}
+
+// =============================================================================
+// STAGE 3: Mob AI
+// =============================================================================
+
+void stage_mob_ai(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    MobLeader ml = mob_leaders[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = gs.random_seed;
+    
+    // Track nearest mob for observations
+    float nearest_dist = 999.0;
+    vec3 nearest_pos = p.position;
+    float total_health = 0.0;
+    
+    for (uint i = 0; i < NUM_MOBS; i++) {
+        uint idx = get_mob_index(env_id, i);
+        Mob m = mobs[idx];
+        
+        if (m.is_alive <= 0.0) continue;
+        
+        total_health += m.is_alive;
+        
+        vec3 to_player = p.position - m.position;
+        float dist = length(to_player);
+        
+        // Track nearest
+        if (dist < nearest_dist) {
+            nearest_dist = dist;
+            nearest_pos = m.position;
+        }
+        
+        // Simple chase AI
+        if (dist < MOB_AGGRO_RANGE && dist > 0.1) {
+            vec3 dir = normalize(to_player);
+            float speed = MOB_SPEED;
+            
+            // Spiders are faster
+            uint mob_type = get_mob_type(i);
+            if (mob_type == MOB_SPIDER) speed = 0.08;
+            
+            m.position.x += dir.x * speed;
+            m.position.z += dir.z * speed;
+            
+            // Random jitter
+            if (rand(seed) < 0.1) {
+                m.position.x += rand_range(seed, -0.1, 0.1);
+                m.position.z += rand_range(seed, -0.1, 0.1);
+            }
+        } else if (dist >= MOB_AGGRO_RANGE) {
+            // Wander
+            if (rand(seed) < 0.05) {
+                float wander_angle = rand(seed) * 6.28318;
+                m.position.x += cos(wander_angle) * 0.03;
+                m.position.z += sin(wander_angle) * 0.03;
+            }
+        }
+        
+        // Keep on ground
+        m.position.y = GROUND_Y;
+        
+        mobs[idx] = m;
+    }
+    
+    // Update mob leader with tracking info
+    ml.position = nearest_pos;
+    ml.health = total_health;
+    
+    gs.random_seed = seed;
+    game_states[env_id] = gs;
+    mob_leaders[env_id] = ml;
+}
+
+// =============================================================================
+// STAGE 4: Combat
+// =============================================================================
+
+void stage_combat(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    InputState inp = inputs[env_id];
+    GameState gs = game_states[env_id];
+    uint seed = gs.random_seed;
+    
+    if ((p.flags & FLAG_DEAD) != 0u) return;
+    
+    float total_damage_taken = 0.0;
+    float total_damage_dealt = 0.0;
+    uint mobs_killed = 0;
+    
+    for (uint i = 0; i < NUM_MOBS; i++) {
+        uint idx = get_mob_index(env_id, i);
+        Mob m = mobs[idx];
+        
+        if (m.is_alive <= 0.0) continue;
+        
+        vec3 to_player = p.position - m.position;
+        float dist = length(to_player);
+        uint mob_type = get_mob_type(i);
+        
+        // Mob attacks player
+        if (dist < MOB_ATTACK_RANGE && p.invincibility_timer == 0u) {
+            float damage = get_mob_damage(mob_type);
+            
+            // Creeper explosion
+            if (mob_type == MOB_CREEPER && dist < 1.5) {
+                damage = CREEPER_DAMAGE;
+                m.is_alive = 0.0;  // Creeper dies
+            } else if (mob_type != MOB_CREEPER) {
+                // Only deal damage every 20 ticks
+                if ((pc.tick + i * 7u) % 20u != 0u) {
+                    damage = 0.0;
+                }
+            }
+            
+            if (damage > 0.0) {
+                total_damage_taken += damage;
+                p.invincibility_timer = INVINCIBILITY_TICKS;
+                
+                // Knockback
+                if (dist > 0.1) {
+                    vec3 kb = normalize(to_player) * KNOCKBACK_BASE;
+                    kb.y = 0.2;
+                    p.velocity += kb;
+                }
+            }
+        }
+        
+        // Player attacks mob
+        if (inp.action == 1u && p.attack_cooldown == 0u) {
+            vec3 look_dir;
+            float yaw_rad = radians(p.yaw);
+            float pitch_rad = radians(p.pitch);
+            look_dir.x = -sin(yaw_rad) * cos(pitch_rad);
+            look_dir.y = -sin(pitch_rad);
+            look_dir.z = cos(yaw_rad) * cos(pitch_rad);
+            
+            vec3 to_mob = m.position - p.position;
+            float mob_dist = length(to_mob);
+            
+            if (mob_dist < 4.0 && mob_dist > 0.1) {
+                vec3 to_mob_norm = normalize(to_mob);
+                float dot_prod = dot(look_dir, to_mob_norm);
+                
+                if (dot_prod > 0.5) {  // In front
+                    float damage = (p.weapon_slot == 1u) ? SWORD_DAMAGE : HAND_DAMAGE;
+                    
+                    // Critical hit (falling)
+                    if (p.velocity.y < -0.1 && (p.flags & FLAG_ON_GROUND) == 0u) {
+                        damage *= CRIT_MULTIPLIER;
+                    }
+                    
+                    m.is_alive -= damage;
+                    total_damage_dealt += damage;
+                    gs.dragon_hits++;  // Track attacks
+                    
+                    // Knockback mob
+                    vec3 kb = to_mob_norm * 0.4;
+                    kb.y = 0.2;
+                    m.position += kb;
+                    
+                    // Rewards
+                    rewards[env_id] += 0.3;  // Hit reward
+                    
+                    if (m.is_alive <= 0.0) {
+                        m.is_alive = 0.0;
+                        mobs_killed++;
+                        gs.crystals_destroyed++;  // Track kills
+                        rewards[env_id] += 1.5;   // Kill reward
+                    }
+                    
+                    p.attack_cooldown = PLAYER_ATTACK_COOLDOWN_TICKS;
+                }
+            }
+        }
+        
+        mobs[idx] = m;
+    }
+    
+    // Apply damage to player
+    if (total_damage_taken > 0.0) {
+        p.health -= total_damage_taken;
+        rewards[env_id] -= total_damage_taken * 0.3;  // Damage penalty
+        
+        if (p.health <= 0.0) {
+            p.health = 0.0;
+            p.flags |= FLAG_DEAD;
+            dones[env_id] = 1u;
+            rewards[env_id] -= 10.0;  // Death penalty
+            gs.player_deaths++;
+        }
+    }
+    
+    gs.best_dragon_damage = max(gs.best_dragon_damage, total_damage_dealt);
+    gs.random_seed = seed;
+    
+    players[env_id] = p;
+    game_states[env_id] = gs;
+}
+
+// =============================================================================
+// STAGE 5: Observations and Rewards
+// =============================================================================
+
+void stage_observations(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+    
+    Player p = players[env_id];
+    MobLeader ml = mob_leaders[env_id];
+    GameState gs = game_states[env_id];
+    
+    uint obs_base = env_id * 48u;
+    
+    // Player state (0-15)
+    observations[obs_base + 0] = (p.position.x + 128.0) / 256.0;
+    observations[obs_base + 1] = p.position.y / 256.0;
+    observations[obs_base + 2] = (p.position.z + 128.0) / 256.0;
+    observations[obs_base + 3] = clamp(p.velocity.x * 5.0 + 0.5, 0.0, 1.0);
+    observations[obs_base + 4] = clamp(p.velocity.y * 5.0 + 0.5, 0.0, 1.0);
+    observations[obs_base + 5] = clamp(p.velocity.z * 5.0 + 0.5, 0.0, 1.0);
+    observations[obs_base + 6] = p.yaw / 360.0;
+    observations[obs_base + 7] = (p.pitch + 90.0) / 180.0;
+    observations[obs_base + 8] = p.health / 20.0;
+    observations[obs_base + 9] = p.hunger / 20.0;
+    observations[obs_base + 10] = ((p.flags & FLAG_ON_GROUND) != 0u) ? 1.0 : 0.0;
+    observations[obs_base + 11] = (p.attack_cooldown == 0u) ? 1.0 : 0.0;
+    observations[obs_base + 12] = float(p.weapon_slot) / 3.0;
+    observations[obs_base + 13] = float(p.arrows) / 64.0;
+    observations[obs_base + 14] = p.arrow_charge;
+    observations[obs_base + 15] = ((p.flags & FLAG_DEAD) != 0u) ? 1.0 : 0.0;
+    
+    // Nearest mob info (16-31) - replaces dragon info
+    vec3 to_nearest = ml.position - p.position;
+    float nearest_dist = length(to_nearest);
+    vec3 nearest_dir = (nearest_dist > 0.1) ? normalize(to_nearest) : vec3(0.0);
+    
+    observations[obs_base + 16] = clamp(ml.health / 100.0, 0.0, 1.0);  // Total mob health
+    observations[obs_base + 17] = clamp(nearest_dist / 64.0, 0.0, 1.0);
+    observations[obs_base + 18] = (ml.position.x + 128.0) / 256.0;
+    observations[obs_base + 19] = ml.position.y / 256.0;
+    observations[obs_base + 20] = (ml.position.z + 128.0) / 256.0;
+    observations[obs_base + 21] = nearest_dir.x * 0.5 + 0.5;
+    observations[obs_base + 22] = nearest_dir.y * 0.5 + 0.5;
+    observations[obs_base + 23] = nearest_dir.z * 0.5 + 0.5;
+    observations[obs_base + 24] = float(ml.phase) / float(NUM_MOBS);  // Mob count
+    observations[obs_base + 25] = is_night(ml.perch_timer) ? 1.0 : 0.0;
+    observations[obs_base + 26] = float(ml.perch_timer) / float(DAY_LENGTH);
+    observations[obs_base + 27] = 0.0;  // Reserved
+    observations[obs_base + 28] = 0.0;
+    observations[obs_base + 29] = 0.0;
+    observations[obs_base + 30] = 0.0;
+    observations[obs_base + 31] = 0.0;
+    
+    // Individual mob positions (32-47) - replaces crystal info
+    for (uint i = 0; i < 8; i++) {
+        uint idx = get_mob_index(env_id, i);
+        float alive = (i < NUM_MOBS && mobs[idx].is_alive > 0.0) ? 1.0 : 0.0;
+        float rel_x = 0.0;
+        float rel_z = 0.0;
+        
+        if (alive > 0.0) {
+            rel_x = (mobs[idx].position.x - p.position.x + 64.0) / 128.0;
+            rel_z = (mobs[idx].position.z - p.position.z + 64.0) / 128.0;
+        }
+        
+        if (i < 4) {
+            observations[obs_base + 32 + i * 2] = clamp(rel_x, 0.0, 1.0);
+            observations[obs_base + 33 + i * 2] = clamp(rel_z, 0.0, 1.0);
+        } else {
+            observations[obs_base + 40 + (i - 4) * 2] = clamp(rel_x, 0.0, 1.0);
+            observations[obs_base + 41 + (i - 4) * 2] = clamp(rel_z, 0.0, 1.0);
+        }
+    }
+    
+    // Survival bonus
+    if ((p.flags & FLAG_DEAD) == 0u) {
+        rewards[env_id] += 0.001;  // Small survival reward per tick
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+    
+    switch (pc.stage) {
+        case 0u: stage_setup(env_id); break;
+        case 1u: stage_player_physics(env_id); break;
+        case 2u: stage_mob_spawning(env_id); break;
+        case 3u: stage_mob_ai(env_id); break;
+        case 4u: stage_combat(env_id); break;
+        case 5u: stage_observations(env_id); break;
+    }
+}

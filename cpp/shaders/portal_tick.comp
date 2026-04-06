@@ -1,0 +1,292 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 Portal Tick Shader
+// Handles portal warmup timers and transition trigger detection
+//
+// Each invocation processes one agent, checking if they're in a portal block
+// and updating their warmup timer accordingly.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Portal constants (must match C++ portal_mechanics.h)
+const float PORTAL_WARMUP_SECONDS = 4.0;
+const float PORTAL_COOLDOWN_SECONDS = 1.0;  // Prevent immediate re-entry
+
+// Block IDs
+const uint BLOCK_AIR = 0;
+const uint BLOCK_NETHER_PORTAL = 90;
+const uint BLOCK_END_PORTAL = 119;
+
+// Dimension IDs
+const uint DIM_NETHER = 0;
+const uint DIM_OVERWORLD = 1;
+const uint DIM_END = 2;
+
+// Portal state flags
+const uint PORTAL_NONE = 0;
+const uint PORTAL_NETHER = 1;
+const uint PORTAL_END = 2;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint agentCount;      // Number of agents to process
+    float deltaTime;      // Time step in seconds
+    uint gameTimeTicks;   // Current game time in ticks
+    uint maxEvents;       // Max events to write
+} pc;
+
+// Portal state per agent
+// Layout: [inPortal(u8), portalAxis(u8), pad(u16), warmupTimer(f32), cooldownTimer(f32),
+//          lastPortalX(u32), lastPortalY(u32), lastPortalZ(u32), pad(u32)]
+layout(std430, set = 0, binding = 0) buffer PortalStateBuffer {
+    uvec4 portalState[];  // 32 bytes per agent (2 uvec4)
+};
+
+// Agent positions: vec4(x, y, z, yaw)
+layout(std430, set = 0, binding = 1) readonly buffer AgentPositions {
+    vec4 agentPos[];
+};
+
+// Agent dimensions: uvec4(dimension(u8), pad, pad, pad)
+layout(std430, set = 0, binding = 2) readonly buffer AgentDimensions {
+    uvec4 agentDim[];
+};
+
+// Dimension extents: ivec4(minX, minZ, maxX, maxZ), ivec4(height, strideX, strideZ, pad)
+layout(std430, set = 0, binding = 3) readonly buffer DimensionExtents {
+    ivec4 extentsOverworld[2];
+    ivec4 extentsNether[2];
+    ivec4 extentsEnd[2];
+};
+
+// Voxel data (uint16 block IDs, linearized as [Y][X][Z])
+layout(std430, set = 0, binding = 4) readonly buffer OverworldVoxels {
+    uint overworldBlocks[];  // packed as uint (2x uint16)
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer NetherVoxels {
+    uint netherBlocks[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer EndVoxels {
+    uint endBlocks[];
+};
+
+// Transition trigger output (agents ready to teleport)
+// Each uvec4 = (agentIdx, fromDim, toDim, portalType)
+layout(std430, set = 0, binding = 7) writeonly buffer TransitionTriggers {
+    uvec4 triggers[];
+};
+
+layout(std430, set = 0, binding = 8) buffer TriggerCount {
+    uint triggerCount;
+};
+
+// Read portal state for an agent
+void readPortalState(uint idx, out uint inPortal, out uint portalAxis,
+                     out float warmupTimer, out float cooldownTimer,
+                     out ivec3 lastPortalPos) {
+    uvec4 data0 = portalState[idx * 2];
+    uvec4 data1 = portalState[idx * 2 + 1];
+
+    inPortal = data0.x & 0xFFu;
+    portalAxis = (data0.x >> 8) & 0xFFu;
+    warmupTimer = uintBitsToFloat(data0.y);
+    cooldownTimer = uintBitsToFloat(data0.z);
+    lastPortalPos.x = int(data0.w);
+    lastPortalPos.y = int(data1.x);
+    lastPortalPos.z = int(data1.y);
+}
+
+// Write portal state for an agent
+void writePortalState(uint idx, uint inPortal, uint portalAxis,
+                      float warmupTimer, float cooldownTimer,
+                      ivec3 lastPortalPos) {
+    uvec4 data0, data1;
+    data0.x = (inPortal & 0xFFu) | ((portalAxis & 0xFFu) << 8);
+    data0.y = floatBitsToUint(warmupTimer);
+    data0.z = floatBitsToUint(cooldownTimer);
+    data0.w = uint(lastPortalPos.x);
+    data1.x = uint(lastPortalPos.y);
+    data1.y = uint(lastPortalPos.z);
+    data1.z = 0u;
+    data1.w = 0u;
+
+    portalState[idx * 2] = data0;
+    portalState[idx * 2 + 1] = data1;
+}
+
+// Sample block ID at world coordinates in a dimension
+uint sampleBlock(uint dimension, ivec3 worldPos) {
+    ivec4 ext0, ext1;
+    if (dimension == DIM_OVERWORLD) {
+        ext0 = extentsOverworld[0];
+        ext1 = extentsOverworld[1];
+    } else if (dimension == DIM_NETHER) {
+        ext0 = extentsNether[0];
+        ext1 = extentsNether[1];
+    } else {
+        ext0 = extentsEnd[0];
+        ext1 = extentsEnd[1];
+    }
+
+    // Check bounds
+    if (worldPos.x < ext0.x || worldPos.x >= ext0.z ||
+        worldPos.z < ext0.y || worldPos.z >= ext0.w ||
+        worldPos.y < 0 || worldPos.y >= ext1.x) {
+        return BLOCK_AIR;
+    }
+
+    // Compute linear index: Y * strideX * strideZ + (X - minX) * strideZ + (Z - minZ)
+    int localX = worldPos.x - ext0.x;
+    int localZ = worldPos.z - ext0.y;
+    uint linearIdx = uint(worldPos.y) * uint(ext1.y) * uint(ext1.z) + uint(localX) * uint(ext1.z) + uint(localZ);
+
+    // Read packed uint16 pair
+    uint packedIdx = linearIdx / 2;
+    uint packed;
+    if (dimension == DIM_OVERWORLD) {
+        packed = overworldBlocks[packedIdx];
+    } else if (dimension == DIM_NETHER) {
+        packed = netherBlocks[packedIdx];
+    } else {
+        packed = endBlocks[packedIdx];
+    }
+
+    // Extract correct uint16
+    if ((linearIdx & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    } else {
+        return packed >> 16;
+    }
+}
+
+// Check if agent's feet position intersects a portal block
+// Returns PORTAL_NONE, PORTAL_NETHER, or PORTAL_END
+uint checkPortalIntersection(vec3 pos, uint dimension, out ivec3 portalPos, out uint axis) {
+    // Agent hitbox: 0.6 wide, 1.8 tall
+    // Check block at feet and block above
+    ivec3 feetBlock = ivec3(floor(pos));
+    ivec3 headBlock = ivec3(floor(pos + vec3(0, 1, 0)));
+
+    // Check feet position
+    uint feetBlockId = sampleBlock(dimension, feetBlock);
+    if (feetBlockId == BLOCK_NETHER_PORTAL) {
+        portalPos = feetBlock;
+        // Determine axis by checking adjacent blocks (simplified: check X+1 and Z+1)
+        uint xCheck = sampleBlock(dimension, feetBlock + ivec3(1, 0, 0));
+        axis = (xCheck == BLOCK_NETHER_PORTAL) ? 0u : 1u;  // 0=X-axis portal, 1=Z-axis
+        return PORTAL_NETHER;
+    }
+    if (feetBlockId == BLOCK_END_PORTAL) {
+        portalPos = feetBlock;
+        axis = 0u;
+        return PORTAL_END;
+    }
+
+    // Check head position
+    uint headBlockId = sampleBlock(dimension, headBlock);
+    if (headBlockId == BLOCK_NETHER_PORTAL) {
+        portalPos = headBlock;
+        uint xCheck = sampleBlock(dimension, headBlock + ivec3(1, 0, 0));
+        axis = (xCheck == BLOCK_NETHER_PORTAL) ? 0u : 1u;
+        return PORTAL_NETHER;
+    }
+    if (headBlockId == BLOCK_END_PORTAL) {
+        portalPos = headBlock;
+        axis = 0u;
+        return PORTAL_END;
+    }
+
+    portalPos = ivec3(0);
+    axis = 0u;
+    return PORTAL_NONE;
+}
+
+// Determine destination dimension for a portal transition
+uint getDestinationDimension(uint currentDim, uint portalType) {
+    if (portalType == PORTAL_NETHER) {
+        // Nether portal: overworld <-> nether
+        return (currentDim == DIM_OVERWORLD) ? DIM_NETHER : DIM_OVERWORLD;
+    } else if (portalType == PORTAL_END) {
+        // End portal: overworld -> end (one-way until dragon killed)
+        // From end -> overworld spawn (handled separately)
+        return (currentDim == DIM_OVERWORLD) ? DIM_END : DIM_OVERWORLD;
+    }
+    return currentDim;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.agentCount) {
+        return;
+    }
+
+    // Read current state
+    uint inPortal, portalAxis;
+    float warmupTimer, cooldownTimer;
+    ivec3 lastPortalPos;
+    readPortalState(idx, inPortal, portalAxis, warmupTimer, cooldownTimer, lastPortalPos);
+
+    // Get agent position and dimension
+    vec4 pos = agentPos[idx];
+    uint dimension = agentDim[idx].x & 0xFFu;
+
+    // Update cooldown timer
+    if (cooldownTimer > 0.0) {
+        cooldownTimer = max(0.0, cooldownTimer - pc.deltaTime);
+    }
+
+    // Check for portal intersection
+    ivec3 currentPortalPos;
+    uint currentAxis;
+    uint portalType = checkPortalIntersection(pos.xyz, dimension, currentPortalPos, currentAxis);
+
+    // Portal state machine
+    if (portalType != PORTAL_NONE && cooldownTimer <= 0.0) {
+        // In a portal
+        if (inPortal == PORTAL_NONE) {
+            // Just entered portal
+            inPortal = portalType;
+            portalAxis = currentAxis;
+            warmupTimer = 0.0;
+            lastPortalPos = currentPortalPos;
+        } else if (inPortal == portalType) {
+            // Still in same portal type, increment warmup
+            warmupTimer += pc.deltaTime;
+
+            // Check for teleport trigger
+            float requiredWarmup = (portalType == PORTAL_END) ? 0.0 : PORTAL_WARMUP_SECONDS;
+            if (warmupTimer >= requiredWarmup) {
+                // Ready to teleport - write trigger
+                uint triggerIdx = atomicAdd(triggerCount, 1u);
+                if (triggerIdx < pc.maxEvents) {
+                    uint destDim = getDestinationDimension(dimension, portalType);
+                    triggers[triggerIdx] = uvec4(idx, dimension, destDim, portalType);
+                }
+
+                // Reset state (actual teleport happens in dimension_teleport.comp)
+                warmupTimer = 0.0;
+                cooldownTimer = PORTAL_COOLDOWN_SECONDS;
+            }
+        } else {
+            // Changed portal type (nether -> end or vice versa)
+            inPortal = portalType;
+            portalAxis = currentAxis;
+            warmupTimer = 0.0;
+            lastPortalPos = currentPortalPos;
+        }
+    } else {
+        // Not in portal or still on cooldown
+        if (inPortal != PORTAL_NONE) {
+            // Left portal before teleporting
+            warmupTimer = 0.0;
+        }
+        inPortal = PORTAL_NONE;
+        portalAxis = 0u;
+    }
+
+    // Write updated state
+    writePortalState(idx, inPortal, portalAxis, warmupTimer, cooldownTimer, lastPortalPos);
+}

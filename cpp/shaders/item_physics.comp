@@ -1,0 +1,568 @@
+#version 450
+
+// Minecraft 1.8.9 dropped item entity physics and pickup
+// Items spawn with random velocity, fall with gravity, collide with blocks,
+// can be picked up by players, despawn after 5 minutes, and stack with same types
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const float GRAVITY = 0.04;                 // Blocks per tick^2 (MC standard)
+const float DRAG_GROUND = 0.5;              // Friction on ground
+const float DRAG_AIR = 0.98;                // Air resistance
+const float BOUNCE_FACTOR = 0.25;           // Velocity retained on bounce
+const float PICKUP_RADIUS = 1.5;            // Blocks from player center
+const uint PICKUP_DELAY_TICKS = 10;         // 0.5 seconds at 20 TPS
+const uint DESPAWN_TICKS = 6000;            // 5 minutes at 20 TPS
+const uint MAX_STACK_SIZE = 64;
+const float MERGE_RADIUS = 0.5;             // Items within this distance can merge
+const float ITEM_HEIGHT = 0.25;             // Item entity height
+const float ITEM_WIDTH = 0.25;              // Item entity half-width
+
+// Block types (must match game_tick.comp)
+const uint BLOCK_AIR = 0;
+const uint BLOCK_WATER = 6;
+const uint BLOCK_LAVA = 7;
+
+// Item flags
+const uint ITEM_FLAG_ACTIVE = 1 << 0;       // Item exists and should be processed
+const uint ITEM_FLAG_ON_GROUND = 1 << 1;    // Item is resting on a block
+const uint ITEM_FLAG_IN_WATER = 1 << 2;     // Item is in water
+const uint ITEM_FLAG_IN_LAVA = 1 << 3;      // Item is in lava (will despawn fast)
+const uint ITEM_FLAG_PICKED_UP = 1 << 4;    // Item was picked up this tick
+const uint ITEM_FLAG_MERGED = 1 << 5;       // Item was merged into another stack
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct ItemEntity {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint item_id;           // Item type ID
+    uint count;             // Stack size (1-64)
+    uint age;               // Ticks since spawn
+    uint pickup_delay;      // Remaining ticks before pickup allowed
+    uint flags;             // State flags
+    uint owner_id;          // Player who dropped (for pickup priority)
+    uint _pad2[2];
+};
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint dimension;
+    uint gamemode;
+    uint activeSlot;
+    uint flags;
+    ivec3 targetBlock;
+    uint targetBlockFace;
+    vec4 statusEffects[8];
+};
+
+struct PickupEvent {
+    uint item_index;        // Index of item entity
+    uint player_id;         // Player who picked up (0 for single player)
+    uint item_id;           // Item type
+    uint count;             // Amount picked up
+};
+
+// ============================================================================
+// BUFFER BINDINGS
+// ============================================================================
+
+// Item entity storage
+layout(set = 0, binding = 0) buffer ItemBuffer {
+    uint item_count;        // Total active items
+    uint free_slot;         // Next free slot for spawning
+    uint pickup_count;      // Pickup events this tick
+    uint _pad;
+    ItemEntity items[];     // Max items defined by buffer size
+};
+
+// Player state (read-only for pickup detection)
+layout(set = 0, binding = 1) buffer readonly PlayerBuffer {
+    Player player;
+};
+
+// Inventory for adding picked up items
+layout(set = 0, binding = 2) buffer InventoryBuffer {
+    uint inventory[36];     // Main inventory slots
+    uint armor[4];
+    uint offhand;
+    uint inv_padding[3];
+};
+
+// Pickup events output (for sound/particle triggers)
+layout(set = 0, binding = 3) buffer PickupEventBuffer {
+    PickupEvent pickups[];
+};
+
+// World block data (for collision)
+layout(set = 0, binding = 4) buffer readonly ChunkBuffer {
+    uint loadedChunkCount;
+    ivec4 loadedChunks[1024];
+    uint blocks[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint max_items;         // Maximum item entities
+    uint tick;              // Current game tick
+    uint random_seed;       // RNG seed
+    uint stage;             // Processing stage
+    float delta_time;       // Time step (1/20 for 20 TPS)
+} pc;
+
+// Shared memory for workgroup coordination
+shared uint s_pickup_count;
+shared uint s_merge_targets[64];  // Items to check for merging
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float random_float(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+float random_range(inout uint seed, float min_val, float max_val) {
+    return min_val + random_float(seed) * (max_val - min_val);
+}
+
+uint getBlockAt(ivec3 worldPos, uint dimension) {
+    ivec3 chunkPos = worldPos >> 4;
+
+    for (uint i = 0; i < loadedChunkCount; i++) {
+        if (loadedChunks[i].xyz == chunkPos && loadedChunks[i].w == int(dimension)) {
+            ivec3 localPos = worldPos & 15;
+            uint idx = i * 16 * 16 * 384 +
+                       localPos.y * 16 * 16 +
+                       localPos.z * 16 +
+                       localPos.x;
+            return blocks[idx];
+        }
+    }
+    return BLOCK_AIR;
+}
+
+bool isBlockSolid(uint blockType) {
+    return blockType != BLOCK_AIR &&
+           blockType != BLOCK_WATER &&
+           blockType != BLOCK_LAVA;
+}
+
+bool isBlockFluid(uint blockType) {
+    return blockType == BLOCK_WATER || blockType == BLOCK_LAVA;
+}
+
+// ============================================================================
+// ITEM SPAWNING
+// ============================================================================
+
+// Spawn a new item entity with random velocity
+// Call from CPU or another shader when dropping items
+void spawnItem(uint item_id, uint count, vec3 position, uint owner_id, inout uint seed) {
+    uint slot = atomicAdd(free_slot, 1);
+    if (slot >= pc.max_items) {
+        atomicAdd(free_slot, 0xFFFFFFFF);  // Decrement on overflow
+        return;
+    }
+
+    // Random initial velocity (small upward + horizontal spread)
+    vec3 velocity;
+    velocity.x = random_range(seed, -0.2, 0.2);
+    velocity.y = random_range(seed, 0.2, 0.4);  // Small upward pop
+    velocity.z = random_range(seed, -0.2, 0.2);
+
+    items[slot].position = position;
+    items[slot].velocity = velocity;
+    items[slot].item_id = item_id;
+    items[slot].count = min(count, MAX_STACK_SIZE);
+    items[slot].age = 0;
+    items[slot].pickup_delay = PICKUP_DELAY_TICKS;
+    items[slot].flags = ITEM_FLAG_ACTIVE;
+    items[slot].owner_id = owner_id;
+
+    atomicAdd(item_count, 1);
+}
+
+// ============================================================================
+// COLLISION DETECTION
+// ============================================================================
+
+// Check if item AABB intersects a solid block
+bool checkBlockCollision(vec3 pos, float half_width, float height) {
+    ivec3 minBlock = ivec3(floor(pos - vec3(half_width, 0.0, half_width)));
+    ivec3 maxBlock = ivec3(floor(pos + vec3(half_width, height, half_width)));
+
+    for (int x = minBlock.x; x <= maxBlock.x; x++) {
+        for (int y = minBlock.y; y <= maxBlock.y; y++) {
+            for (int z = minBlock.z; z <= maxBlock.z; z++) {
+                if (isBlockSolid(getBlockAt(ivec3(x, y, z), player.dimension))) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Resolve collision by pushing item out of blocks
+vec3 resolveCollision(vec3 pos, vec3 vel, float half_width, float height, out bool on_ground) {
+    on_ground = false;
+    vec3 new_pos = pos;
+
+    // Check Y collision first (most common for falling items)
+    if (vel.y < 0.0) {
+        int ground_y = int(floor(pos.y - 0.001));
+        bool hit_ground = false;
+
+        for (int x = int(floor(pos.x - half_width)); x <= int(floor(pos.x + half_width)); x++) {
+            for (int z = int(floor(pos.z - half_width)); z <= int(floor(pos.z + half_width)); z++) {
+                if (isBlockSolid(getBlockAt(ivec3(x, ground_y, z), player.dimension))) {
+                    hit_ground = true;
+                    break;
+                }
+            }
+            if (hit_ground) break;
+        }
+
+        if (hit_ground) {
+            new_pos.y = float(ground_y + 1);
+            on_ground = true;
+        }
+    }
+
+    // Check ceiling collision (upward velocity)
+    if (vel.y > 0.0) {
+        int ceil_y = int(floor(pos.y + height));
+        for (int x = int(floor(pos.x - half_width)); x <= int(floor(pos.x + half_width)); x++) {
+            for (int z = int(floor(pos.z - half_width)); z <= int(floor(pos.z + half_width)); z++) {
+                if (isBlockSolid(getBlockAt(ivec3(x, ceil_y, z), player.dimension))) {
+                    new_pos.y = float(ceil_y) - height;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Check X collision
+    int check_x = int(floor(pos.x + sign(vel.x) * (half_width + 0.01)));
+    for (int y = int(floor(new_pos.y)); y <= int(floor(new_pos.y + height)); y++) {
+        for (int z = int(floor(pos.z - half_width)); z <= int(floor(pos.z + half_width)); z++) {
+            if (isBlockSolid(getBlockAt(ivec3(check_x, y, z), player.dimension))) {
+                if (vel.x > 0.0) {
+                    new_pos.x = float(check_x) - half_width;
+                } else {
+                    new_pos.x = float(check_x + 1) + half_width;
+                }
+                break;
+            }
+        }
+    }
+
+    // Check Z collision
+    int check_z = int(floor(pos.z + sign(vel.z) * (half_width + 0.01)));
+    for (int y = int(floor(new_pos.y)); y <= int(floor(new_pos.y + height)); y++) {
+        for (int x = int(floor(new_pos.x - half_width)); x <= int(floor(new_pos.x + half_width)); x++) {
+            if (isBlockSolid(getBlockAt(ivec3(x, y, check_z), player.dimension))) {
+                if (vel.z > 0.0) {
+                    new_pos.z = float(check_z) - half_width;
+                } else {
+                    new_pos.z = float(check_z + 1) + half_width;
+                }
+                break;
+            }
+        }
+    }
+
+    return new_pos;
+}
+
+// ============================================================================
+// PHYSICS UPDATE
+// ============================================================================
+
+void updateItemPhysics(uint idx) {
+    if ((items[idx].flags & ITEM_FLAG_ACTIVE) == 0) return;
+    if ((items[idx].flags & (ITEM_FLAG_PICKED_UP | ITEM_FLAG_MERGED)) != 0) return;
+
+    vec3 pos = items[idx].position;
+    vec3 vel = items[idx].velocity;
+    uint flags = items[idx].flags;
+
+    // Check if in fluid
+    uint block_at = getBlockAt(ivec3(floor(pos)), player.dimension);
+    bool in_water = (block_at == BLOCK_WATER);
+    bool in_lava = (block_at == BLOCK_LAVA);
+
+    // Apply gravity (reduced in water)
+    if (in_water) {
+        vel.y -= GRAVITY * 0.2;  // Buoyancy effect
+        vel *= 0.8;              // Water drag
+        flags |= ITEM_FLAG_IN_WATER;
+        flags &= ~ITEM_FLAG_IN_LAVA;
+    } else if (in_lava) {
+        vel.y -= GRAVITY * 0.1;  // Strong buoyancy in lava
+        vel *= 0.5;              // Lava is thick
+        flags |= ITEM_FLAG_IN_LAVA;
+        flags &= ~ITEM_FLAG_IN_WATER;
+    } else {
+        vel.y -= GRAVITY;
+        flags &= ~(ITEM_FLAG_IN_WATER | ITEM_FLAG_IN_LAVA);
+    }
+
+    // Apply position update
+    vec3 new_pos = pos + vel;
+
+    // Collision detection and resolution
+    bool on_ground;
+    new_pos = resolveCollision(new_pos, vel, ITEM_WIDTH, ITEM_HEIGHT, on_ground);
+
+    // Update velocity based on collision
+    if (on_ground) {
+        // Bounce or settle
+        if (abs(vel.y) < 0.1) {
+            vel.y = 0.0;
+            flags |= ITEM_FLAG_ON_GROUND;
+        } else {
+            vel.y = -vel.y * BOUNCE_FACTOR;
+            flags &= ~ITEM_FLAG_ON_GROUND;
+        }
+        // Ground friction
+        vel.x *= DRAG_GROUND;
+        vel.z *= DRAG_GROUND;
+    } else {
+        flags &= ~ITEM_FLAG_ON_GROUND;
+        // Air drag
+        vel.x *= DRAG_AIR;
+        vel.z *= DRAG_AIR;
+    }
+
+    // Horizontal collision bounce
+    if (abs(new_pos.x - (pos.x + vel.x * pc.delta_time)) > 0.001) {
+        vel.x = -vel.x * BOUNCE_FACTOR;
+    }
+    if (abs(new_pos.z - (pos.z + vel.z * pc.delta_time)) > 0.001) {
+        vel.z = -vel.z * BOUNCE_FACTOR;
+    }
+
+    // Clamp very small velocities to zero
+    if (abs(vel.x) < 0.001) vel.x = 0.0;
+    if (abs(vel.y) < 0.001) vel.y = 0.0;
+    if (abs(vel.z) < 0.001) vel.z = 0.0;
+
+    // Write back
+    items[idx].position = new_pos;
+    items[idx].velocity = vel;
+    items[idx].flags = flags;
+}
+
+// ============================================================================
+// PICKUP DETECTION
+// ============================================================================
+
+void checkPickup(uint idx) {
+    if ((items[idx].flags & ITEM_FLAG_ACTIVE) == 0) return;
+    if ((items[idx].flags & (ITEM_FLAG_PICKED_UP | ITEM_FLAG_MERGED)) != 0) return;
+    if (items[idx].pickup_delay > 0) return;
+
+    // Distance check to player
+    vec3 to_player = player.position - items[idx].position;
+    // Player pickup point is at feet + 0.5 (roughly waist height)
+    to_player.y = (player.position.y + 0.5) - items[idx].position.y;
+
+    float dist = length(to_player);
+    if (dist > PICKUP_RADIUS) return;
+
+    // Find inventory slot for this item
+    uint item_id = items[idx].item_id;
+    uint pickup_amount = items[idx].count;
+    uint remaining = pickup_amount;
+
+    // First pass: try to stack with existing items
+    for (uint i = 0; i < 36 && remaining > 0; i++) {
+        if (inventory[i] == item_id) {
+            // Inventory stores item_id in upper 16 bits, count in lower 16
+            uint slot_count = inventory[i] & 0xFFFF;
+            uint slot_id = inventory[i] >> 16;
+
+            if (slot_id == item_id && slot_count < MAX_STACK_SIZE) {
+                uint space = MAX_STACK_SIZE - slot_count;
+                uint to_add = min(remaining, space);
+                inventory[i] = (slot_id << 16) | (slot_count + to_add);
+                remaining -= to_add;
+            }
+        }
+    }
+
+    // Second pass: find empty slots
+    for (uint i = 0; i < 36 && remaining > 0; i++) {
+        if (inventory[i] == 0) {
+            uint to_add = min(remaining, MAX_STACK_SIZE);
+            inventory[i] = (item_id << 16) | to_add;
+            remaining -= to_add;
+        }
+    }
+
+    // Record pickup event
+    uint picked_up = pickup_amount - remaining;
+    if (picked_up > 0) {
+        uint event_idx = atomicAdd(pickup_count, 1);
+        pickups[event_idx].item_index = idx;
+        pickups[event_idx].player_id = 0;
+        pickups[event_idx].item_id = item_id;
+        pickups[event_idx].count = picked_up;
+
+        if (remaining == 0) {
+            // Fully picked up
+            items[idx].flags |= ITEM_FLAG_PICKED_UP;
+            items[idx].flags &= ~ITEM_FLAG_ACTIVE;
+            atomicAdd(item_count, 0xFFFFFFFF);  // Decrement
+        } else {
+            // Partial pickup (inventory was full)
+            items[idx].count = remaining;
+        }
+    }
+}
+
+// ============================================================================
+// STACK MERGING
+// ============================================================================
+
+void checkMerge(uint idx) {
+    if ((items[idx].flags & ITEM_FLAG_ACTIVE) == 0) return;
+    if ((items[idx].flags & (ITEM_FLAG_PICKED_UP | ITEM_FLAG_MERGED)) != 0) return;
+    if (items[idx].count >= MAX_STACK_SIZE) return;
+
+    uint my_id = items[idx].item_id;
+    vec3 my_pos = items[idx].position;
+
+    // Search nearby items for merge candidates
+    // Only merge with lower-indexed items to prevent double-merging
+    for (uint i = 0; i < idx; i++) {
+        if ((items[i].flags & ITEM_FLAG_ACTIVE) == 0) continue;
+        if ((items[i].flags & (ITEM_FLAG_PICKED_UP | ITEM_FLAG_MERGED)) != 0) continue;
+        if (items[i].item_id != my_id) continue;
+
+        vec3 other_pos = items[i].position;
+        float dist = length(my_pos - other_pos);
+
+        if (dist <= MERGE_RADIUS) {
+            // Try to merge into the other item
+            uint space = MAX_STACK_SIZE - items[i].count;
+            if (space > 0) {
+                uint to_merge = min(items[idx].count, space);
+
+                // Atomically update counts
+                atomicAdd(items[i].count, to_merge);
+                uint remaining = items[idx].count - to_merge;
+
+                if (remaining == 0) {
+                    items[idx].flags |= ITEM_FLAG_MERGED;
+                    items[idx].flags &= ~ITEM_FLAG_ACTIVE;
+                    atomicAdd(item_count, 0xFFFFFFFF);
+                } else {
+                    items[idx].count = remaining;
+                }
+
+                // Only merge with one item per tick
+                return;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// AGE AND DESPAWN
+// ============================================================================
+
+void updateAge(uint idx) {
+    if ((items[idx].flags & ITEM_FLAG_ACTIVE) == 0) return;
+    if ((items[idx].flags & (ITEM_FLAG_PICKED_UP | ITEM_FLAG_MERGED)) != 0) return;
+
+    // Increment age
+    items[idx].age++;
+
+    // Decrement pickup delay
+    if (items[idx].pickup_delay > 0) {
+        items[idx].pickup_delay--;
+    }
+
+    // Check despawn conditions
+    bool should_despawn = false;
+
+    // Normal despawn after 5 minutes
+    if (items[idx].age >= DESPAWN_TICKS) {
+        should_despawn = true;
+    }
+
+    // Instant despawn in lava
+    if ((items[idx].flags & ITEM_FLAG_IN_LAVA) != 0) {
+        should_despawn = true;
+    }
+
+    // Void despawn
+    if (items[idx].position.y < -64.0) {
+        should_despawn = true;
+    }
+
+    if (should_despawn) {
+        items[idx].flags &= ~ITEM_FLAG_ACTIVE;
+        atomicAdd(item_count, 0xFFFFFFFF);  // Decrement
+    }
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= pc.max_items) return;
+
+    // Process based on stage
+    switch (pc.stage) {
+        case 0:
+            // Stage 0: Physics update
+            updateItemPhysics(idx);
+            break;
+
+        case 1:
+            // Stage 1: Pickup detection
+            checkPickup(idx);
+            break;
+
+        case 2:
+            // Stage 2: Stack merging
+            checkMerge(idx);
+            break;
+
+        case 3:
+            // Stage 3: Age update and despawn
+            updateAge(idx);
+            break;
+    }
+}

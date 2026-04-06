@@ -1,0 +1,6 @@
+# Local contributor guide generated for this repo
+AGENTS.md
+
+# Compiled extensions (keep in cpp/build/ or python/minecraft_sim/)
+*.so
+*.dylib

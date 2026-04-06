@@ -1,0 +1,407 @@
+#version 450
+
+// Overworld terrain generation compute shader
+// Generates Minecraft 1.8.9-style terrain with biome-aware heightmaps
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// Chunk dimensions: 16x256x16 (X, Y, Z)
+#define CHUNK_SIZE_X 16
+#define CHUNK_SIZE_Y 256
+#define CHUNK_SIZE_Z 16
+#define SEA_LEVEL 63
+
+// Block IDs (MC 1.8.9)
+#define AIR 0
+#define STONE 1
+#define GRASS 2
+#define DIRT 3
+#define COBBLESTONE 4
+#define BEDROCK 7
+#define WATER 9
+#define SAND 12
+#define GRAVEL 13
+#define COAL_ORE 16
+#define IRON_ORE 15
+#define GOLD_ORE 14
+#define DIAMOND_ORE 56
+#define LAPIS_ORE 21
+#define REDSTONE_ORE 73
+#define EMERALD_ORE 129
+
+// Push constants for chunk generation
+layout(push_constant) uniform ChunkParams {
+    ivec3 chunk_pos;     // Chunk coordinates in world
+    int seed;            // World seed
+    float base_height;   // Base terrain height (64)
+    float height_scale;  // Height variation scale (32)
+    int lod_level;       // LOD: 0=full, 1=half, 2=quarter resolution
+    uint generation_flags; // Bit flags for features
+} params;
+
+// Chunk voxel storage - int8 packed
+// Layout: [chunk_x][chunk_z][16][256][16] but stored flat
+layout(std430, binding = 0) buffer ChunkData {
+    int voxels[]; // 16*256*16 = 65536 per chunk
+} chunk_out;
+
+// Heightmap cache for surface operations
+layout(std430, binding = 1) buffer HeightmapCache {
+    int heightmap[256]; // 16x16 heightmap
+} height_cache;
+
+// Biome data (256 values for 16x16)
+layout(std430, binding = 2) readonly buffer BiomeData {
+    uint biomes[256];
+} biome_in;
+
+// Permutation table for noise
+layout(std430, binding = 3) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+// Ore generation config
+struct OreConfig {
+    int block_id;
+    int min_height;
+    int max_height;
+    int vein_size;
+    int veins_per_chunk;
+    float spawn_chance;
+};
+
+// Biome types (MC 1.8.9)
+#define BIOME_OCEAN 0
+#define BIOME_PLAINS 1
+#define BIOME_DESERT 2
+#define BIOME_EXTREME_HILLS 3
+#define BIOME_FOREST 4
+#define BIOME_TAIGA 5
+#define BIOME_SWAMP 6
+#define BIOME_RIVER 7
+#define BIOME_FROZEN_OCEAN 10
+#define BIOME_FROZEN_RIVER 11
+#define BIOME_ICE_PLAINS 12
+#define BIOME_ICE_MOUNTAINS 13
+#define BIOME_MUSHROOM_ISLAND 14
+#define BIOME_BEACH 16
+#define BIOME_JUNGLE 21
+#define BIOME_SAVANNA 35
+#define BIOME_MESA 37
+
+// Noise functions (duplicated from noise.comp for standalone compilation)
+float fade(float t) {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float grad(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : h == 12 || h == 14 ? x : z;
+    return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+}
+
+float perlin3D(vec3 p) {
+    int X = int(floor(p.x)) & 255;
+    int Y = int(floor(p.y)) & 255;
+    int Z = int(floor(p.z)) & 255;
+    float x = fract(p.x);
+    float y = fract(p.y);
+    float z = fract(p.z);
+    float u = fade(x);
+    float v = fade(y);
+    float w = fade(z);
+
+    int A  = perm_table.perm[X] + Y;
+    int AA = perm_table.perm[A] + Z;
+    int AB = perm_table.perm[A + 1] + Z;
+    int B  = perm_table.perm[X + 1] + Y;
+    int BA = perm_table.perm[B] + Z;
+    int BB = perm_table.perm[B + 1] + Z;
+
+    return mix(
+        mix(mix(grad(perm_table.perm[AA], x, y, z), grad(perm_table.perm[BA], x-1, y, z), u),
+            mix(grad(perm_table.perm[AB], x, y-1, z), grad(perm_table.perm[BB], x-1, y-1, z), u), v),
+        mix(mix(grad(perm_table.perm[AA+1], x, y, z-1), grad(perm_table.perm[BA+1], x-1, y, z-1), u),
+            mix(grad(perm_table.perm[AB+1], x, y-1, z-1), grad(perm_table.perm[BB+1], x-1, y-1, z-1), u), v), w);
+}
+
+float perlin2D(vec2 p) {
+    int X = int(floor(p.x)) & 255;
+    int Y = int(floor(p.y)) & 255;
+    float x = fract(p.x);
+    float y = fract(p.y);
+    float u = fade(x);
+    float v = fade(y);
+
+    int A = perm_table.perm[X] + Y;
+    int B = perm_table.perm[X + 1] + Y;
+
+    return mix(mix(grad(perm_table.perm[A], x, y, 0), grad(perm_table.perm[B], x-1, y, 0), u),
+               mix(grad(perm_table.perm[A+1], x, y-1, 0), grad(perm_table.perm[B+1], x-1, y-1, 0), u), v);
+}
+
+float fbm2D(vec2 p, int octaves) {
+    float total = 0.0;
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float maxValue = 0.0;
+
+    for (int i = 0; i < octaves; i++) {
+        total += perlin2D(p * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    return total / maxValue;
+}
+
+float fbm3D(vec3 p, int octaves) {
+    float total = 0.0;
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float maxValue = 0.0;
+
+    for (int i = 0; i < octaves; i++) {
+        total += perlin3D(p * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    return total / maxValue;
+}
+
+// Get biome-specific height parameters
+void getBiomeHeightParams(uint biome, out float baseHeight, out float variation) {
+    switch (biome) {
+        case BIOME_OCEAN:
+        case BIOME_FROZEN_OCEAN:
+            baseHeight = 36.0;
+            variation = 8.0;
+            break;
+        case BIOME_PLAINS:
+        case BIOME_SAVANNA:
+            baseHeight = 64.0;
+            variation = 4.0;
+            break;
+        case BIOME_DESERT:
+        case BIOME_MESA:
+            baseHeight = 66.0;
+            variation = 6.0;
+            break;
+        case BIOME_EXTREME_HILLS:
+        case BIOME_ICE_MOUNTAINS:
+            baseHeight = 72.0;
+            variation = 48.0;
+            break;
+        case BIOME_FOREST:
+        case BIOME_TAIGA:
+        case BIOME_JUNGLE:
+            baseHeight = 66.0;
+            variation = 8.0;
+            break;
+        case BIOME_SWAMP:
+            baseHeight = 62.0;
+            variation = 2.0;
+            break;
+        case BIOME_RIVER:
+        case BIOME_FROZEN_RIVER:
+            baseHeight = 56.0;
+            variation = 4.0;
+            break;
+        case BIOME_BEACH:
+            baseHeight = 64.0;
+            variation = 2.0;
+            break;
+        default:
+            baseHeight = 64.0;
+            variation = 8.0;
+    }
+}
+
+// Get surface block for biome
+int getSurfaceBlock(uint biome) {
+    switch (biome) {
+        case BIOME_DESERT:
+        case BIOME_BEACH:
+            return SAND;
+        case BIOME_MESA:
+            return int(73); // Red sand / hardened clay
+        case BIOME_MUSHROOM_ISLAND:
+            return int(110); // Mycelium
+        default:
+            return GRASS;
+    }
+}
+
+// Get subsurface block for biome
+int getSubsurfaceBlock(uint biome) {
+    switch (biome) {
+        case BIOME_DESERT:
+        case BIOME_BEACH:
+            return SAND;
+        case BIOME_MESA:
+            return int(172); // Hardened clay
+        default:
+            return DIRT;
+    }
+}
+
+// Calculate terrain height at world position
+int calculateHeight(vec2 worldXZ, uint biome) {
+    float biomeBase, biomeVar;
+    getBiomeHeightParams(biome, biomeBase, biomeVar);
+
+    // Multi-octave noise for terrain shape
+    float baseNoise = fbm2D(worldXZ * 0.004, 4);
+    float detailNoise = fbm2D(worldXZ * 0.02, 2) * 0.3;
+    float microNoise = fbm2D(worldXZ * 0.1, 2) * 0.1;
+
+    float totalNoise = baseNoise + detailNoise + microNoise;
+
+    int height = int(biomeBase + totalNoise * biomeVar);
+    return clamp(height, 1, CHUNK_SIZE_Y - 1);
+}
+
+// Check if position should have a cave
+bool isCave(vec3 worldPos) {
+    // Main cave system
+    float caveNoise = fbm3D(worldPos * 0.05, 3);
+    float threshold = 0.55;
+
+    // Worm caves
+    float wormNoise = perlin3D(worldPos * 0.02);
+    float wormThreshold = 0.7;
+
+    // Vertical caves / ravines
+    float ravineNoise = abs(perlin2D(worldPos.xz * 0.01));
+    bool isRavine = ravineNoise < 0.03 && worldPos.y > 10 && worldPos.y < 60;
+
+    return caveNoise > threshold || abs(wormNoise) > wormThreshold || isRavine;
+}
+
+// Ore generation using noise-based approach
+int getOreBlock(vec3 worldPos, int currentBlock) {
+    if (currentBlock != STONE) return currentBlock;
+
+    int y = int(worldPos.y);
+    float oreNoise = perlin3D(worldPos * 0.15);
+
+    // Diamond: Y 1-16
+    if (y <= 16 && oreNoise > 0.85) return DIAMOND_ORE;
+
+    // Gold: Y 1-32
+    if (y <= 32 && oreNoise > 0.80) return GOLD_ORE;
+
+    // Redstone: Y 1-16
+    float redstoneNoise = perlin3D(worldPos * 0.12 + 100.0);
+    if (y <= 16 && redstoneNoise > 0.78) return REDSTONE_ORE;
+
+    // Lapis: Y 1-32 (peak at 16)
+    float lapisNoise = perlin3D(worldPos * 0.13 + 200.0);
+    float lapisChance = 1.0 - abs(float(y) - 16.0) / 16.0;
+    if (y <= 32 && lapisNoise > 0.85 - lapisChance * 0.1) return LAPIS_ORE;
+
+    // Iron: Y 1-64
+    float ironNoise = perlin3D(worldPos * 0.1 + 300.0);
+    if (y <= 64 && ironNoise > 0.72) return IRON_ORE;
+
+    // Coal: Y 1-128
+    float coalNoise = perlin3D(worldPos * 0.08 + 400.0);
+    if (y <= 128 && coalNoise > 0.70) return COAL_ORE;
+
+    return STONE;
+}
+
+// Linear index into chunk voxel array
+uint voxelIndex(uint x, uint y, uint z) {
+    return z * CHUNK_SIZE_X * CHUNK_SIZE_Y + y * CHUNK_SIZE_X + x;
+}
+
+// Heightmap index
+uint heightIndex(uint x, uint z) {
+    return z * CHUNK_SIZE_X + x;
+}
+
+void main() {
+    uvec3 lid = gl_LocalInvocationID;
+    uvec3 gid = gl_GlobalInvocationID;
+    uvec3 wgid = gl_WorkGroupID;
+
+    // Apply LOD - skip voxels based on LOD level
+    int lodStep = 1 << params.lod_level;
+    if ((gid.x % lodStep != 0) || (gid.y % lodStep != 0) || (gid.z % lodStep != 0)) {
+        return;
+    }
+
+    // Local coordinates within chunk
+    uint localX = gid.x % CHUNK_SIZE_X;
+    uint localY = gid.y;
+    uint localZ = gid.z % CHUNK_SIZE_Z;
+
+    // World coordinates
+    vec3 worldPos = vec3(
+        float(params.chunk_pos.x * CHUNK_SIZE_X + int(localX)),
+        float(localY),
+        float(params.chunk_pos.z * CHUNK_SIZE_Z + int(localZ))
+    );
+
+    // Get biome at this column
+    uint biomeIdx = heightIndex(localX, localZ);
+    uint biome = uint(biome_in.biomes[biomeIdx]);
+
+    // Calculate terrain height for this column
+    int surfaceHeight = calculateHeight(worldPos.xz, biome);
+
+    // Store in heightmap cache (first invocation per column)
+    if (localY == 0) {
+        height_cache.heightmap[biomeIdx] = surfaceHeight;
+    }
+
+    // Determine block type
+    int blockId = AIR;
+    int y = int(localY);
+
+    if (y == 0) {
+        // Bedrock layer at Y=0
+        blockId = BEDROCK;
+    } else if (y < 5) {
+        // Bedrock with noise for Y 1-4
+        float bedrockNoise = perlin3D(worldPos * 0.5);
+        if (bedrockNoise > (float(y) - 1.0) * 0.25) {
+            blockId = BEDROCK;
+        } else {
+            blockId = STONE;
+        }
+    } else if (y <= surfaceHeight) {
+        // Underground
+        if (y == surfaceHeight) {
+            // Surface block
+            if (y < SEA_LEVEL - 1) {
+                // Underwater floor
+                blockId = (biome == BIOME_OCEAN || biome == BIOME_RIVER) ? GRAVEL : getSurfaceBlock(biome);
+            } else {
+                blockId = getSurfaceBlock(biome);
+            }
+        } else if (y > surfaceHeight - 4) {
+            // Subsurface (dirt/sand layer)
+            blockId = getSubsurfaceBlock(biome);
+        } else {
+            // Deep underground - stone with ores
+            blockId = STONE;
+            blockId = getOreBlock(worldPos, blockId);
+        }
+
+        // Carve caves
+        if (y > 5 && y < surfaceHeight - 2 && isCave(worldPos)) {
+            blockId = (y < SEA_LEVEL) ? WATER : AIR;
+        }
+    } else if (y <= SEA_LEVEL) {
+        // Water above terrain but below sea level
+        blockId = WATER;
+    }
+
+    // Write to chunk buffer
+    uint idx = voxelIndex(localX, localY, localZ);
+    chunk_out.voxels[idx] = int(blockId);
+}

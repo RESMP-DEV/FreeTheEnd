@@ -1,0 +1,387 @@
+#version 450
+
+// Block Placing Compute Shader
+// Processes block placement for multiple agents in parallel
+// Input: player positions, look directions, block to place, face
+// Output: world modification, success flag
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Block placement rules encoded as flags
+const uint PLACE_ANYWHERE = 0x0001;      // Can be placed against any solid block
+const uint PLACE_ON_SOLID = 0x0002;      // Must be placed on solid surface below
+const uint PLACE_AGAINST_SOLID = 0x0004; // Must be against solid block on any side
+const uint PLACE_IN_WATER = 0x0008;      // Can replace water
+const uint PLACE_REPLACEABLE = 0x0010;   // Can replace tall grass, etc.
+const uint PLACE_DIRECTIONAL = 0x0020;   // Rotation depends on player facing
+const uint PLACE_MULTI_BLOCK = 0x0040;   // Multi-block structure (doors, beds)
+const uint PLACE_NEEDS_SUPPORT = 0x0080; // Will break without adjacent support
+const uint PLACE_NOT_COLLIDE = 0x0100;   // Cannot place where player stands
+
+// Block face constants
+const uint FACE_DOWN = 0;   // -Y
+const uint FACE_UP = 1;     // +Y
+const uint FACE_NORTH = 2;  // -Z
+const uint FACE_SOUTH = 3;  // +Z
+const uint FACE_WEST = 4;   // -X
+const uint FACE_EAST = 5;   // +X
+
+// Face offset vectors
+const ivec3 FACE_OFFSETS[6] = ivec3[6](
+    ivec3(0, -1, 0),  // DOWN
+    ivec3(0, 1, 0),   // UP
+    ivec3(0, 0, -1),  // NORTH
+    ivec3(0, 0, 1),   // SOUTH
+    ivec3(-1, 0, 0),  // WEST
+    ivec3(1, 0, 0)    // EAST
+);
+
+// Horizontal rotation based on player yaw (for directional blocks)
+// 0=south, 1=west, 2=north, 3=east
+uint getHorizontalRotation(vec3 look_dir) {
+    float angle = atan(look_dir.x, look_dir.z);
+    if (angle < 0.0) angle += 6.283185307;
+    return uint((angle + 0.7853981634) / 1.5707963268) % 4;
+}
+
+// Full rotation including vertical (for observer, piston, etc.)
+uint getFullRotation(vec3 look_dir, uint placed_face) {
+    // If looking straight up/down, use that
+    if (look_dir.y > 0.7) return 0; // Down-facing
+    if (look_dir.y < -0.7) return 1; // Up-facing
+
+    // Otherwise use horizontal
+    uint h = getHorizontalRotation(look_dir);
+    return 2 + h; // 2=north, 3=south, 4=west, 5=east
+}
+
+// Check if a block ID is solid for placement purposes
+bool isSolidBlock(uint block_id) {
+    if (block_id == 0) return false; // Air
+    if (block_id == 8 || block_id == 9) return false; // Water
+    if (block_id == 10 || block_id == 11) return false; // Lava
+    if (block_id == 31 || block_id == 32) return false; // Tall grass, dead bush
+    if (block_id == 37 || block_id == 38) return false; // Flowers
+    if (block_id == 39 || block_id == 40) return false; // Mushrooms
+    if (block_id == 50 || block_id == 51) return false; // Torch, fire
+    if (block_id == 55) return false; // Redstone wire
+    if (block_id == 59) return false; // Wheat
+    if (block_id == 75 || block_id == 76) return false; // Redstone torches
+    if (block_id == 83) return false; // Sugar cane
+    if (block_id == 104 || block_id == 105) return false; // Stems
+    if (block_id == 106) return false; // Vines
+    if (block_id == 115) return false; // Nether wart
+    if (block_id == 141 || block_id == 142) return false; // Crops
+    if (block_id == 175) return false; // Double plant
+    return true;
+}
+
+// Check if a block can be replaced (for placement)
+bool isReplaceable(uint block_id) {
+    if (block_id == 0) return true; // Air
+    if (block_id == 31) return true; // Tall grass
+    if (block_id == 32) return true; // Dead bush
+    if (block_id == 78 && true) return true; // Snow layer (single)
+    if (block_id == 8 || block_id == 9) return true; // Water (with waterlogging)
+    return false;
+}
+
+// Get placement rules for a block type
+uint getPlacementRules(uint block_id) {
+    // Most blocks can place against solid
+    uint rules = PLACE_AGAINST_SOLID | PLACE_REPLACEABLE | PLACE_NOT_COLLIDE;
+
+    // Directional blocks
+    if (block_id == 17 || block_id == 162) rules |= PLACE_DIRECTIONAL; // Logs
+    if (block_id == 23 || block_id == 158) rules |= PLACE_DIRECTIONAL; // Dispenser, Dropper
+    if (block_id == 29 || block_id == 33) rules |= PLACE_DIRECTIONAL; // Pistons
+    if (block_id == 50) rules = PLACE_AGAINST_SOLID | PLACE_NEEDS_SUPPORT; // Torch
+    if (block_id == 54 || block_id == 146) rules |= PLACE_DIRECTIONAL; // Chests
+    if (block_id == 61 || block_id == 62) rules |= PLACE_DIRECTIONAL; // Furnace
+    if (block_id == 65) rules = PLACE_AGAINST_SOLID | PLACE_NEEDS_SUPPORT; // Ladder
+    if (block_id == 69) rules = PLACE_AGAINST_SOLID | PLACE_NEEDS_SUPPORT; // Lever
+    if (block_id == 77 || block_id == 143) rules = PLACE_AGAINST_SOLID | PLACE_NEEDS_SUPPORT; // Buttons
+    if (block_id == 64 || block_id == 71) rules |= PLACE_MULTI_BLOCK; // Doors
+    if (block_id == 26) rules |= PLACE_MULTI_BLOCK; // Bed
+
+    // Needs support below
+    if (block_id == 6) rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE; // Sapling
+    if (block_id == 37 || block_id == 38) rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE; // Flowers
+    if (block_id == 39 || block_id == 40) rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE; // Mushrooms
+    if (block_id == 55) rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE; // Redstone
+    if (block_id == 59) rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE; // Wheat
+    if (block_id == 83) rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE; // Sugar cane
+
+    // Rails
+    if (block_id == 27 || block_id == 28 || block_id == 66 || block_id == 157) {
+        rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE;
+    }
+
+    // Pressure plates
+    if (block_id == 70 || block_id == 72 || block_id == 147 || block_id == 148) {
+        rules = PLACE_ON_SOLID | PLACE_NOT_COLLIDE;
+    }
+
+    return rules;
+}
+
+// Get metadata for directional block based on placement
+uint getDirectionalMetadata(uint block_id, vec3 look_dir, uint placed_face) {
+    // Logs use meta 0-3 for rotation axis
+    if (block_id == 17 || block_id == 162) {
+        if (placed_face == FACE_UP || placed_face == FACE_DOWN) return 0; // Y axis
+        if (placed_face == FACE_EAST || placed_face == FACE_WEST) return 4; // X axis
+        return 8; // Z axis
+    }
+
+    // Stairs, furnaces, chests use horizontal facing
+    if (block_id == 53 || block_id == 67 || block_id == 108 || block_id == 109 ||
+        block_id == 128 || block_id == 134 || block_id == 135 || block_id == 136 ||
+        block_id == 163 || block_id == 164 ||
+        block_id == 54 || block_id == 146 ||
+        block_id == 61 || block_id == 62 ||
+        block_id == 23 || block_id == 158) {
+        // Facing away from player
+        uint rot = getHorizontalRotation(look_dir);
+        // Map to minecraft facing: 2=north, 3=south, 4=west, 5=east
+        const uint facingMap[4] = uint[4](3, 4, 2, 5);
+        return facingMap[rot];
+    }
+
+    // Pistons and observers use all 6 directions
+    if (block_id == 29 || block_id == 33) {
+        return getFullRotation(look_dir, placed_face);
+    }
+
+    // Torches and buttons on walls
+    if (block_id == 50 || block_id == 75 || block_id == 76 ||
+        block_id == 77 || block_id == 143) {
+        if (placed_face == FACE_UP) return 5;
+        if (placed_face == FACE_EAST) return 1;
+        if (placed_face == FACE_WEST) return 2;
+        if (placed_face == FACE_SOUTH) return 3;
+        if (placed_face == FACE_NORTH) return 4;
+    }
+
+    // Ladder and other wall-attached
+    if (block_id == 65) {
+        if (placed_face == FACE_NORTH) return 2;
+        if (placed_face == FACE_SOUTH) return 3;
+        if (placed_face == FACE_WEST) return 4;
+        if (placed_face == FACE_EAST) return 5;
+    }
+
+    return 0;
+}
+
+struct AgentInput {
+    vec3 position;          // Player eye position
+    float _pad0;
+    vec3 look_dir;          // Normalized look direction
+    float _pad1;
+    uint block_to_place;    // Block ID from inventory
+    uint block_metadata;    // Initial metadata (for colored blocks, etc.)
+    ivec3 target_pos;       // Position of block being clicked
+    uint target_face;       // Face being clicked (0-5)
+    uint inventory_slot;    // Which slot the block is from
+    uint _pad2;
+};
+
+struct PlaceResult {
+    uint success;           // 1 if placement succeeded
+    uint placed_block_id;   // Block that was placed
+    ivec3 placed_position;  // Where it was placed
+    uint placed_metadata;   // Final metadata after rotation
+    uint failure_reason;    // 0=success, 1=collision, 2=no_support, 3=invalid_location
+    uint inventory_slot;    // Slot to decrement
+};
+
+struct WorldModification {
+    ivec3 position;
+    uint new_block_id;
+    uint new_metadata;
+    uint modification_type; // 0=break, 1=place, 2=update
+    uint agent_id;
+    uint _pad;
+};
+
+// World data for collision checks (read from voxel grid)
+struct VoxelData {
+    uint block_id;
+    uint metadata;
+};
+
+// Input/Output bindings
+layout(set = 0, binding = 0, std430) readonly buffer AgentInputBuffer {
+    AgentInput agents[];
+} agent_input;
+
+layout(set = 0, binding = 1, std430) writeonly buffer PlaceResultBuffer {
+    PlaceResult results[];
+} place_results;
+
+layout(set = 0, binding = 2, std430) buffer WorldModBuffer {
+    uint modification_count;
+    uint _pad[3];
+    WorldModification modifications[];
+} world_mods;
+
+// Voxel grid for collision/support checks (simplified linear buffer)
+layout(set = 0, binding = 3, std430) readonly buffer VoxelGridBuffer {
+    uvec2 grid_size; // x, z dimensions
+    uint grid_height; // y dimension
+    uint _pad;
+    VoxelData voxels[];
+} voxel_grid;
+
+layout(push_constant) uniform PushConstants {
+    uint agent_count;
+    uint max_modifications;
+    vec3 _pad;
+} pc;
+
+// Get voxel at world position
+VoxelData getVoxel(ivec3 pos) {
+    // Bounds check
+    if (pos.x < 0 || pos.y < 0 || pos.z < 0) {
+        VoxelData empty;
+        empty.block_id = 0;
+        empty.metadata = 0;
+        return empty;
+    }
+    if (pos.x >= int(voxel_grid.grid_size.x) ||
+        pos.y >= int(voxel_grid.grid_height) ||
+        pos.z >= int(voxel_grid.grid_size.y)) {
+        VoxelData empty;
+        empty.block_id = 0;
+        empty.metadata = 0;
+        return empty;
+    }
+
+    uint index = pos.y * voxel_grid.grid_size.x * voxel_grid.grid_size.y +
+                 pos.z * voxel_grid.grid_size.x +
+                 pos.x;
+    return voxel_grid.voxels[index];
+}
+
+// Check if position collides with player AABB
+bool collidesWithPlayer(ivec3 block_pos, vec3 player_pos) {
+    // Player AABB is 0.6 x 1.8 x 0.6 centered on position
+    vec3 player_min = player_pos - vec3(0.3, 1.62, 0.3);
+    vec3 player_max = player_pos + vec3(0.3, 0.18, 0.3);
+
+    vec3 block_min = vec3(block_pos);
+    vec3 block_max = vec3(block_pos) + vec3(1.0);
+
+    return !(block_max.x <= player_min.x || block_min.x >= player_max.x ||
+             block_max.y <= player_min.y || block_min.y >= player_max.y ||
+             block_max.z <= player_min.z || block_min.z >= player_max.z);
+}
+
+// Check if position has solid support below
+bool hasSupportBelow(ivec3 pos) {
+    VoxelData below = getVoxel(pos + ivec3(0, -1, 0));
+    return isSolidBlock(below.block_id);
+}
+
+// Check if position has solid support on any adjacent side
+bool hasAdjacentSupport(ivec3 pos) {
+    for (int i = 0; i < 6; i++) {
+        VoxelData adj = getVoxel(pos + FACE_OFFSETS[i]);
+        if (isSolidBlock(adj.block_id)) return true;
+    }
+    return false;
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    if (agent_id >= pc.agent_count) return;
+
+    AgentInput agent_in = agent_input.agents[agent_id];
+
+    // Initialize result to failure
+    PlaceResult result;
+    result.success = 0;
+    result.placed_block_id = 0;
+    result.placed_position = ivec3(0);
+    result.placed_metadata = 0;
+    result.failure_reason = 3; // Invalid location by default
+    result.inventory_slot = agent_in.inventory_slot;
+
+    uint block_id = agent_in.block_to_place;
+
+    // No block to place
+    if (block_id == 0) {
+        place_results.results[agent_id] = result;
+        return;
+    }
+
+    // Calculate placement position (offset from clicked face)
+    ivec3 place_pos = agent_in.target_pos + FACE_OFFSETS[agent_in.target_face];
+
+    // Check existing block at placement position
+    VoxelData existing = getVoxel(place_pos);
+    if (!isReplaceable(existing.block_id)) {
+        result.failure_reason = 3; // Invalid location
+        place_results.results[agent_id] = result;
+        return;
+    }
+
+    // Get placement rules
+    uint rules = getPlacementRules(block_id);
+
+    // Check player collision
+    if ((rules & PLACE_NOT_COLLIDE) != 0) {
+        if (collidesWithPlayer(place_pos, agent_in.position)) {
+            result.failure_reason = 1; // Collision
+            place_results.results[agent_id] = result;
+            return;
+        }
+    }
+
+    // Check support requirements
+    if ((rules & PLACE_ON_SOLID) != 0) {
+        if (!hasSupportBelow(place_pos)) {
+            result.failure_reason = 2; // No support
+            place_results.results[agent_id] = result;
+            return;
+        }
+    }
+
+    if ((rules & PLACE_AGAINST_SOLID) != 0) {
+        // Need to check the clicked block is solid
+        VoxelData clicked = getVoxel(agent_in.target_pos);
+        if (!isSolidBlock(clicked.block_id)) {
+            result.failure_reason = 2; // No support
+            place_results.results[agent_id] = result;
+            return;
+        }
+    }
+
+    // Calculate metadata for directional blocks
+    uint metadata = agent_in.block_metadata;
+    if ((rules & PLACE_DIRECTIONAL) != 0) {
+        metadata = getDirectionalMetadata(block_id, agent_in.look_dir, agent_in.target_face);
+    }
+
+    // Success! Queue world modification
+    uint mod_index = atomicAdd(world_mods.modification_count, 1);
+    if (mod_index < pc.max_modifications) {
+        WorldModification mod;
+        mod.position = place_pos;
+        mod.new_block_id = block_id;
+        mod.new_metadata = metadata;
+        mod.modification_type = 1; // Place
+        mod.agent_id = agent_id;
+        mod._pad = 0;
+        world_mods.modifications[mod_index] = mod;
+
+        result.success = 1;
+        result.placed_block_id = block_id;
+        result.placed_position = place_pos;
+        result.placed_metadata = metadata;
+        result.failure_reason = 0;
+    }
+
+    place_results.results[agent_id] = result;
+}

@@ -1,0 +1,242 @@
+#version 450
+
+// Dragon AI - Movement and targeting
+// Implements MC 1.8.9 Ender Dragon flight patterns
+
+layout(local_size_x = 1) in;
+
+// Dragon state buffer - singleton per environment
+layout(std430, binding = 0) buffer DragonState {
+    vec3 position;
+    float health;           // 200 HP max
+    vec3 velocity;
+    uint phase;             // 0=circling, 1=strafing, 2=landing, 3=perching, 4=dying
+    mat4 body_transform;    // For hitbox computation
+    uint target_player;     // Index into player buffer
+    float perch_timer;      // Time spent perching
+    float strafe_timer;     // Time in strafe run
+    vec3 target_position;   // Current movement target
+    uint crystals_alive;    // Cached count of alive crystals
+} dragon;
+
+// Crystal state buffer
+layout(std430, binding = 1) buffer CrystalState {
+    vec4 positions[10];     // xyz = position, w = unused
+    uint alive_mask;        // Bitmask of alive crystals
+    uint cage_mask;         // Bitmask of crystals with cages
+    float beam_timers[10];  // Animation timers for healing beams
+} crystals;
+
+// Player positions for targeting
+layout(std430, binding = 2) buffer PlayerState {
+    vec4 positions[256];    // xyz = position, w = health
+    uint count;
+    uint pad[3];
+} players;
+
+// Perch locations on the end fountain
+layout(std430, binding = 3) readonly buffer PerchLocations {
+    vec4 perch_points[8];   // Valid perching spots
+    vec4 fountain_center;   // Center of the end fountain
+} perches;
+
+// Random state for AI decisions
+layout(std430, binding = 4) buffer RandomState {
+    uint seed;
+} rng;
+
+// Push constants for time
+layout(push_constant) uniform PushConstants {
+    float delta_time;
+    float total_time;
+    uint tick;
+} pc;
+
+// Constants matching MC 1.8.9 behavior
+const float CIRCLE_RADIUS = 40.0;
+const float CIRCLE_HEIGHT = 70.0;
+const float CIRCLE_SPEED = 0.5;
+const float STRAFE_SPEED = 8.0;
+const float LANDING_SPEED = 3.0;
+const float PERCH_DURATION = 5.0;
+const float MAX_TURN_RATE = 0.15;
+const float TARGET_SWITCH_CHANCE = 0.01;
+
+// PCG random
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random() {
+    rng.seed = pcg_hash(rng.seed);
+    return float(rng.seed) / 4294967295.0;
+}
+
+// Count set bits (alive crystals)
+uint popcount(uint x) {
+    x = x - ((x >> 1) & 0x55555555u);
+    x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+    return ((x + (x >> 4) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+}
+
+// Find nearest player
+uint find_nearest_player() {
+    float min_dist = 1e10;
+    uint nearest = 0;
+
+    for (uint i = 0; i < players.count && i < 256; i++) {
+        vec3 player_pos = players.positions[i].xyz;
+        float dist = distance(dragon.position, player_pos);
+        if (dist < min_dist && players.positions[i].w > 0.0) {
+            min_dist = dist;
+            nearest = i;
+        }
+    }
+    return nearest;
+}
+
+// Get circling position based on time
+vec3 get_circle_position() {
+    float angle = pc.total_time * CIRCLE_SPEED;
+    return vec3(
+        perches.fountain_center.x + cos(angle) * CIRCLE_RADIUS,
+        CIRCLE_HEIGHT,
+        perches.fountain_center.z + sin(angle) * CIRCLE_RADIUS
+    );
+}
+
+// Smooth steering toward target
+vec3 steer_toward(vec3 target, float max_speed) {
+    vec3 desired = normalize(target - dragon.position) * max_speed;
+    vec3 steering = desired - dragon.velocity;
+
+    float steering_length = length(steering);
+    if (steering_length > MAX_TURN_RATE) {
+        steering = steering / steering_length * MAX_TURN_RATE;
+    }
+
+    return dragon.velocity + steering;
+}
+
+// Update dragon body transform for hitbox calculation
+void update_body_transform() {
+    vec3 forward = normalize(dragon.velocity);
+    if (length(dragon.velocity) < 0.001) {
+        forward = vec3(0.0, 0.0, 1.0);
+    }
+
+    vec3 up = vec3(0.0, 1.0, 0.0);
+    vec3 right = normalize(cross(up, forward));
+    up = cross(forward, right);
+
+    // Build rotation matrix
+    mat4 rotation = mat4(
+        vec4(right, 0.0),
+        vec4(up, 0.0),
+        vec4(forward, 0.0),
+        vec4(0.0, 0.0, 0.0, 1.0)
+    );
+
+    // Translation
+    mat4 translation = mat4(1.0);
+    translation[3] = vec4(dragon.position, 1.0);
+
+    dragon.body_transform = translation * rotation;
+}
+
+void main() {
+    // Skip if dragon is dead
+    if (dragon.health <= 0.0) {
+        dragon.phase = 4; // dying
+        return;
+    }
+
+    // Count alive crystals
+    dragon.crystals_alive = popcount(crystals.alive_mask);
+
+    // Occasionally retarget
+    if (random() < TARGET_SWITCH_CHANCE || dragon.target_player >= players.count) {
+        dragon.target_player = find_nearest_player();
+    }
+
+    // State machine
+    switch (dragon.phase) {
+        case 0: // Circling
+            dragon.target_position = get_circle_position();
+            dragon.velocity = steer_toward(dragon.target_position, CIRCLE_SPEED * 16.0);
+
+            // Transition to strafing if player is visible and close
+            if (players.count > 0 && dragon.crystals_alive == 0) {
+                vec3 to_player = players.positions[dragon.target_player].xyz - dragon.position;
+                if (length(to_player) < 50.0 && random() < 0.02) {
+                    dragon.phase = 1; // strafe
+                    dragon.strafe_timer = 0.0;
+                }
+            }
+            break;
+
+        case 1: // Strafing player
+            if (dragon.target_player < players.count) {
+                dragon.target_position = players.positions[dragon.target_player].xyz;
+                dragon.velocity = steer_toward(dragon.target_position, STRAFE_SPEED);
+            }
+
+            dragon.strafe_timer += pc.delta_time;
+
+            // End strafe after a while or if close to target
+            float dist_to_target = distance(dragon.position, dragon.target_position);
+            if (dragon.strafe_timer > 4.0 || dist_to_target < 5.0) {
+                // Maybe land on fountain
+                if (dragon.crystals_alive == 0 && random() < 0.3) {
+                    dragon.phase = 2; // landing
+                } else {
+                    dragon.phase = 0; // return to circling
+                }
+            }
+            break;
+
+        case 2: // Landing on fountain
+            dragon.target_position = perches.fountain_center.xyz;
+            dragon.velocity = steer_toward(dragon.target_position, LANDING_SPEED);
+
+            // Check if landed
+            if (distance(dragon.position, perches.fountain_center.xyz) < 2.0) {
+                dragon.phase = 3; // perching
+                dragon.perch_timer = 0.0;
+                dragon.velocity = vec3(0.0);
+            }
+            break;
+
+        case 3: // Perching (vulnerable)
+            dragon.velocity = vec3(0.0);
+            dragon.perch_timer += pc.delta_time;
+
+            // Take off after perch duration
+            if (dragon.perch_timer > PERCH_DURATION) {
+                dragon.phase = 0; // return to circling
+            }
+            break;
+
+        case 4: // Dying - handled by dragon_death.comp
+            break;
+    }
+
+    // Apply velocity
+    dragon.position += dragon.velocity * pc.delta_time;
+
+    // Keep within arena bounds
+    float arena_radius = 100.0;
+    vec2 from_center = dragon.position.xz - perches.fountain_center.xz;
+    float dist_from_center = length(from_center);
+    if (dist_from_center > arena_radius) {
+        dragon.position.xz = perches.fountain_center.xz + normalize(from_center) * arena_radius;
+    }
+
+    // Height bounds
+    dragon.position.y = clamp(dragon.position.y, 10.0, 100.0);
+
+    // Update transform for hitbox
+    update_body_transform();
+}

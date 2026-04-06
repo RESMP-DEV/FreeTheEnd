@@ -1,0 +1,313 @@
+#version 450
+
+// End dimension terrain generation compute shader
+// Generates the main island (~100 block radius), obsidian pillars with crystals, and void
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define CHUNK_SIZE_X 16
+#define CHUNK_SIZE_Y 256
+#define CHUNK_SIZE_Z 16
+#define END_ISLAND_CENTER_Y 64
+
+// Block IDs (MC 1.8.9)
+#define AIR 0
+#define BEDROCK 7
+#define OBSIDIAN 49
+#define END_STONE 121
+#define END_PORTAL_FRAME 120
+#define ENDER_CRYSTAL 200  // Entity-spawned, but we mark the position
+#define IRON_BARS 101
+#define TORCH 50  // For fountain center marker
+
+// Push constants
+layout(push_constant) uniform ChunkParams {
+    ivec3 chunk_pos;
+    int seed;
+    float island_radius;     // Main island radius (default ~100)
+    float outer_island_dist; // Distance to outer islands (default ~1000)
+    int lod_level;
+    uint generation_flags;   // Bit 0: generate obsidian pillars, Bit 1: generate fountain
+} params;
+
+// Chunk voxel storage
+layout(std430, binding = 0) buffer ChunkData {
+    int voxels[];
+} chunk_out;
+
+// Permutation table for Perlin noise
+layout(std430, binding = 1) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+// Crystal position output (for entity spawning)
+layout(std430, binding = 2) buffer CrystalPositions {
+    ivec4 positions[10];  // x, y, z, caged (0 or 1)
+    int count;
+} crystals;
+
+// Pillar configurations - exact MC 1.8.9 positions
+// 10 pillars arranged in a circle, heights vary from 76 to 103
+const vec2 PILLAR_POS[10] = vec2[](
+    vec2(42.0, 0.0),
+    vec2(-42.0, 0.0),
+    vec2(0.0, 42.0),
+    vec2(0.0, -42.0),
+    vec2(30.0, 30.0),
+    vec2(-30.0, 30.0),
+    vec2(30.0, -30.0),
+    vec2(-30.0, -30.0),
+    vec2(22.0, 22.0),
+    vec2(-22.0, -22.0)
+);
+
+const int PILLAR_HEIGHT[10] = int[](76, 79, 82, 85, 88, 91, 94, 97, 100, 103);
+const bool PILLAR_CAGED[10] = bool[](false, false, true, false, false, false, true, false, false, false);
+
+// Noise functions
+float fade(float t) {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float grad(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : h == 12 || h == 14 ? x : z;
+    return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+}
+
+float perlin3D(vec3 p) {
+    int X = int(floor(p.x)) & 255;
+    int Y = int(floor(p.y)) & 255;
+    int Z = int(floor(p.z)) & 255;
+    float x = fract(p.x);
+    float y = fract(p.y);
+    float z = fract(p.z);
+    float u = fade(x);
+    float v = fade(y);
+    float w = fade(z);
+
+    int A  = perm_table.perm[X] + Y;
+    int AA = perm_table.perm[A] + Z;
+    int AB = perm_table.perm[A + 1] + Z;
+    int B  = perm_table.perm[X + 1] + Y;
+    int BA = perm_table.perm[B] + Z;
+    int BB = perm_table.perm[B + 1] + Z;
+
+    return mix(
+        mix(mix(grad(perm_table.perm[AA], x, y, z), grad(perm_table.perm[BA], x-1, y, z), u),
+            mix(grad(perm_table.perm[AB], x, y-1, z), grad(perm_table.perm[BB], x-1, y-1, z), u), v),
+        mix(mix(grad(perm_table.perm[AA+1], x, y, z-1), grad(perm_table.perm[BA+1], x-1, y, z-1), u),
+            mix(grad(perm_table.perm[AB+1], x, y-1, z-1), grad(perm_table.perm[BB+1], x-1, y-1, z-1), u), v), w);
+}
+
+float noise_2d(vec2 p) {
+    int X = int(floor(p.x)) & 255;
+    int Y = int(floor(p.y)) & 255;
+    float x = fract(p.x);
+    float y = fract(p.y);
+    float u = fade(x);
+    float v = fade(y);
+
+    int A = perm_table.perm[X] + Y;
+    int B = perm_table.perm[X + 1] + Y;
+
+    return mix(mix(grad(perm_table.perm[A], x, y, 0), grad(perm_table.perm[B], x-1, y, 0), u),
+               mix(grad(perm_table.perm[A+1], x, y-1, 0), grad(perm_table.perm[B+1], x-1, y-1, 0), u), v);
+}
+
+// Main island height calculation
+// The island is a ~100 block radius sphere-like formation centered at (0, 64, 0)
+// Height drops off quadratically from center with noise variation
+float getIslandHeight(vec2 pos) {
+    float dist_from_center = length(pos);
+
+    // Outside island radius = void
+    if (dist_from_center > 100.0) {
+        return -1000.0;
+    }
+
+    // Base height: parabolic falloff from center
+    // At center: 64, at edge (~100 blocks): 64 - 20 = 44
+    float island_height = float(END_ISLAND_CENTER_Y) - pow(dist_from_center / 100.0, 2.0) * 20.0;
+
+    // Add noise variation for natural look
+    island_height += noise_2d(pos * 0.1) * 5.0;
+
+    return island_height;
+}
+
+// Check if position is inside an obsidian pillar
+// Returns pillar index (0-9) or -1 if not in pillar
+int getPillarIndex(vec3 worldPos) {
+    if ((params.generation_flags & 1u) == 0u) {
+        return -1;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        vec2 pillarCenter = PILLAR_POS[i];
+        float dx = worldPos.x - pillarCenter.x;
+        float dz = worldPos.z - pillarCenter.y;
+
+        // 3x3 pillar footprint (1.5 block radius)
+        if (abs(dx) <= 1.5 && abs(dz) <= 1.5) {
+            // Check height range: from island surface up to pillar top
+            float surfaceHeight = getIslandHeight(pillarCenter);
+            if (surfaceHeight < 0.0) surfaceHeight = float(END_ISLAND_CENTER_Y);
+
+            if (worldPos.y >= surfaceHeight && worldPos.y <= float(PILLAR_HEIGHT[i])) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+// Check if position is a crystal position (top of pillar)
+bool isCrystalPosition(vec3 worldPos, int pillarIdx) {
+    if (pillarIdx < 0) return false;
+
+    vec2 pillarCenter = PILLAR_POS[pillarIdx];
+    float dx = worldPos.x - pillarCenter.x;
+    float dz = worldPos.z - pillarCenter.y;
+
+    // Crystal sits on top center of pillar
+    return abs(dx) < 0.5 && abs(dz) < 0.5 &&
+           int(worldPos.y) == PILLAR_HEIGHT[pillarIdx] + 1;
+}
+
+// Check if position is part of iron bar cage around crystal
+bool isIronBarCage(vec3 worldPos, int pillarIdx) {
+    if (pillarIdx < 0 || !PILLAR_CAGED[pillarIdx]) return false;
+
+    vec2 pillarCenter = PILLAR_POS[pillarIdx];
+    int pillarTop = PILLAR_HEIGHT[pillarIdx];
+
+    float dx = worldPos.x - pillarCenter.x;
+    float dz = worldPos.z - pillarCenter.y;
+    int y = int(worldPos.y);
+
+    // Cage is 3x3x3 around crystal (at pillar_top + 1 to pillar_top + 3)
+    if (y < pillarTop + 1 || y > pillarTop + 4) return false;
+
+    // Only edges of the 3x3 area (not the center where crystal is)
+    bool onEdgeX = abs(dx) > 1.0 && abs(dx) <= 2.0;
+    bool onEdgeZ = abs(dz) > 1.0 && abs(dz) <= 2.0;
+    bool inCageArea = abs(dx) <= 2.0 && abs(dz) <= 2.0;
+
+    // Top and sides of cage
+    if (y == pillarTop + 4 && inCageArea) return true;  // Top cap
+    if ((onEdgeX || onEdgeZ) && inCageArea) return true;  // Side bars
+
+    return false;
+}
+
+// Exit portal / fountain structure at center
+// Bedrock frame with end portal frames
+int getFountainBlock(vec3 worldPos) {
+    if ((params.generation_flags & 2u) == 0u) {
+        return -1;
+    }
+
+    float distXZ = length(worldPos.xz);
+    int y = int(worldPos.y);
+
+    // Bedrock pillar in center going down
+    if (distXZ < 0.5 && y >= END_ISLAND_CENTER_Y - 4 && y < END_ISLAND_CENTER_Y) {
+        return BEDROCK;
+    }
+
+    // End portal frame ring at surface level
+    // Inner ring: radius ~1 block
+    if (distXZ >= 1.0 && distXZ < 2.0 && y == END_ISLAND_CENTER_Y) {
+        return END_PORTAL_FRAME;
+    }
+
+    // Outer bedrock ring
+    if (distXZ >= 2.0 && distXZ < 4.0 && y == END_ISLAND_CENTER_Y - 1) {
+        return BEDROCK;
+    }
+
+    // Pool area (will be filled with void/air initially, portal activates on dragon death)
+    if (distXZ < 1.0 && y == END_ISLAND_CENTER_Y) {
+        return AIR;  // Portal pool, empty until dragon death
+    }
+
+    return -1;
+}
+
+uint voxelIndex(uint x, uint y, uint z) {
+    return z * CHUNK_SIZE_X * CHUNK_SIZE_Y + y * CHUNK_SIZE_X + x;
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+    // LOD filtering
+    int lodStep = 1 << params.lod_level;
+    if ((gid.x % lodStep != 0) || (gid.y % lodStep != 0) || (gid.z % lodStep != 0)) {
+        return;
+    }
+
+    uint localX = gid.x % CHUNK_SIZE_X;
+    uint localY = gid.y;
+    uint localZ = gid.z % CHUNK_SIZE_Z;
+
+    if (localY >= CHUNK_SIZE_Y) {
+        return;
+    }
+
+    vec3 worldPos = vec3(
+        float(params.chunk_pos.x * CHUNK_SIZE_X + int(localX)),
+        float(localY),
+        float(params.chunk_pos.z * CHUNK_SIZE_Z + int(localZ))
+    );
+
+    int blockId = AIR;  // Default: void (air)
+
+    // Priority 1: Fountain/exit portal at center
+    int fountainBlock = getFountainBlock(worldPos);
+    if (fountainBlock >= 0) {
+        blockId = fountainBlock;
+    }
+    // Priority 2: Obsidian pillars
+    else {
+        int pillarIdx = getPillarIndex(worldPos);
+        if (pillarIdx >= 0) {
+            // Check for iron bar cage first
+            if (isIronBarCage(worldPos, pillarIdx)) {
+                blockId = IRON_BARS;
+            }
+            // Crystal position - mark for entity spawn (use special ID or handle separately)
+            else if (isCrystalPosition(worldPos, pillarIdx)) {
+                // Record crystal position for entity spawning
+                // Atomically increment crystal count and store position
+                int idx = atomicAdd(crystals.count, 1);
+                if (idx < 10) {
+                    crystals.positions[idx] = ivec4(
+                        int(worldPos.x),
+                        int(worldPos.y),
+                        int(worldPos.z),
+                        PILLAR_CAGED[pillarIdx] ? 1 : 0
+                    );
+                }
+                blockId = AIR;  // Crystal is an entity, block is air
+            }
+            // Regular pillar obsidian
+            else {
+                blockId = OBSIDIAN;
+            }
+        }
+        // Priority 3: Main island end stone
+        else {
+            float islandHeight = getIslandHeight(worldPos.xz);
+            if (islandHeight > -999.0 && worldPos.y < islandHeight) {
+                blockId = END_STONE;
+            }
+            // Everything else is void (AIR)
+        }
+    }
+
+    uint idx = voxelIndex(localX, localY, localZ);
+    chunk_out.voxels[idx] = blockId;
+}

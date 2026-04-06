@@ -1,0 +1,312 @@
+# yaml-language-server: $schema=
+# Phase 4: Per-Stage Functionality Validation
+# Generated: January 24, 2026
+# Target: Fix remaining test failures, validate all stages, add smoke tests
+
+tasks:
+  # =============================================================================
+  # PRIORITY 0: Fix Remaining Test Failures
+  # =============================================================================
+
+  - name: fix-float-precision-tests
+    prompt: |
+      Fix floating-point precision issues in inventory persistence tests.
+
+      **Failing tests:**
+      - tests/test_full_speedrun.py::TestInventoryPersistence::test_advance_stage_persists_inventory
+      - tests/test_full_speedrun.py::TestInventoryPersistence::test_set_stage_persists_inventory
+
+      **Problem:** Direct float comparison fails due to precision:
+      `assert env._inventory_state["iron_ingot"] == 0.3`
+      but actual value is `0.30000001192092896`
+
+      **Fix:** Use `pytest.approx()` for float comparisons:
+      ```python
+      assert env._inventory_state["iron_ingot"] == pytest.approx(0.3, rel=1e-5)
+      assert env._inventory_state["ender_pearl"] == pytest.approx(0.8, rel=1e-5)
+      ```
+
+      **File:** tests/test_full_speedrun.py
+
+      **Validation:**
+      ```bash
+      PYTHONPATH=python uv run pytest tests/test_full_speedrun.py::TestInventoryPersistence -v
+      ```
+    priority: P0
+
+  # =============================================================================
+  # PRIORITY 1: Per-Stage Smoke Tests
+  # =============================================================================
+
+  - name: stage1-smoke-test
+    prompt: |
+      Run and validate Stage 1 (Basic Survival) functionality.
+
+      **Validation steps:**
+      1. Run stage 1 tests:
+         ```bash
+         PYTHONPATH=python uv run pytest tests/test_stage1_survival.py -v
+         ```
+
+      2. Verify all tests pass. If any fail, analyze and fix.
+
+      3. Run quick 100-episode smoke test:
+         ```python
+         from minecraft_sim.stage_envs import BasicSurvivalEnv
+         env = BasicSurvivalEnv()
+         for _ in range(100):
+             obs, info = env.reset()
+             for _ in range(100):
+                 obs, reward, done, trunc, info = env.step(env.action_space.sample())
+                 if done or trunc:
+                     break
+         print("Stage 1 smoke test passed")
+         ```
+
+      **Success criteria:** All stage 1 tests pass, smoke test completes without errors.
+    priority: P1
+    dependencies:
+      - fix-float-precision-tests
+
+  - name: stage2-smoke-test
+    prompt: |
+      Run and validate Stage 2 (Resource Gathering) functionality.
+
+      **Validation steps:**
+      1. Run stage 2 tests:
+         ```bash
+         PYTHONPATH=python uv run pytest tests/test_stage2_resources.py -v
+         ```
+
+      2. Verify all tests pass. If any fail, analyze and fix.
+
+      3. Run quick 100-episode smoke test with ResourceGatheringEnv.
+
+      **Success criteria:** All stage 2 tests pass, smoke test completes without errors.
+    priority: P1
+    dependencies:
+      - fix-float-precision-tests
+
+  - name: stage3-smoke-test
+    prompt: |
+      Run and validate Stage 3 (Nether Navigation) functionality.
+
+      **Validation steps:**
+      1. Run stage 3 tests:
+         ```bash
+         PYTHONPATH=python uv run pytest tests/test_stage3_nether.py tests/test_stage3_vec_reward.py -v
+         ```
+
+      2. Verify all tests pass. If any fail, analyze and fix.
+
+      3. Verify Nether portal mechanics work (portal_built, entered_nether flags).
+
+      **Success criteria:** All stage 3 tests pass, Nether transition works.
+    priority: P1
+    dependencies:
+      - fix-float-precision-tests
+
+  - name: stage4-smoke-test
+    prompt: |
+      Run and validate Stage 4 (Enderman/Stronghold) functionality.
+
+      **Validation steps:**
+      1. Run stage 4 tests:
+         ```bash
+         PYTHONPATH=python uv run pytest tests/test_stage4_enderman.py tests/test_stage4_stronghold.py tests/test_stage4_vector_portal_rewards.py -v
+         ```
+
+      2. Verify all tests pass. If any fail, analyze and fix.
+
+      3. Verify Enderman hunting and pearl collection mechanics.
+
+      **Success criteria:** All stage 4 tests pass.
+    priority: P1
+    dependencies:
+      - fix-float-precision-tests
+
+  - name: stage5-smoke-test
+    prompt: |
+      Run and validate Stage 5 (Stronghold Finding) functionality.
+
+      **Validation steps:**
+      1. Run stage 5 tests:
+         ```bash
+         PYTHONPATH=python uv run pytest tests/test_stage5_stronghold.py -v
+         ```
+
+      2. Verify triangulation, portal room finding, and portal activation mechanics.
+
+      3. Check eye of ender throwing and stronghold location logic.
+
+      **Success criteria:** All stage 5 tests pass (excluding skipped GPU tests).
+    priority: P1
+    dependencies:
+      - fix-float-precision-tests
+
+  - name: stage6-smoke-test
+    prompt: |
+      Run and validate Stage 6 (Dragon Fight) functionality.
+
+      **Validation steps:**
+      1. Run stage 6 tests:
+         ```bash
+         PYTHONPATH=python uv run pytest tests/test_stage6_dragon_enhanced.py -v
+         ```
+
+      2. Verify dragon fight mechanics: crystal destruction, dragon phases, combat.
+
+      3. Run VecDragonFightEnv smoke test:
+         ```python
+         from minecraft_sim import VecDragonFightEnv
+         env = VecDragonFightEnv(num_envs=4)
+         obs = env.reset()
+         for _ in range(100):
+             obs, rewards, dones, infos = env.step([0, 0, 0, 0])
+         print("Stage 6 smoke test passed")
+         ```
+
+      **Success criteria:** All stage 6 tests pass, vectorized env works.
+    priority: P1
+    dependencies:
+      - fix-float-precision-tests
+
+  # =============================================================================
+  # PRIORITY 2: Full Speedrun Validation
+  # =============================================================================
+
+  - name: full-speedrun-smoke-test
+    prompt: |
+      Run full speedrun integration tests.
+
+      **Validation:**
+      ```bash
+      PYTHONPATH=python uv run pytest tests/test_full_speedrun.py -v -m "not slow"
+      ```
+
+      Ensure:
+      1. Stage transitions work (1→2, 2→3, etc.)
+      2. Inventory persists across stage changes
+      3. Curriculum manager advances correctly
+      4. Seed determinism is maintained
+
+      **Success criteria:** All full speedrun tests pass (excluding slow tests).
+    priority: P2
+    dependencies:
+      - stage1-smoke-test
+      - stage2-smoke-test
+      - stage3-smoke-test
+      - stage4-smoke-test
+      - stage5-smoke-test
+      - stage6-smoke-test
+
+  - name: curriculum-integration-test
+    prompt: |
+      Validate CurriculumManager integration with all stages.
+
+      **Test script:**
+      ```python
+      from minecraft_sim.curriculum import CurriculumManager, StageID
+
+      cm = CurriculumManager()
+
+      # Test stage loading
+      for stage_id in StageID:
+          stage = cm.get_stage(stage_id)
+          assert stage is not None, f"Failed to load {stage_id}"
+          print(f"✓ {stage_id.name}: {stage.name}")
+
+      # Test progression
+      cm.start_training(StageID.BASIC_SURVIVAL)
+      for _ in range(10):
+          cm.record_episode(success=True, reward=100, ticks=1000)
+
+      if cm.should_advance():
+          new_stage = cm.advance_stage()
+          print(f"✓ Advanced to {new_stage.name}")
+
+      print("Curriculum integration test passed")
+      ```
+
+      **Validation:**
+      ```bash
+      PYTHONPATH=python uv run pytest tests/test_curriculum.py -v -k "CurriculumManager"
+      ```
+    priority: P2
+    dependencies:
+      - full-speedrun-smoke-test
+
+  # =============================================================================
+  # PRIORITY 3: Performance Benchmarks
+  # =============================================================================
+
+  - name: benchmark-stage-throughput
+    prompt: |
+      Create per-stage throughput benchmark script.
+
+      **File to create:** examples/benchmark_stages.py
+
+      ```python
+      #!/usr/bin/env python3
+      """Benchmark throughput for each curriculum stage."""
+      import sys
+      import time
+      from pathlib import Path
+
+      sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
+
+      import numpy as np
+      from minecraft_sim.curriculum import StageID
+      from minecraft_sim.speedrun_vec_env import SpeedrunVecEnv
+
+      def benchmark_stage(stage_id: StageID, num_envs: int = 64, num_steps: int = 1000) -> float:
+          """Benchmark a single stage, return steps/sec."""
+          env = SpeedrunVecEnv(num_envs=num_envs, initial_stage=stage_id)
+          env.reset()
+          actions = np.zeros(num_envs, dtype=np.int32)
+
+          start = time.perf_counter()
+          for _ in range(num_steps):
+              env.step(actions)
+          elapsed = time.perf_counter() - start
+
+          env.close()
+          return num_envs * num_steps / elapsed
+
+      if __name__ == "__main__":
+          print("Per-Stage Throughput Benchmark")
+          print("=" * 50)
+          print(f"{'Stage':<25} {'Steps/sec':>12}")
+          print("-" * 50)
+
+          for stage_id in StageID:
+              try:
+                  rate = benchmark_stage(stage_id)
+                  print(f"{stage_id.name:<25} {rate:>12,.0f}")
+              except Exception as e:
+                  print(f"{stage_id.name:<25} {'ERROR':>12} ({e})")
+
+          print("=" * 50)
+      ```
+
+      **Run:**
+      ```bash
+      PYTHONPATH=python uv run python examples/benchmark_stages.py
+      ```
+    priority: P3
+    dependencies:
+      - curriculum-integration-test
+
+  - name: update-status-md
+    prompt: |
+      Update STATUS.md with validation results.
+
+      After all tests pass, update STATUS.md:
+      1. Update test pass rate
+      2. Mark Phase 4 as complete
+      3. Add per-stage benchmark results
+
+      **File:** STATUS.md
+    priority: P3
+    dependencies:
+      - benchmark-stage-throughput

@@ -1,0 +1,925 @@
+#version 450
+
+/*
+ * inventory_full.comp - Complete Minecraft 1.8.9 inventory system
+ *
+ * Full inventory layout (42 slots total):
+ *   Slots 0-8:    Hotbar (9 slots)
+ *   Slots 9-35:   Main storage (27 slots)
+ *   Slots 36-39:  Armor (helmet=36, chestplate=37, leggings=38, boots=39)
+ *   Slot 40:      Offhand (shield slot, 1.9+ but included)
+ *   Slot 41:      Cursor slot (for drag operations)
+ *
+ * Memory layout per agent (256 bytes, aligned):
+ *   Offset 0-83:    item_ids[42]     (42 * 2 bytes = 84, padded to 84)
+ *   Offset 84-125:  counts[42]       (42 * 1 byte = 42, padded to 42)
+ *   Offset 126-209: damage[42]       (42 * 2 bytes = 84)
+ *   Offset 210-251: nbt_flags[42]    (42 * 1 byte = 42, for enchantments)
+ *   Offset 252:     selected_slot    (1 byte, 0-8)
+ *   Offset 253:     cursor_active    (1 byte, bool)
+ *   Offset 254-255: padding
+ *
+ * Stack limits by item category:
+ *   DEFAULT (64): blocks, resources
+ *   TOOLS (1): swords, pickaxes, axes, shovels, hoes, bows, fishing rods
+ *   ARMOR (1): helmets, chestplates, leggings, boots
+ *   SPECIAL_16 (16): ender pearls, eggs, snowballs, signs, banners
+ *   POTIONS (1): all potions
+ *   BUCKETS (16): buckets with contents (empty stack to 16)
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Inventory slot indices
+const uint HOTBAR_START = 0;
+const uint HOTBAR_END = 8;
+const uint MAIN_START = 9;
+const uint MAIN_END = 35;
+const uint ARMOR_HELMET = 36;
+const uint ARMOR_CHEST = 37;
+const uint ARMOR_LEGS = 38;
+const uint ARMOR_BOOTS = 39;
+const uint OFFHAND = 40;
+const uint CURSOR = 41;
+const uint INV_SIZE = 42;
+const uint INV_STRIDE = 64;  // 256 bytes / 4 = 64 uints
+
+// Stack size categories
+const uint STACK_64 = 64;
+const uint STACK_16 = 16;
+const uint STACK_1 = 1;
+
+// Operation codes
+const uint OP_NOP = 0;
+const uint OP_PICKUP_ITEM = 1;       // Add item to inventory, returns overflow
+const uint OP_DROP_ITEM = 2;         // Drop items, spawns entity
+const uint OP_SWAP_SLOTS = 3;        // Swap two slots
+const uint OP_SPLIT_STACK = 4;       // Half to cursor
+const uint OP_EQUIP_ARMOR = 5;       // Move item to appropriate armor slot
+const uint OP_USE_ITEM = 6;          // Consume/throw item
+const uint OP_MOVE_TO_CURSOR = 7;    // Pick up stack to cursor
+const uint OP_DROP_FROM_CURSOR = 8;  // Place cursor stack
+const uint OP_QUICK_MOVE = 9;        // Shift-click move to other section
+const uint OP_DROP_ONE = 10;         // Drop single item (Q key)
+const uint OP_HOTBAR_SWAP = 11;      // Number key swap with armor/etc
+
+// Item category ranges (Minecraft 1.8.9 item IDs)
+// These are approximate ranges for stack size determination
+const uint ITEM_DIAMOND_SWORD = 276;
+const uint ITEM_WOOD_SWORD = 268;
+const uint ITEM_STONE_SWORD = 272;
+const uint ITEM_IRON_SWORD = 267;
+const uint ITEM_GOLD_SWORD = 283;
+
+const uint ITEM_DIAMOND_PICK = 278;
+const uint ITEM_WOOD_PICK = 270;
+const uint ITEM_STONE_PICK = 274;
+const uint ITEM_IRON_PICK = 257;
+const uint ITEM_GOLD_PICK = 285;
+
+const uint ITEM_BOW = 261;
+const uint ITEM_FISHING_ROD = 346;
+const uint ITEM_FLINT_STEEL = 259;
+const uint ITEM_SHEARS = 359;
+
+const uint ITEM_LEATHER_HELMET = 298;
+const uint ITEM_LEATHER_CHEST = 299;
+const uint ITEM_LEATHER_LEGS = 300;
+const uint ITEM_LEATHER_BOOTS = 301;
+const uint ITEM_IRON_HELMET = 306;
+const uint ITEM_IRON_CHEST = 307;
+const uint ITEM_IRON_LEGS = 308;
+const uint ITEM_IRON_BOOTS = 309;
+const uint ITEM_DIAMOND_HELMET = 310;
+const uint ITEM_DIAMOND_CHEST = 311;
+const uint ITEM_DIAMOND_LEGS = 312;
+const uint ITEM_DIAMOND_BOOTS = 313;
+const uint ITEM_GOLD_HELMET = 314;
+const uint ITEM_GOLD_CHEST = 315;
+const uint ITEM_GOLD_LEGS = 316;
+const uint ITEM_GOLD_BOOTS = 317;
+const uint ITEM_CHAIN_HELMET = 302;
+const uint ITEM_CHAIN_CHEST = 303;
+const uint ITEM_CHAIN_LEGS = 304;
+const uint ITEM_CHAIN_BOOTS = 305;
+
+const uint ITEM_ENDER_PEARL = 368;
+const uint ITEM_EGG = 344;
+const uint ITEM_SNOWBALL = 332;
+const uint ITEM_SIGN = 323;
+
+const uint ITEM_POTION = 373;
+const uint ITEM_SPLASH_POTION = 438;
+const uint ITEM_BUCKET = 325;
+const uint ITEM_WATER_BUCKET = 326;
+const uint ITEM_LAVA_BUCKET = 327;
+const uint ITEM_MILK_BUCKET = 335;
+
+// Food items
+const uint ITEM_APPLE = 260;
+const uint ITEM_GOLDEN_APPLE = 322;
+const uint ITEM_BREAD = 297;
+const uint ITEM_PORKCHOP_COOKED = 320;
+const uint ITEM_STEAK = 364;
+const uint ITEM_CHICKEN_COOKED = 366;
+const uint ITEM_CARROT = 391;
+const uint ITEM_POTATO_BAKED = 393;
+const uint ITEM_MELON_SLICE = 360;
+const uint ITEM_COOKIE = 357;
+const uint ITEM_PUMPKIN_PIE = 400;
+const uint ITEM_MUSHROOM_STEW = 282;
+const uint ITEM_RABBIT_STEW = 413;
+const uint ITEM_CAKE = 354;
+
+// Use item result types
+const uint USE_NONE = 0;
+const uint USE_CONSUME_FOOD = 1;
+const uint USE_THROW_PROJECTILE = 2;
+const uint USE_PLACE_BLOCK = 3;
+const uint USE_DRINK_POTION = 4;
+const uint USE_USE_BUCKET = 5;
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+// Inventory data for all agents
+layout(set = 0, binding = 0) buffer InventoryBuffer {
+    uint data[];
+} inventories;
+
+// Operation requests
+layout(set = 0, binding = 1) buffer OperationBuffer {
+    uint operations[];  // Packed operation data
+} ops;
+
+// Operation results
+layout(set = 0, binding = 2) buffer ResultBuffer {
+    uint results[];  // Success, overflow count, spawned entity info
+} results;
+
+// Item metadata table (stack sizes, categories, armor type)
+// Format per item: max_stack | (category << 8) | (armor_slot << 16) | (food_value << 24)
+layout(set = 0, binding = 3) readonly buffer ItemMetadata {
+    uint item_data[];  // Indexed by item_id
+} item_meta;
+
+// Spawned item entities output buffer
+// When items are dropped, entity data is written here
+layout(set = 0, binding = 4) buffer SpawnedEntities {
+    uint entity_count;
+    uint entities[];  // item_id, count, x, y, z, vx, vy, vz per entity
+} spawned;
+
+// Agent position data (for drop calculations)
+layout(set = 0, binding = 5) readonly buffer AgentPositions {
+    float positions[];  // x, y, z, yaw, pitch per agent
+} agent_pos;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint num_agents;
+    uint num_operations;
+    uint tick;
+} push;
+
+// ============================================================================
+// Inventory Access Helpers
+// ============================================================================
+
+uint getInventoryOffset(uint agent_id) {
+    return agent_id * INV_STRIDE;
+}
+
+uint readItemId(uint base, uint slot) {
+    // item_ids at offset 0, 2 bytes each
+    uint word_offset = base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return (slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16);
+}
+
+void writeItemId(uint base, uint slot, uint item_id) {
+    uint word_offset = base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | (item_id & 0xFFFF);
+    } else {
+        word = (word & 0x0000FFFF) | (item_id << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+uint readCount(uint base, uint slot) {
+    // counts at offset 21 words (84 bytes / 4)
+    uint count_base = base + 21;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    return (word >> shift) & 0xFF;
+}
+
+void writeCount(uint base, uint slot, uint count) {
+    uint count_base = base + 21;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    word = (word & ~(0xFF << shift)) | ((count & 0xFF) << shift);
+    inventories.data[word_offset] = word;
+}
+
+uint readDamage(uint base, uint slot) {
+    // damage at offset 32 words (126 bytes / 4, rounded)
+    uint damage_base = base + 32;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return (slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16);
+}
+
+void writeDamage(uint base, uint slot, uint damage) {
+    uint damage_base = base + 32;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | (damage & 0xFFFF);
+    } else {
+        word = (word & 0x0000FFFF) | (damage << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+uint readSelectedSlot(uint base) {
+    // selected_slot at offset 63 words, byte 0 of that word
+    uint word = inventories.data[base + 63];
+    return word & 0xFF;
+}
+
+void writeSelectedSlot(uint base, uint slot) {
+    uint word = inventories.data[base + 63];
+    word = (word & 0xFFFFFF00) | (slot & 0xFF);
+    inventories.data[base + 63] = word;
+}
+
+bool isCursorActive(uint base) {
+    uint word = inventories.data[base + 63];
+    return ((word >> 8) & 0xFF) != 0;
+}
+
+void setCursorActive(uint base, bool is_active) {
+    uint word = inventories.data[base + 63];
+    word = (word & 0xFFFF00FF) | ((is_active ? 1u : 0u) << 8);
+    inventories.data[base + 63] = word;
+}
+
+// ============================================================================
+// Item Property Helpers
+// ============================================================================
+
+uint getMaxStackSize(uint item_id) {
+    if (item_id == 0) return 0;
+
+    // Check metadata table first
+    if (item_id < 512 && item_meta.item_data.length() > item_id) {
+        return item_meta.item_data[item_id] & 0xFF;
+    }
+
+    // Fallback: hardcoded stack sizes
+    // Tools (stack of 1)
+    if (item_id >= 256 && item_id <= 259) return STACK_1;  // Iron tools
+    if (item_id >= 267 && item_id <= 279) return STACK_1;  // All tools
+    if (item_id >= 283 && item_id <= 286) return STACK_1;  // Gold tools
+    if (item_id == ITEM_BOW) return STACK_1;
+    if (item_id == ITEM_FISHING_ROD) return STACK_1;
+    if (item_id == ITEM_FLINT_STEEL) return STACK_1;
+    if (item_id == ITEM_SHEARS) return STACK_1;
+
+    // Armor (stack of 1)
+    if (item_id >= 298 && item_id <= 317) return STACK_1;
+
+    // Special 16-stack items
+    if (item_id == ITEM_ENDER_PEARL) return STACK_16;
+    if (item_id == ITEM_EGG) return STACK_16;
+    if (item_id == ITEM_SNOWBALL) return STACK_16;
+    if (item_id == ITEM_SIGN) return STACK_16;
+
+    // Potions (stack of 1)
+    if (item_id == ITEM_POTION || item_id == ITEM_SPLASH_POTION) return STACK_1;
+
+    // Buckets
+    if (item_id == ITEM_BUCKET) return STACK_16;
+    if (item_id >= ITEM_WATER_BUCKET && item_id <= ITEM_MILK_BUCKET) return STACK_1;
+
+    // Mushroom stew / rabbit stew (stack of 1, have bowl)
+    if (item_id == ITEM_MUSHROOM_STEW || item_id == ITEM_RABBIT_STEW) return STACK_1;
+    if (item_id == ITEM_CAKE) return STACK_1;
+
+    return STACK_64;
+}
+
+// Returns the armor slot (36-39) this item can equip to, or 0xFF if not armor
+uint getArmorSlot(uint item_id) {
+    // Helmets
+    if (item_id == ITEM_LEATHER_HELMET || item_id == ITEM_CHAIN_HELMET ||
+        item_id == ITEM_IRON_HELMET || item_id == ITEM_DIAMOND_HELMET ||
+        item_id == ITEM_GOLD_HELMET) {
+        return ARMOR_HELMET;
+    }
+    // Chestplates
+    if (item_id == ITEM_LEATHER_CHEST || item_id == ITEM_CHAIN_CHEST ||
+        item_id == ITEM_IRON_CHEST || item_id == ITEM_DIAMOND_CHEST ||
+        item_id == ITEM_GOLD_CHEST) {
+        return ARMOR_CHEST;
+    }
+    // Leggings
+    if (item_id == ITEM_LEATHER_LEGS || item_id == ITEM_CHAIN_LEGS ||
+        item_id == ITEM_IRON_LEGS || item_id == ITEM_DIAMOND_LEGS ||
+        item_id == ITEM_GOLD_LEGS) {
+        return ARMOR_LEGS;
+    }
+    // Boots
+    if (item_id == ITEM_LEATHER_BOOTS || item_id == ITEM_CHAIN_BOOTS ||
+        item_id == ITEM_IRON_BOOTS || item_id == ITEM_DIAMOND_BOOTS ||
+        item_id == ITEM_GOLD_BOOTS) {
+        return ARMOR_BOOTS;
+    }
+    return 0xFF;
+}
+
+bool isFood(uint item_id) {
+    return item_id == ITEM_APPLE || item_id == ITEM_GOLDEN_APPLE ||
+           item_id == ITEM_BREAD || item_id == ITEM_PORKCHOP_COOKED ||
+           item_id == ITEM_STEAK || item_id == ITEM_CHICKEN_COOKED ||
+           item_id == ITEM_CARROT || item_id == ITEM_POTATO_BAKED ||
+           item_id == ITEM_MELON_SLICE || item_id == ITEM_COOKIE ||
+           item_id == ITEM_PUMPKIN_PIE || item_id == ITEM_MUSHROOM_STEW ||
+           item_id == ITEM_RABBIT_STEW || item_id == ITEM_CAKE;
+}
+
+uint getFoodValue(uint item_id) {
+    // Returns hunger points restored (half-shanks)
+    if (item_id == ITEM_APPLE) return 4;
+    if (item_id == ITEM_GOLDEN_APPLE) return 4;  // Plus absorption
+    if (item_id == ITEM_BREAD) return 5;
+    if (item_id == ITEM_PORKCHOP_COOKED) return 8;
+    if (item_id == ITEM_STEAK) return 8;
+    if (item_id == ITEM_CHICKEN_COOKED) return 6;
+    if (item_id == ITEM_CARROT) return 3;
+    if (item_id == ITEM_POTATO_BAKED) return 5;
+    if (item_id == ITEM_MELON_SLICE) return 2;
+    if (item_id == ITEM_COOKIE) return 2;
+    if (item_id == ITEM_PUMPKIN_PIE) return 8;
+    if (item_id == ITEM_MUSHROOM_STEW) return 6;
+    if (item_id == ITEM_RABBIT_STEW) return 10;
+    return 0;
+}
+
+bool isThrowable(uint item_id) {
+    return item_id == ITEM_ENDER_PEARL ||
+           item_id == ITEM_EGG ||
+           item_id == ITEM_SNOWBALL ||
+           item_id == ITEM_SPLASH_POTION;
+}
+
+// ============================================================================
+// Slot Operations
+// ============================================================================
+
+void clearSlot(uint base, uint slot) {
+    writeItemId(base, slot, 0);
+    writeCount(base, slot, 0);
+    writeDamage(base, slot, 0);
+}
+
+void copySlot(uint base, uint src, uint dst) {
+    writeItemId(base, dst, readItemId(base, src));
+    writeCount(base, dst, readCount(base, src));
+    writeDamage(base, dst, readDamage(base, src));
+}
+
+bool isEmpty(uint base, uint slot) {
+    return readItemId(base, slot) == 0;
+}
+
+bool canStack(uint base, uint slot, uint item_id, uint damage_val) {
+    if (isEmpty(base, slot)) return true;
+    if (readItemId(base, slot) != item_id) return false;
+    if (readDamage(base, slot) != damage_val) return false;
+    return readCount(base, slot) < getMaxStackSize(item_id);
+}
+
+// ============================================================================
+// Core Operations
+// ============================================================================
+
+// pickup_item: Add items to inventory, return overflow count
+// Tries hotbar first (for convenience), then main inventory
+// Returns: amount that couldn't fit (overflow)
+uint opPickupItem(uint base, uint item_id, uint count, uint damage_val) {
+    if (item_id == 0 || count == 0) return count;
+
+    uint max_stack = getMaxStackSize(item_id);
+    uint remaining = count;
+
+    // Phase 1: Stack with existing matching items
+    // Check hotbar first
+    for (uint i = HOTBAR_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (readItemId(base, i) == item_id && readDamage(base, i) == damage_val) {
+            uint current = readCount(base, i);
+            uint space = max_stack - current;
+            uint to_add = min(remaining, space);
+            if (to_add > 0) {
+                writeCount(base, i, current + to_add);
+                remaining -= to_add;
+            }
+        }
+    }
+
+    // Check main inventory
+    for (uint i = MAIN_START; i <= MAIN_END && remaining > 0; i++) {
+        if (readItemId(base, i) == item_id && readDamage(base, i) == damage_val) {
+            uint current = readCount(base, i);
+            uint space = max_stack - current;
+            uint to_add = min(remaining, space);
+            if (to_add > 0) {
+                writeCount(base, i, current + to_add);
+                remaining -= to_add;
+            }
+        }
+    }
+
+    // Phase 2: Place in empty slots
+    // Hotbar empty slots
+    for (uint i = HOTBAR_START; i <= HOTBAR_END && remaining > 0; i++) {
+        if (isEmpty(base, i)) {
+            uint to_add = min(remaining, max_stack);
+            writeItemId(base, i, item_id);
+            writeCount(base, i, to_add);
+            writeDamage(base, i, damage_val);
+            remaining -= to_add;
+        }
+    }
+
+    // Main inventory empty slots
+    for (uint i = MAIN_START; i <= MAIN_END && remaining > 0; i++) {
+        if (isEmpty(base, i)) {
+            uint to_add = min(remaining, max_stack);
+            writeItemId(base, i, item_id);
+            writeCount(base, i, to_add);
+            writeDamage(base, i, damage_val);
+            remaining -= to_add;
+        }
+    }
+
+    return remaining;  // Overflow
+}
+
+// drop_item: Remove items from slot, queue entity spawn
+// Returns: actual count dropped
+uint opDropItem(uint base, uint agent_id, uint slot, uint count) {
+    if (slot >= INV_SIZE) return 0;
+    if (isEmpty(base, slot)) return 0;
+
+    uint item_id = readItemId(base, slot);
+    uint current = readCount(base, slot);
+    uint damage_val = readDamage(base, slot);
+
+    uint to_drop = min(count, current);
+    if (to_drop == 0) return 0;
+
+    // Update inventory
+    if (to_drop >= current) {
+        clearSlot(base, slot);
+    } else {
+        writeCount(base, slot, current - to_drop);
+    }
+
+    // Queue entity spawn (atomic increment)
+    uint spawn_idx = atomicAdd(spawned.entity_count, 1);
+    uint spawn_base = spawn_idx * 8;
+
+    // Get agent position for spawn location
+    uint pos_base = agent_id * 5;
+    float px = agent_pos.positions[pos_base];
+    float py = agent_pos.positions[pos_base + 1];
+    float pz = agent_pos.positions[pos_base + 2];
+    float yaw = agent_pos.positions[pos_base + 3];
+
+    // Spawn slightly in front of player with random-ish velocity
+    float drop_dist = 0.5;
+    float vx = -sin(yaw) * 0.3;
+    float vy = 0.2;  // Slight upward toss
+    float vz = cos(yaw) * 0.3;
+
+    spawned.entities[spawn_base + 0] = item_id;
+    spawned.entities[spawn_base + 1] = to_drop;
+    spawned.entities[spawn_base + 2] = floatBitsToUint(px + vx * drop_dist);
+    spawned.entities[spawn_base + 3] = floatBitsToUint(py + 1.2);  // Eye height
+    spawned.entities[spawn_base + 4] = floatBitsToUint(pz + vz * drop_dist);
+    spawned.entities[spawn_base + 5] = floatBitsToUint(vx);
+    spawned.entities[spawn_base + 6] = floatBitsToUint(vy);
+    spawned.entities[spawn_base + 7] = floatBitsToUint(vz);
+
+    return to_drop;
+}
+
+// swap_slots: Exchange contents of two slots
+uint opSwapSlots(uint base, uint slot1, uint slot2) {
+    if (slot1 >= INV_SIZE || slot2 >= INV_SIZE) return 0;
+    if (slot1 == slot2) return 1;  // No-op success
+
+    uint id1 = readItemId(base, slot1);
+    uint count1 = readCount(base, slot1);
+    uint damage1 = readDamage(base, slot1);
+
+    copySlot(base, slot2, slot1);
+
+    writeItemId(base, slot2, id1);
+    writeCount(base, slot2, count1);
+    writeDamage(base, slot2, damage1);
+
+    return 1;
+}
+
+// split_stack: Move half of stack to cursor
+uint opSplitStack(uint base, uint slot) {
+    if (slot >= INV_SIZE) return 0;
+    if (isEmpty(base, slot)) return 0;
+    if (!isEmpty(base, CURSOR)) return 0;  // Cursor must be empty
+
+    uint item_id = readItemId(base, slot);
+    uint count = readCount(base, slot);
+    uint damage_val = readDamage(base, slot);
+
+    if (count < 2) return 0;  // Can't split stack of 1
+
+    uint half_count = count / 2;
+    uint remain = count - half_count;
+
+    // Move half to cursor
+    writeItemId(base, CURSOR, item_id);
+    writeCount(base, CURSOR, half_count);
+    writeDamage(base, CURSOR, damage_val);
+    setCursorActive(base, true);
+
+    // Update source slot
+    writeCount(base, slot, remain);
+
+    return half_count;
+}
+
+// equip_armor: Move item from slot to appropriate armor slot
+// Returns: 1 on success, 0 if item isn't armor or can't equip
+uint opEquipArmor(uint base, uint slot) {
+    if (slot >= INV_SIZE) return 0;
+    if (isEmpty(base, slot)) return 0;
+
+    uint item_id = readItemId(base, slot);
+    uint armor_slot = getArmorSlot(item_id);
+
+    if (armor_slot == 0xFF) return 0;  // Not an armor piece
+
+    // Swap with current armor (if any)
+    return opSwapSlots(base, slot, armor_slot);
+}
+
+// use_item: Consume food, throw projectile, etc.
+// Returns: use_type in low byte, additional data in high bytes
+uint opUseItem(uint base, uint agent_id, uint slot) {
+    if (slot >= INV_SIZE) return USE_NONE;
+    if (isEmpty(base, slot)) return USE_NONE;
+
+    uint item_id = readItemId(base, slot);
+    uint count = readCount(base, slot);
+
+    // Food consumption
+    if (isFood(item_id)) {
+        uint food_val = getFoodValue(item_id);
+
+        // Consume one
+        if (count > 1) {
+            writeCount(base, slot, count - 1);
+        } else {
+            clearSlot(base, slot);
+
+            // Some foods return containers
+            if (item_id == ITEM_MUSHROOM_STEW || item_id == ITEM_RABBIT_STEW) {
+                // Return bowl (item 281)
+                writeItemId(base, slot, 281);
+                writeCount(base, slot, 1);
+                writeDamage(base, slot, 0);
+            }
+        }
+
+        return USE_CONSUME_FOOD | (food_val << 8);
+    }
+
+    // Throwable items
+    if (isThrowable(item_id)) {
+        // Consume one
+        if (count > 1) {
+            writeCount(base, slot, count - 1);
+        } else {
+            clearSlot(base, slot);
+        }
+
+        // Queue projectile spawn (use same mechanism as drop)
+        uint spawn_idx = atomicAdd(spawned.entity_count, 1);
+        uint spawn_base = spawn_idx * 8;
+
+        uint pos_base = agent_id * 5;
+        float px = agent_pos.positions[pos_base];
+        float py = agent_pos.positions[pos_base + 1];
+        float pz = agent_pos.positions[pos_base + 2];
+        float yaw = agent_pos.positions[pos_base + 3];
+        float pitch = agent_pos.positions[pos_base + 4];
+
+        // Calculate throw velocity (stronger than drop)
+        float throw_speed = 1.5;
+        float vx = -sin(yaw) * cos(pitch) * throw_speed;
+        float vy = -sin(pitch) * throw_speed;
+        float vz = cos(yaw) * cos(pitch) * throw_speed;
+
+        spawned.entities[spawn_base + 0] = item_id | 0x80000000;  // Mark as projectile
+        spawned.entities[spawn_base + 1] = 1;
+        spawned.entities[spawn_base + 2] = floatBitsToUint(px);
+        spawned.entities[spawn_base + 3] = floatBitsToUint(py + 1.6);  // Eye height
+        spawned.entities[spawn_base + 4] = floatBitsToUint(pz);
+        spawned.entities[spawn_base + 5] = floatBitsToUint(vx);
+        spawned.entities[spawn_base + 6] = floatBitsToUint(vy);
+        spawned.entities[spawn_base + 7] = floatBitsToUint(vz);
+
+        return USE_THROW_PROJECTILE | (item_id << 8);
+    }
+
+    // Potions
+    if (item_id == ITEM_POTION) {
+        uint damage_val = readDamage(base, slot);  // Potion type
+
+        if (count > 1) {
+            writeCount(base, slot, count - 1);
+        } else {
+            // Return glass bottle (item 374)
+            writeItemId(base, slot, 374);
+            writeCount(base, slot, 1);
+            writeDamage(base, slot, 0);
+        }
+
+        return USE_DRINK_POTION | (damage_val << 8);
+    }
+
+    return USE_NONE;
+}
+
+// move_to_cursor: Pick up entire stack to cursor
+uint opMoveToCursor(uint base, uint slot) {
+    if (slot >= INV_SIZE) return 0;
+    if (isEmpty(base, slot)) return 0;
+    if (!isEmpty(base, CURSOR)) return 0;
+
+    copySlot(base, slot, CURSOR);
+    clearSlot(base, slot);
+    setCursorActive(base, true);
+
+    return 1;
+}
+
+// drop_from_cursor: Place cursor stack into slot
+// If slot has same item, try to stack; if different, swap
+uint opDropFromCursor(uint base, uint slot) {
+    if (slot >= INV_SIZE) return 0;
+    if (isEmpty(base, CURSOR)) return 0;
+
+    uint cursor_id = readItemId(base, CURSOR);
+    uint cursor_count = readCount(base, CURSOR);
+    uint cursor_damage = readDamage(base, CURSOR);
+
+    if (isEmpty(base, slot)) {
+        // Simple move
+        copySlot(base, CURSOR, slot);
+        clearSlot(base, CURSOR);
+        setCursorActive(base, false);
+        return 1;
+    }
+
+    uint slot_id = readItemId(base, slot);
+    uint slot_count = readCount(base, slot);
+    uint slot_damage = readDamage(base, slot);
+
+    // Try to stack if same item
+    if (slot_id == cursor_id && slot_damage == cursor_damage) {
+        uint max_stack = getMaxStackSize(slot_id);
+        uint space = max_stack - slot_count;
+        uint to_add = min(cursor_count, space);
+
+        if (to_add > 0) {
+            writeCount(base, slot, slot_count + to_add);
+
+            if (to_add >= cursor_count) {
+                clearSlot(base, CURSOR);
+                setCursorActive(base, false);
+            } else {
+                writeCount(base, CURSOR, cursor_count - to_add);
+            }
+        }
+        return to_add;
+    }
+
+    // Different items: swap
+    copySlot(base, slot, CURSOR);
+    writeItemId(base, slot, cursor_id);
+    writeCount(base, slot, cursor_count);
+    writeDamage(base, slot, cursor_damage);
+
+    return 1;
+}
+
+// quick_move: Shift-click to move item to other section
+uint opQuickMove(uint base, uint slot) {
+    if (slot >= INV_SIZE) return 0;
+    if (isEmpty(base, slot)) return 0;
+
+    uint item_id = readItemId(base, slot);
+    uint count = readCount(base, slot);
+    uint damage_val = readDamage(base, slot);
+
+    // Check if it's armor - try to equip
+    uint armor_slot = getArmorSlot(item_id);
+    if (armor_slot != 0xFF && isEmpty(base, armor_slot)) {
+        copySlot(base, slot, armor_slot);
+        clearSlot(base, slot);
+        return 1;
+    }
+
+    // From hotbar -> main inventory
+    if (slot <= HOTBAR_END) {
+        for (uint i = MAIN_START; i <= MAIN_END; i++) {
+            if (canStack(base, i, item_id, damage_val)) {
+                if (isEmpty(base, i)) {
+                    copySlot(base, slot, i);
+                    clearSlot(base, slot);
+                    return 1;
+                } else {
+                    // Stack
+                    uint current = readCount(base, i);
+                    uint max_stack = getMaxStackSize(item_id);
+                    uint space = max_stack - current;
+                    uint to_move = min(count, space);
+                    writeCount(base, i, current + to_move);
+                    count -= to_move;
+                    if (count == 0) {
+                        clearSlot(base, slot);
+                        return 1;
+                    }
+                    writeCount(base, slot, count);
+                }
+            }
+        }
+    }
+    // From main -> hotbar
+    else if (slot >= MAIN_START && slot <= MAIN_END) {
+        for (uint i = HOTBAR_START; i <= HOTBAR_END; i++) {
+            if (canStack(base, i, item_id, damage_val)) {
+                if (isEmpty(base, i)) {
+                    copySlot(base, slot, i);
+                    clearSlot(base, slot);
+                    return 1;
+                } else {
+                    uint current = readCount(base, i);
+                    uint max_stack = getMaxStackSize(item_id);
+                    uint space = max_stack - current;
+                    uint to_move = min(count, space);
+                    writeCount(base, i, current + to_move);
+                    count -= to_move;
+                    if (count == 0) {
+                        clearSlot(base, slot);
+                        return 1;
+                    }
+                    writeCount(base, slot, count);
+                }
+            }
+        }
+    }
+    // From armor -> inventory
+    else if (slot >= ARMOR_HELMET && slot <= ARMOR_BOOTS) {
+        uint overflow = opPickupItem(base, item_id, count, damage_val);
+        if (overflow < count) {
+            if (overflow == 0) {
+                clearSlot(base, slot);
+            } else {
+                writeCount(base, slot, overflow);
+            }
+            return count - overflow;
+        }
+    }
+
+    return 0;
+}
+
+// drop_one: Drop single item (Q key)
+uint opDropOne(uint base, uint agent_id, uint slot) {
+    return opDropItem(base, agent_id, slot, 1);
+}
+
+// hotbar_swap: Number key to swap slot with hotbar position
+uint opHotbarSwap(uint base, uint slot, uint hotbar_num) {
+    if (hotbar_num > 8) return 0;
+    if (slot >= INV_SIZE) return 0;
+
+    uint hotbar_slot = HOTBAR_START + hotbar_num;
+    return opSwapSlots(base, slot, hotbar_slot);
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+void main() {
+    uint op_idx = gl_GlobalInvocationID.x;
+    if (op_idx >= push.num_operations) return;
+
+    // Operation format (5 uints = 20 bytes):
+    //   [0]: agent_id
+    //   [1]: opcode | (slot1 << 8) | (slot2 << 16) | (count << 24)
+    //   [2]: item_id (for pickup)
+    //   [3]: damage_value (for pickup)
+    //   [4]: reserved/flags
+
+    uint op_base = op_idx * 5;
+    uint agent_id = ops.operations[op_base];
+    uint packed = ops.operations[op_base + 1];
+    uint arg_item = ops.operations[op_base + 2];
+    uint arg_damage = ops.operations[op_base + 3];
+
+    uint opcode = packed & 0xFF;
+    uint slot1 = (packed >> 8) & 0xFF;
+    uint slot2 = (packed >> 16) & 0xFF;
+    uint count = (packed >> 24) & 0xFF;
+    if (count == 0) count = 64;  // Default to full stack
+
+    if (agent_id >= push.num_agents) {
+        results.results[op_idx * 2] = 0;
+        results.results[op_idx * 2 + 1] = 0;
+        return;
+    }
+
+    uint inv_base = getInventoryOffset(agent_id);
+    uint result = 0;
+    uint extra = 0;
+
+    switch (opcode) {
+        case OP_NOP:
+            result = 1;
+            break;
+
+        case OP_PICKUP_ITEM:
+            extra = opPickupItem(inv_base, arg_item, count, arg_damage);
+            result = (extra < count) ? 1 : 0;  // Success if any items added
+            break;
+
+        case OP_DROP_ITEM:
+            result = opDropItem(inv_base, agent_id, slot1, count);
+            break;
+
+        case OP_SWAP_SLOTS:
+            result = opSwapSlots(inv_base, slot1, slot2);
+            break;
+
+        case OP_SPLIT_STACK:
+            result = opSplitStack(inv_base, slot1);
+            break;
+
+        case OP_EQUIP_ARMOR:
+            result = opEquipArmor(inv_base, slot1);
+            break;
+
+        case OP_USE_ITEM:
+            result = opUseItem(inv_base, agent_id, slot1);
+            break;
+
+        case OP_MOVE_TO_CURSOR:
+            result = opMoveToCursor(inv_base, slot1);
+            break;
+
+        case OP_DROP_FROM_CURSOR:
+            result = opDropFromCursor(inv_base, slot1);
+            break;
+
+        case OP_QUICK_MOVE:
+            result = opQuickMove(inv_base, slot1);
+            break;
+
+        case OP_DROP_ONE:
+            result = opDropOne(inv_base, agent_id, slot1);
+            break;
+
+        case OP_HOTBAR_SWAP:
+            result = opHotbarSwap(inv_base, slot1, slot2);
+            break;
+    }
+
+    results.results[op_idx * 2] = result;
+    results.results[op_idx * 2 + 1] = extra;
+}

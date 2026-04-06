@@ -1,0 +1,537 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// Block Breaking Compute Shader
+// Processes block mining for multiple agents in parallel
+// Input: player positions, look directions, tools, blocks being mined
+// State: break_progress per agent
+// Output: broken flags, drops to spawn
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Block hardness values (MC 1.8.9 compatible)
+// Index by block_id, -1.0 = unbreakable
+const float HARDNESS_TABLE[256] = float[256](
+    0.0,   // 0: Air
+    1.5,   // 1: Stone
+    0.6,   // 2: Grass
+    0.5,   // 3: Dirt
+    2.0,   // 4: Cobblestone
+    2.0,   // 5: Planks
+    0.0,   // 6: Sapling
+    -1.0,  // 7: Bedrock
+    100.0, // 8: Flowing Water
+    100.0, // 9: Water
+    100.0, // 10: Flowing Lava
+    100.0, // 11: Lava
+    0.5,   // 12: Sand
+    0.5,   // 13: Gravel
+    3.0,   // 14: Gold Ore
+    3.0,   // 15: Iron Ore
+    3.0,   // 16: Coal Ore
+    2.0,   // 17: Log
+    0.2,   // 18: Leaves
+    0.5,   // 19: Sponge
+    0.3,   // 20: Glass
+    3.0,   // 21: Lapis Ore
+    3.0,   // 22: Lapis Block
+    3.5,   // 23: Dispenser
+    0.8,   // 24: Sandstone
+    0.8,   // 25: Note Block
+    0.2,   // 26: Bed
+    0.7,   // 27: Powered Rail
+    0.7,   // 28: Detector Rail
+    0.5,   // 29: Sticky Piston
+    0.0,   // 30: Cobweb
+    0.0,   // 31: Tall Grass
+    0.0,   // 32: Dead Bush
+    0.5,   // 33: Piston
+    0.5,   // 34: Piston Head
+    0.8,   // 35: Wool
+    0.0,   // 36: Moving Piston (tech block)
+    0.0,   // 37: Dandelion
+    0.0,   // 38: Poppy
+    0.0,   // 39: Brown Mushroom
+    0.0,   // 40: Red Mushroom
+    3.0,   // 41: Gold Block
+    5.0,   // 42: Iron Block
+    2.0,   // 43: Double Slab
+    2.0,   // 44: Slab
+    2.0,   // 45: Bricks
+    0.0,   // 46: TNT
+    1.5,   // 47: Bookshelf
+    2.0,   // 48: Mossy Cobblestone
+    -1.0,  // 49: Obsidian (50.0 in vanilla, use -1 for efficiency)
+    0.0,   // 50: Torch
+    0.0,   // 51: Fire
+    0.0,   // 52: Monster Spawner (5.0)
+    2.0,   // 53: Oak Stairs
+    2.5,   // 54: Chest
+    0.0,   // 55: Redstone Wire
+    3.0,   // 56: Diamond Ore
+    5.0,   // 57: Diamond Block
+    2.5,   // 58: Crafting Table
+    0.0,   // 59: Wheat
+    0.6,   // 60: Farmland
+    3.5,   // 61: Furnace
+    3.5,   // 62: Lit Furnace
+    1.0,   // 63: Sign Post
+    3.0,   // 64: Oak Door
+    0.5,   // 65: Ladder
+    0.7,   // 66: Rail
+    2.0,   // 67: Cobblestone Stairs
+    1.0,   // 68: Wall Sign
+    0.5,   // 69: Lever
+    0.5,   // 70: Stone Pressure Plate
+    5.0,   // 71: Iron Door
+    0.5,   // 72: Wood Pressure Plate
+    3.0,   // 73: Redstone Ore
+    3.0,   // 74: Lit Redstone Ore
+    0.0,   // 75: Unlit Redstone Torch
+    0.0,   // 76: Redstone Torch
+    0.5,   // 77: Stone Button
+    0.1,   // 78: Snow Layer
+    0.5,   // 79: Ice
+    0.2,   // 80: Snow Block
+    0.0,   // 81: Cactus (0.4)
+    0.6,   // 82: Clay
+    0.0,   // 83: Sugar Cane
+    0.8,   // 84: Jukebox
+    2.0,   // 85: Fence
+    1.0,   // 86: Pumpkin
+    0.5,   // 87: Netherrack
+    0.5,   // 88: Soul Sand
+    0.3,   // 89: Glowstone
+    -1.0,  // 90: Portal
+    1.0,   // 91: Jack O Lantern
+    0.5,   // 92: Cake
+    0.0,   // 93: Unpowered Repeater
+    0.0,   // 94: Powered Repeater
+    0.3,   // 95: Stained Glass
+    2.5,   // 96: Trapdoor
+    1.5,   // 97: Monster Egg
+    1.5,   // 98: Stone Bricks
+    0.0,   // 99: Brown Mushroom Block
+    0.0,   // 100: Red Mushroom Block
+    5.0,   // 101: Iron Bars
+    0.3,   // 102: Glass Pane
+    0.3,   // 103: Melon
+    0.0,   // 104: Pumpkin Stem
+    0.0,   // 105: Melon Stem
+    0.0,   // 106: Vines
+    2.0,   // 107: Fence Gate
+    2.0,   // 108: Brick Stairs
+    1.5,   // 109: Stone Brick Stairs
+    2.5,   // 110: Mycelium
+    0.0,   // 111: Lily Pad
+    2.0,   // 112: Nether Brick
+    2.0,   // 113: Nether Brick Fence
+    2.0,   // 114: Nether Brick Stairs
+    0.0,   // 115: Nether Wart
+    2.5,   // 116: Enchanting Table
+    0.5,   // 117: Brewing Stand
+    0.5,   // 118: Cauldron
+    -1.0,  // 119: End Portal
+    -1.0,  // 120: End Portal Frame
+    3.0,   // 121: End Stone
+    3.0,   // 122: Dragon Egg
+    0.3,   // 123: Redstone Lamp
+    0.3,   // 124: Lit Redstone Lamp
+    2.0,   // 125: Double Wood Slab
+    2.0,   // 126: Wood Slab
+    0.0,   // 127: Cocoa
+    2.0,   // 128: Sandstone Stairs
+    3.0,   // 129: Emerald Ore
+    2.5,   // 130: Ender Chest
+    0.0,   // 131: Tripwire Hook
+    0.0,   // 132: Tripwire
+    5.0,   // 133: Emerald Block
+    2.0,   // 134: Spruce Stairs
+    2.0,   // 135: Birch Stairs
+    2.0,   // 136: Jungle Stairs
+    -1.0,  // 137: Command Block
+    5.0,   // 138: Beacon
+    2.0,   // 139: Cobblestone Wall
+    0.0,   // 140: Flower Pot
+    0.0,   // 141: Carrots
+    0.0,   // 142: Potatoes
+    0.5,   // 143: Wood Button
+    1.0,   // 144: Skull
+    5.0,   // 145: Anvil
+    2.5,   // 146: Trapped Chest
+    0.5,   // 147: Light Weighted Pressure Plate
+    0.5,   // 148: Heavy Weighted Pressure Plate
+    0.0,   // 149: Unpowered Comparator
+    0.0,   // 150: Powered Comparator
+    0.0,   // 151: Daylight Detector
+    5.0,   // 152: Redstone Block
+    3.0,   // 153: Quartz Ore
+    3.5,   // 154: Hopper
+    0.8,   // 155: Quartz Block
+    0.8,   // 156: Quartz Stairs
+    0.7,   // 157: Activator Rail
+    3.5,   // 158: Dropper
+    0.8,   // 159: Stained Clay
+    0.3,   // 160: Stained Glass Pane
+    2.0,   // 161: Leaves2 (Acacia/Dark Oak)
+    2.0,   // 162: Log2 (Acacia/Dark Oak)
+    2.0,   // 163: Acacia Stairs
+    2.0,   // 164: Dark Oak Stairs
+    5.0,   // 165: Slime Block
+    -1.0,  // 166: Barrier
+    5.0,   // 167: Iron Trapdoor
+    1.25,  // 168: Prismarine
+    0.3,   // 169: Sea Lantern
+    2.0,   // 170: Hay Block
+    0.8,   // 171: Carpet
+    0.6,   // 172: Hardened Clay
+    5.0,   // 173: Coal Block
+    0.8,   // 174: Packed Ice
+    0.0,   // 175: Double Plant
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 176-185
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 186-195
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 196-205
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 206-215
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 216-225
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 226-235
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // 236-245
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  // 246-255
+);
+
+// Tool types
+const uint TOOL_NONE = 0;
+const uint TOOL_WOOD_PICKAXE = 1;
+const uint TOOL_STONE_PICKAXE = 2;
+const uint TOOL_IRON_PICKAXE = 3;
+const uint TOOL_DIAMOND_PICKAXE = 4;
+const uint TOOL_GOLD_PICKAXE = 5;
+const uint TOOL_WOOD_AXE = 6;
+const uint TOOL_STONE_AXE = 7;
+const uint TOOL_IRON_AXE = 8;
+const uint TOOL_DIAMOND_AXE = 9;
+const uint TOOL_GOLD_AXE = 10;
+const uint TOOL_WOOD_SHOVEL = 11;
+const uint TOOL_STONE_SHOVEL = 12;
+const uint TOOL_IRON_SHOVEL = 13;
+const uint TOOL_DIAMOND_SHOVEL = 14;
+const uint TOOL_GOLD_SHOVEL = 15;
+const uint TOOL_SHEARS = 16;
+const uint TOOL_SWORD = 17;
+
+// Tool tiers for speed multiplier
+const float TOOL_TIER_SPEED[6] = float[6](
+    1.0,   // 0: Hand/None
+    2.0,   // 1: Wood
+    4.0,   // 2: Stone
+    6.0,   // 3: Iron
+    8.0,   // 4: Diamond
+    12.0   // 5: Gold
+);
+
+// Block material types for tool matching
+const uint MAT_NONE = 0;
+const uint MAT_STONE = 1;
+const uint MAT_WOOD = 2;
+const uint MAT_DIRT = 3;
+const uint MAT_PLANT = 4;
+const uint MAT_WOOL = 5;
+
+struct AgentInput {
+    vec3 position;     // Player eye position
+    float _pad0;
+    vec3 look_dir;     // Normalized look direction
+    float _pad1;
+    uint tool_id;      // Currently held tool
+    uint target_block; // Block ID being mined (from world lookup)
+    ivec3 target_pos;  // World position of target block
+    uint mining_face;  // Face being mined (0-5)
+};
+
+struct BreakingState {
+    float progress;    // 0.0 to 1.0, resets if target changes
+    ivec3 last_target; // Last targeted block position
+    uint last_block;   // Last targeted block ID
+    float _pad[3];
+};
+
+struct BreakResult {
+    uint broken;       // 1 if block was broken this tick
+    uint block_id;     // Block that was broken
+    ivec3 position;    // Where it was broken
+    uint drop_count;   // Number of drops
+    uint drop_ids[4];  // Up to 4 different drop item IDs
+    uint drop_amounts[4]; // Amount per drop type
+};
+
+struct WorldModification {
+    ivec3 position;
+    uint new_block_id;
+    uint new_metadata;
+    uint modification_type; // 0=break, 1=place, 2=update
+    uint agent_id;
+    uint _pad;
+};
+
+// Input/Output bindings
+layout(set = 0, binding = 0, std430) readonly buffer AgentInputBuffer {
+    AgentInput agents[];
+} agent_input;
+
+layout(set = 0, binding = 1, std430) buffer BreakingStateBuffer {
+    BreakingState states[];
+} breaking_state;
+
+layout(set = 0, binding = 2, std430) writeonly buffer BreakResultBuffer {
+    BreakResult results[];
+} break_results;
+
+layout(set = 0, binding = 3, std430) buffer WorldModBuffer {
+    uint modification_count;
+    uint _pad[3];
+    WorldModification modifications[];
+} world_mods;
+
+layout(push_constant) uniform PushConstants {
+    float delta_time;      // Time since last tick in seconds (typically 0.05 for 20 TPS)
+    uint agent_count;      // Number of is_active agents
+    uint max_modifications; // Max world modifications per tick
+} pc;
+
+// Get tool tier (0-5) from tool ID
+uint getToolTier(uint tool_id) {
+    if (tool_id == TOOL_NONE) return 0;
+    if (tool_id <= 5) return tool_id; // Pickaxes
+    if (tool_id <= 10) return tool_id - 5; // Axes
+    if (tool_id <= 15) return tool_id - 10; // Shovels
+    return 1; // Shears/Sword = wood tier
+}
+
+// Check if tool is correct type for block
+bool isCorrectToolType(uint tool_id, uint block_id) {
+    // Pickaxes for stone-type blocks
+    if (tool_id >= TOOL_WOOD_PICKAXE && tool_id <= TOOL_GOLD_PICKAXE) {
+        if (block_id == 1 || block_id == 4 || block_id == 48 || // Stone, Cobble, Mossy Cobble
+            block_id == 98 || // Stone Bricks
+            (block_id >= 14 && block_id <= 16) || // Ores
+            block_id == 21 || block_id == 22 || // Lapis
+            block_id == 56 || block_id == 57 || // Diamond
+            block_id == 41 || block_id == 42 || // Gold/Iron blocks
+            block_id == 49) // Obsidian
+            return true;
+    }
+    // Axes for wood-type blocks
+    if (tool_id >= TOOL_WOOD_AXE && tool_id <= TOOL_GOLD_AXE) {
+        if (block_id == 5 || block_id == 17 || block_id == 162 || // Planks, Log, Log2
+            block_id == 47 || block_id == 54 || block_id == 58 || // Bookshelf, Chest, Crafting
+            block_id == 85 || block_id == 107) // Fence, Gate
+            return true;
+    }
+    // Shovels for dirt-type blocks
+    if (tool_id >= TOOL_WOOD_SHOVEL && tool_id <= TOOL_GOLD_SHOVEL) {
+        if (block_id == 2 || block_id == 3 || block_id == 12 || block_id == 13 || // Grass, Dirt, Sand, Gravel
+            block_id == 60 || block_id == 78 || block_id == 80 || block_id == 82) // Farmland, Snow, Clay
+            return true;
+    }
+    // Shears for leaves and wool
+    if (tool_id == TOOL_SHEARS) {
+        if (block_id == 18 || block_id == 161 || block_id == 35 || block_id == 30) // Leaves, Wool, Cobweb
+            return true;
+    }
+    return false;
+}
+
+// Check if block requires specific tool tier to drop
+uint getRequiredTier(uint block_id) {
+    // Iron and up required
+    if (block_id == 56 || block_id == 57) return 3; // Diamond
+    if (block_id == 14 || block_id == 21 || block_id == 22) return 3; // Gold ore, Lapis
+    if (block_id == 129 || block_id == 133) return 3; // Emerald
+    if (block_id == 49) return 4; // Obsidian requires diamond
+    // Stone required
+    if (block_id == 15 || block_id == 16) return 2; // Iron ore, Coal ore
+    if (block_id == 73 || block_id == 74) return 3; // Redstone ore
+    // Wood pickaxe okay
+    if (block_id == 1 || block_id == 4 || block_id == 48) return 1; // Stone, Cobble
+    return 0;
+}
+
+// Calculate break speed multiplier
+float getBreakSpeedMultiplier(uint tool_id, uint block_id) {
+    float multiplier = 1.0;
+
+    if (isCorrectToolType(tool_id, block_id)) {
+        uint tier = getToolTier(tool_id);
+        multiplier = TOOL_TIER_SPEED[tier];
+    }
+
+    return multiplier;
+}
+
+// Calculate drops for a broken block
+void calculateDrops(uint block_id, uint tool_tier, out uint drop_count, out uint drop_ids[4], out uint drop_amounts[4]) {
+    drop_count = 0;
+    for (int i = 0; i < 4; i++) {
+        drop_ids[i] = 0;
+        drop_amounts[i] = 0;
+    }
+
+    // Check if correct tier is met
+    uint req_tier = getRequiredTier(block_id);
+    if (tool_tier < req_tier) {
+        return; // No drops without correct tool
+    }
+
+    // Map block drops (simplified)
+    switch (block_id) {
+        case 1: // Stone -> Cobblestone
+            drop_count = 1;
+            drop_ids[0] = 4;
+            drop_amounts[0] = 1;
+            break;
+        case 2: // Grass -> Dirt
+            drop_count = 1;
+            drop_ids[0] = 3;
+            drop_amounts[0] = 1;
+            break;
+        case 3: // Dirt
+        case 4: // Cobblestone
+        case 5: // Planks
+        case 17: // Log
+            drop_count = 1;
+            drop_ids[0] = block_id;
+            drop_amounts[0] = 1;
+            break;
+        case 14: // Gold Ore
+            drop_count = 1;
+            drop_ids[0] = 14;
+            drop_amounts[0] = 1;
+            break;
+        case 15: // Iron Ore
+            drop_count = 1;
+            drop_ids[0] = 15;
+            drop_amounts[0] = 1;
+            break;
+        case 16: // Coal Ore -> Coal
+            drop_count = 1;
+            drop_ids[0] = 263; // Coal item ID
+            drop_amounts[0] = 1;
+            break;
+        case 21: // Lapis Ore -> Lapis (4-8, use 6)
+            drop_count = 1;
+            drop_ids[0] = 351; // Dye with meta 4
+            drop_amounts[0] = 6;
+            break;
+        case 56: // Diamond Ore -> Diamond
+            drop_count = 1;
+            drop_ids[0] = 264; // Diamond item ID
+            drop_amounts[0] = 1;
+            break;
+        case 73: // Redstone Ore -> Redstone (4-5)
+        case 74:
+            drop_count = 1;
+            drop_ids[0] = 331; // Redstone dust
+            drop_amounts[0] = 5;
+            break;
+        case 18: // Leaves -> possibly sapling (1/20 chance, handle in CPU)
+        case 161:
+            drop_count = 0;
+            break;
+        case 13: // Gravel -> possibly flint (1/10 chance, handle in CPU)
+            drop_count = 1;
+            drop_ids[0] = 13;
+            drop_amounts[0] = 1;
+            break;
+        default:
+            drop_count = 1;
+            drop_ids[0] = block_id;
+            drop_amounts[0] = 1;
+            break;
+    }
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    if (agent_id >= pc.agent_count) return;
+
+    AgentInput agent_in = agent_input.agents[agent_id];
+    BreakingState state = breaking_state.states[agent_id];
+
+    // Initialize result to not broken
+    BreakResult result;
+    result.broken = 0;
+    result.block_id = 0;
+    result.position = ivec3(0);
+    result.drop_count = 0;
+    for (int i = 0; i < 4; i++) {
+        result.drop_ids[i] = 0;
+        result.drop_amounts[i] = 0;
+    }
+
+    uint block_id = agent_in.target_block;
+    ivec3 target_pos = agent_in.target_pos;
+
+    // Check if target changed
+    if (state.last_target != target_pos || state.last_block != block_id) {
+        state.progress = 0.0;
+        state.last_target = target_pos;
+        state.last_block = block_id;
+    }
+
+    // Skip unbreakable or air blocks
+    float hardness = HARDNESS_TABLE[block_id];
+    if (hardness < 0.0 || block_id == 0) {
+        breaking_state.states[agent_id] = state;
+        break_results.results[agent_id] = result;
+        return;
+    }
+
+    // Calculate break time
+    float speed_mult = getBreakSpeedMultiplier(agent_in.tool_id, block_id);
+
+    // Base break time formula: hardness * 1.5 / speed_mult (if correct tool)
+    // or hardness * 5.0 / speed_mult (if wrong tool)
+    float break_time;
+    if (isCorrectToolType(agent_in.tool_id, block_id)) {
+        break_time = hardness * 1.5 / speed_mult;
+    } else {
+        break_time = hardness * 5.0;
+    }
+
+    // Minimum break time
+    if (break_time < 0.05) break_time = 0.05;
+
+    // Add progress based on delta time
+    float progress_increment = pc.delta_time / break_time;
+    state.progress += progress_increment;
+
+    // Check if broken
+    if (state.progress >= 1.0) {
+        result.broken = 1;
+        result.block_id = block_id;
+        result.position = target_pos;
+
+        // Calculate drops
+        uint tool_tier = getToolTier(agent_in.tool_id);
+        calculateDrops(block_id, tool_tier, result.drop_count, result.drop_ids, result.drop_amounts);
+
+        // Queue world modification
+        uint mod_index = atomicAdd(world_mods.modification_count, 1);
+        if (mod_index < pc.max_modifications) {
+            WorldModification mod;
+            mod.position = target_pos;
+            mod.new_block_id = 0; // Air
+            mod.new_metadata = 0;
+            mod.modification_type = 0; // Break
+            mod.agent_id = agent_id;
+            mod._pad = 0;
+            world_mods.modifications[mod_index] = mod;
+        }
+
+        // Reset state
+        state.progress = 0.0;
+    }
+
+    // Write outputs
+    breaking_state.states[agent_id] = state;
+    break_results.results[agent_id] = result;
+}

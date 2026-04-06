@@ -1,0 +1,927 @@
+#version 450
+#extension GL_EXT_shader_atomic_int64 : enable
+
+// Nether Fortress structure generation compute shader
+// Generates Minecraft 1.8.9-style fortress using BFS piece expansion
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+#define MAX_PIECES 100
+#define MAX_EXITS_PER_PIECE 4
+#define MIN_BLAZE_ROOMS 2
+#define MIN_WART_ROOMS 1
+
+// Block IDs
+#define AIR 0
+#define LAVA 11
+#define NETHER_BRICK 112
+#define NETHER_BRICK_FENCE 113
+#define NETHER_BRICK_STAIRS 114
+#define SOUL_SAND 88
+#define NETHER_WART 115
+#define MOB_SPAWNER 52
+#define CHEST 54
+
+// Piece types
+#define PIECE_ENTRANCE 0
+#define PIECE_STRAIGHT_CORRIDOR 1
+#define PIECE_TURN_CORRIDOR 2
+#define PIECE_STAIRS 3
+#define PIECE_BRIDGE 4
+#define PIECE_BLAZE_SPAWNER_ROOM 5
+#define PIECE_NETHER_WART_ROOM 6
+#define PIECE_CROSSING 7
+#define PIECE_BALCONY 8
+
+// Exit directions (relative to piece facing)
+#define EXIT_NORTH 0
+#define EXIT_SOUTH 1
+#define EXIT_EAST 2
+#define EXIT_WEST 3
+#define EXIT_UP 4
+#define EXIT_DOWN 5
+
+// Piece flags
+#define PIECE_FLAG_PLACED 1
+#define PIECE_FLAG_PROCESSED 2
+#define PIECE_FLAG_HAS_LOOT 4
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct PieceExit {
+    ivec3 offset;       // Position offset from piece origin
+    uint direction;     // Exit direction
+    uint allowed_types; // Bitmask of piece types that can connect
+};
+
+struct FortressPiece {
+    ivec3 position;     // World position of piece origin
+    uint piece_type;    // Type of this piece
+    uint rotation;      // 0-3 (90 degree increments)
+    uint flags;         // PIECE_FLAG_*
+    uint depth;         // BFS depth from entrance
+    uint parent_idx;    // Index of parent piece
+    ivec3 size;         // Bounding box size
+    uint exit_count;    // Number of exits
+    PieceExit exits[MAX_EXITS_PER_PIECE];
+};
+
+struct FortressLayout {
+    uint piece_count;
+    uint blaze_room_count;
+    uint wart_room_count;
+    uint generation_seed;
+    ivec3 origin;
+    uint generation_pass;
+    uint queue_head;
+    uint queue_tail;
+    FortressPiece pieces[MAX_PIECES];
+};
+
+struct BlockPlacement {
+    ivec3 position;
+    uint block_id;
+    uint metadata;
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(std430, binding = 0) buffer FortressBuffer {
+    FortressLayout fortress;
+};
+
+layout(std430, binding = 1) buffer BlockBuffer {
+    uint block_count;
+    BlockPlacement blocks[];
+};
+
+layout(std430, binding = 2) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+layout(push_constant) uniform PushConstants {
+    ivec3 chunk_origin;
+    uint seed;
+    uint max_pieces;
+    uint generation_mode;   // 0=init, 1=expand, 2=place_blocks
+    float bridge_lava_level;
+} pc;
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+uint pcg_hash(uint val) {
+    uint state = val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint random_uint(inout uint seed) {
+    seed = pcg_hash(seed);
+    return seed;
+}
+
+float random_float(inout uint seed) {
+    return float(random_uint(seed)) / float(0xFFFFFFFFu);
+}
+
+int random_int_range(inout uint seed, int min_val, int max_val) {
+    return min_val + int(random_uint(seed) % uint(max_val - min_val + 1));
+}
+
+// ============================================================================
+// Rotation Helpers
+// ============================================================================
+
+ivec3 rotate_offset(ivec3 offset, uint rotation) {
+    switch (rotation) {
+        case 0: return offset;
+        case 1: return ivec3(-offset.z, offset.y, offset.x);
+        case 2: return ivec3(-offset.x, offset.y, -offset.z);
+        case 3: return ivec3(offset.z, offset.y, -offset.x);
+    }
+    return offset;
+}
+
+uint rotate_direction(uint dir, uint rotation) {
+    if (dir >= EXIT_UP) return dir; // Vertical unchanged
+    return (dir + rotation) & 3;
+}
+
+// ============================================================================
+// Piece Definitions
+// ============================================================================
+
+void get_piece_info(uint piece_type, out ivec3 size, out uint exit_count) {
+    switch (piece_type) {
+        case PIECE_ENTRANCE:
+            size = ivec3(13, 14, 13);
+            exit_count = 4;
+            break;
+        case PIECE_STRAIGHT_CORRIDOR:
+            size = ivec3(5, 4, 5);
+            exit_count = 2;
+            break;
+        case PIECE_TURN_CORRIDOR:
+            size = ivec3(5, 4, 8);
+            exit_count = 2;
+            break;
+        case PIECE_STAIRS:
+            size = ivec3(5, 8, 5);
+            exit_count = 2;
+            break;
+        case PIECE_BRIDGE:
+            size = ivec3(5, 4, 19);
+            exit_count = 2;
+            break;
+        case PIECE_BLAZE_SPAWNER_ROOM:
+            size = ivec3(9, 6, 9);
+            exit_count = 4;
+            break;
+        case PIECE_NETHER_WART_ROOM:
+            size = ivec3(7, 5, 7);
+            exit_count = 2;
+            break;
+        case PIECE_CROSSING:
+            size = ivec3(7, 5, 7);
+            exit_count = 4;
+            break;
+        case PIECE_BALCONY:
+            size = ivec3(5, 8, 5);
+            exit_count = 1;
+            break;
+        default:
+            size = ivec3(5, 4, 5);
+            exit_count = 2;
+    }
+}
+
+void init_piece_exits(inout FortressPiece piece) {
+    switch (piece.piece_type) {
+        case PIECE_ENTRANCE:
+            // Four exits from entrance hall
+            piece.exits[0] = PieceExit(ivec3(6, 1, 0), EXIT_NORTH, 0x7F);
+            piece.exits[1] = PieceExit(ivec3(6, 1, 12), EXIT_SOUTH, 0x7F);
+            piece.exits[2] = PieceExit(ivec3(0, 1, 6), EXIT_WEST, 0x7F);
+            piece.exits[3] = PieceExit(ivec3(12, 1, 6), EXIT_EAST, 0x7F);
+            break;
+
+        case PIECE_STRAIGHT_CORRIDOR:
+            piece.exits[0] = PieceExit(ivec3(2, 0, 0), EXIT_NORTH, 0x7F);
+            piece.exits[1] = PieceExit(ivec3(2, 0, 4), EXIT_SOUTH, 0x7F);
+            break;
+
+        case PIECE_TURN_CORRIDOR:
+            piece.exits[0] = PieceExit(ivec3(2, 0, 0), EXIT_NORTH, 0x7F);
+            piece.exits[1] = PieceExit(ivec3(0, 0, 5), EXIT_WEST, 0x7F);
+            break;
+
+        case PIECE_STAIRS:
+            piece.exits[0] = PieceExit(ivec3(2, 0, 0), EXIT_NORTH, 0x7F);
+            piece.exits[1] = PieceExit(ivec3(2, 4, 4), EXIT_SOUTH | (EXIT_UP << 4), 0x7F);
+            break;
+
+        case PIECE_BRIDGE:
+            piece.exits[0] = PieceExit(ivec3(2, 0, 0), EXIT_NORTH, 0x7F);
+            piece.exits[1] = PieceExit(ivec3(2, 0, 18), EXIT_SOUTH, 0x7F);
+            break;
+
+        case PIECE_BLAZE_SPAWNER_ROOM:
+            piece.exits[0] = PieceExit(ivec3(4, 0, 0), EXIT_NORTH, 0x3F);
+            piece.exits[1] = PieceExit(ivec3(4, 0, 8), EXIT_SOUTH, 0x3F);
+            piece.exits[2] = PieceExit(ivec3(0, 0, 4), EXIT_WEST, 0x3F);
+            piece.exits[3] = PieceExit(ivec3(8, 0, 4), EXIT_EAST, 0x3F);
+            break;
+
+        case PIECE_NETHER_WART_ROOM:
+            piece.exits[0] = PieceExit(ivec3(3, 0, 0), EXIT_NORTH, 0x3F);
+            piece.exits[1] = PieceExit(ivec3(3, 0, 6), EXIT_SOUTH, 0x3F);
+            break;
+
+        case PIECE_CROSSING:
+            piece.exits[0] = PieceExit(ivec3(3, 0, 0), EXIT_NORTH, 0x7F);
+            piece.exits[1] = PieceExit(ivec3(3, 0, 6), EXIT_SOUTH, 0x7F);
+            piece.exits[2] = PieceExit(ivec3(0, 0, 3), EXIT_WEST, 0x7F);
+            piece.exits[3] = PieceExit(ivec3(6, 0, 3), EXIT_EAST, 0x7F);
+            break;
+
+        case PIECE_BALCONY:
+            piece.exits[0] = PieceExit(ivec3(2, 0, 0), EXIT_NORTH, 0x7F);
+            break;
+    }
+}
+
+// ============================================================================
+// Collision Detection
+// ============================================================================
+
+bool pieces_overlap(FortressPiece a, FortressPiece b) {
+    ivec3 a_min = a.position;
+    ivec3 a_max = a.position + a.size;
+    ivec3 b_min = b.position;
+    ivec3 b_max = b.position + b.size;
+
+    return all(lessThan(a_min, b_max)) && all(lessThan(b_min, a_max));
+}
+
+bool would_collide(FortressPiece candidate) {
+    for (uint i = 0; i < fortress.piece_count; i++) {
+        if ((fortress.pieces[i].flags & PIECE_FLAG_PLACED) != 0) {
+            if (pieces_overlap(candidate, fortress.pieces[i])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Piece Generation
+// ============================================================================
+
+uint select_piece_type(inout uint seed, uint allowed_mask, uint depth) {
+    // Weight special rooms based on current counts
+    float blaze_weight = fortress.blaze_room_count < MIN_BLAZE_ROOMS ? 0.15 : 0.02;
+    float wart_weight = fortress.wart_room_count < MIN_WART_ROOMS ? 0.1 : 0.02;
+
+    // Bridges more likely at medium depths
+    float bridge_weight = (depth > 2 && depth < 6) ? 0.1 : 0.02;
+
+    float r = random_float(seed);
+    float cumulative = 0.0;
+
+    // Check blaze room
+    if ((allowed_mask & (1 << PIECE_BLAZE_SPAWNER_ROOM)) != 0) {
+        cumulative += blaze_weight;
+        if (r < cumulative) return PIECE_BLAZE_SPAWNER_ROOM;
+    }
+
+    // Check wart room
+    if ((allowed_mask & (1 << PIECE_NETHER_WART_ROOM)) != 0) {
+        cumulative += wart_weight;
+        if (r < cumulative) return PIECE_NETHER_WART_ROOM;
+    }
+
+    // Check bridge
+    if ((allowed_mask & (1 << PIECE_BRIDGE)) != 0) {
+        cumulative += bridge_weight;
+        if (r < cumulative) return PIECE_BRIDGE;
+    }
+
+    // Otherwise random from remaining
+    uint types[9];
+    uint type_count = 0;
+    for (uint t = 0; t < 9; t++) {
+        if ((allowed_mask & (1 << t)) != 0) {
+            types[type_count++] = t;
+        }
+    }
+
+    if (type_count == 0) return PIECE_STRAIGHT_CORRIDOR;
+    return types[random_uint(seed) % type_count];
+}
+
+bool try_add_piece(uint parent_idx, uint exit_idx, inout uint seed) {
+    if (fortress.piece_count >= pc.max_pieces) return false;
+
+    FortressPiece parent = fortress.pieces[parent_idx];
+    PieceExit exit = parent.exits[exit_idx];
+
+    // Calculate connection position
+    ivec3 exit_world = parent.position + rotate_offset(exit.offset, parent.rotation);
+    uint exit_dir = rotate_direction(exit.direction & 0xF, parent.rotation);
+
+    // Select piece type
+    uint new_type = select_piece_type(seed, exit.allowed_types, parent.depth + 1);
+
+    // Create candidate piece
+    FortressPiece candidate;
+    candidate.piece_type = new_type;
+    candidate.rotation = (exit_dir + 2) & 3; // Face back toward parent
+    candidate.flags = PIECE_FLAG_PLACED;
+    candidate.depth = parent.depth + 1;
+    candidate.parent_idx = parent_idx;
+
+    ivec3 size;
+    uint exit_cnt;
+    get_piece_info(new_type, size, exit_cnt);
+    candidate.size = size;
+    candidate.exit_count = exit_cnt;
+
+    // Position relative to exit
+    ivec3 entry_offset;
+    switch (exit_dir) {
+        case EXIT_NORTH: entry_offset = ivec3(-size.x/2, 0, -size.z); break;
+        case EXIT_SOUTH: entry_offset = ivec3(-size.x/2, 0, 0); break;
+        case EXIT_EAST:  entry_offset = ivec3(0, 0, -size.z/2); break;
+        case EXIT_WEST:  entry_offset = ivec3(-size.x, 0, -size.z/2); break;
+        default:         entry_offset = ivec3(0); break;
+    }
+
+    if ((exit.direction & 0xF0) == (EXIT_UP << 4)) {
+        entry_offset.y = 4; // Stairs go up
+    }
+
+    candidate.position = exit_world + entry_offset;
+
+    // Initialize exits
+    init_piece_exits(candidate);
+
+    // Collision check
+    if (would_collide(candidate)) {
+        return false;
+    }
+
+    // Add to layout
+    uint idx = atomicAdd(fortress.piece_count, 1);
+    if (idx >= MAX_PIECES) {
+        atomicMax(fortress.piece_count, MAX_PIECES);
+        return false;
+    }
+
+    fortress.pieces[idx] = candidate;
+
+    // Update counts
+    if (new_type == PIECE_BLAZE_SPAWNER_ROOM) {
+        atomicAdd(fortress.blaze_room_count, 1);
+    } else if (new_type == PIECE_NETHER_WART_ROOM) {
+        atomicAdd(fortress.wart_room_count, 1);
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Block Placement Functions
+// ============================================================================
+
+void place_block(ivec3 pos, uint block_id, uint metadata) {
+    uint idx = atomicAdd(block_count, 1);
+    if (idx < 65536) { // Max blocks buffer
+        blocks[idx].position = pos;
+        blocks[idx].block_id = block_id;
+        blocks[idx].metadata = metadata;
+    }
+}
+
+void place_hollow_box(ivec3 origin, ivec3 size, uint wall_block) {
+    for (int x = 0; x < size.x; x++) {
+        for (int y = 0; y < size.y; y++) {
+            for (int z = 0; z < size.z; z++) {
+                bool is_wall = x == 0 || x == size.x - 1 ||
+                              y == 0 || y == size.y - 1 ||
+                              z == 0 || z == size.z - 1;
+                uint block = is_wall ? wall_block : AIR;
+                place_block(origin + ivec3(x, y, z), block, 0);
+            }
+        }
+    }
+}
+
+void place_straight_corridor(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Floor
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Walls
+    for (int y = 1; y < 4; y++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(0, y, z), NETHER_BRICK, 0);
+            place_block(p + ivec3(4, y, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Ceiling
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(x, 3, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Interior air
+    for (int x = 1; x < 4; x++) {
+        for (int y = 1; y < 3; y++) {
+            for (int z = 0; z < 5; z++) {
+                place_block(p + ivec3(x, y, z), AIR, 0);
+            }
+        }
+    }
+}
+
+void place_turn_corridor(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // L-shaped floor
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+    for (int x = 0; x < 3; x++) {
+        for (int z = 5; z < 8; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Walls and ceiling
+    for (int y = 1; y < 4; y++) {
+        // Main corridor walls
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(0, y, z), NETHER_BRICK, 0);
+            place_block(p + ivec3(4, y, z), NETHER_BRICK, 0);
+        }
+        // Turn section
+        for (int z = 5; z < 8; z++) {
+            place_block(p + ivec3(2, y, z), NETHER_BRICK, 0);
+        }
+        for (int x = 0; x < 3; x++) {
+            place_block(p + ivec3(x, y, 7), NETHER_BRICK, 0);
+        }
+    }
+
+    // Ceiling
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(x, 3, z), NETHER_BRICK, 0);
+        }
+    }
+    for (int x = 0; x < 3; x++) {
+        for (int z = 5; z < 8; z++) {
+            place_block(p + ivec3(x, 3, z), NETHER_BRICK, 0);
+        }
+    }
+}
+
+void place_stairs(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Base section
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 5; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Ascending stairs
+    for (int step = 0; step < 4; step++) {
+        int y = step;
+        int z = step;
+        // Step surface
+        for (int x = 1; x < 4; x++) {
+            place_block(p + ivec3(x, y, z), NETHER_BRICK_STAIRS, 0);
+        }
+        // Walls at this level
+        place_block(p + ivec3(0, y + 1, z), NETHER_BRICK, 0);
+        place_block(p + ivec3(4, y + 1, z), NETHER_BRICK, 0);
+    }
+
+    // Upper landing
+    for (int x = 0; x < 5; x++) {
+        place_block(p + ivec3(x, 4, 4), NETHER_BRICK, 0);
+    }
+
+    // Enclosure walls
+    for (int y = 0; y < 8; y++) {
+        place_block(p + ivec3(0, y, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(4, y, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(0, y, 4), NETHER_BRICK, 0);
+        place_block(p + ivec3(4, y, 4), NETHER_BRICK, 0);
+    }
+}
+
+void place_bridge(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Bridge deck - full floor with railing
+    for (int z = 0; z < 19; z++) {
+        // Floor
+        for (int x = 0; x < 5; x++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+        // Fence railings
+        place_block(p + ivec3(0, 1, z), NETHER_BRICK_FENCE, 0);
+        place_block(p + ivec3(4, 1, z), NETHER_BRICK_FENCE, 0);
+    }
+
+    // Support pillars every 6 blocks (if above lava)
+    for (int z = 3; z < 19; z += 6) {
+        // Pillar down to lava level
+        for (int y = -1; y > int(pc.bridge_lava_level) - int(p.y) - 5; y--) {
+            place_block(p + ivec3(0, y, z), NETHER_BRICK, 0);
+            place_block(p + ivec3(4, y, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Arches at entry points
+    for (int x = 1; x < 4; x++) {
+        place_block(p + ivec3(x, 2, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(x, 2, 18), NETHER_BRICK, 0);
+    }
+}
+
+void place_blaze_spawner_room(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Floor
+    for (int x = 0; x < 9; x++) {
+        for (int z = 0; z < 9; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Walls
+    for (int y = 1; y < 6; y++) {
+        for (int x = 0; x < 9; x++) {
+            place_block(p + ivec3(x, y, 0), NETHER_BRICK, 0);
+            place_block(p + ivec3(x, y, 8), NETHER_BRICK, 0);
+        }
+        for (int z = 1; z < 8; z++) {
+            place_block(p + ivec3(0, y, z), NETHER_BRICK, 0);
+            place_block(p + ivec3(8, y, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Ceiling
+    for (int x = 0; x < 9; x++) {
+        for (int z = 0; z < 9; z++) {
+            place_block(p + ivec3(x, 5, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Four corner pillars
+    for (int y = 1; y < 5; y++) {
+        place_block(p + ivec3(2, y, 2), NETHER_BRICK, 0);
+        place_block(p + ivec3(6, y, 2), NETHER_BRICK, 0);
+        place_block(p + ivec3(2, y, 6), NETHER_BRICK, 0);
+        place_block(p + ivec3(6, y, 6), NETHER_BRICK, 0);
+    }
+
+    // Central platform with spawner
+    for (int x = 3; x < 6; x++) {
+        for (int z = 3; z < 6; z++) {
+            place_block(p + ivec3(x, 1, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Fence around spawner
+    place_block(p + ivec3(3, 2, 3), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(5, 2, 3), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(3, 2, 5), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(5, 2, 5), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(4, 2, 3), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(4, 2, 5), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(3, 2, 4), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(5, 2, 4), NETHER_BRICK_FENCE, 0);
+
+    // Blaze spawner at center
+    place_block(p + ivec3(4, 2, 4), MOB_SPAWNER, 61); // metadata 61 = blaze
+}
+
+void place_nether_wart_room(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Floor
+    for (int x = 0; x < 7; x++) {
+        for (int z = 0; z < 7; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Walls
+    for (int y = 1; y < 5; y++) {
+        for (int x = 0; x < 7; x++) {
+            place_block(p + ivec3(x, y, 0), NETHER_BRICK, 0);
+            place_block(p + ivec3(x, y, 6), NETHER_BRICK, 0);
+        }
+        for (int z = 1; z < 6; z++) {
+            place_block(p + ivec3(0, y, z), NETHER_BRICK, 0);
+            place_block(p + ivec3(6, y, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Ceiling
+    for (int x = 0; x < 7; x++) {
+        for (int z = 0; z < 7; z++) {
+            place_block(p + ivec3(x, 4, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Soul sand platform with stairs on sides
+    for (int x = 2; x < 5; x++) {
+        for (int z = 2; z < 5; z++) {
+            // Soul sand
+            place_block(p + ivec3(x, 1, z), SOUL_SAND, 0);
+            // Nether wart on top
+            place_block(p + ivec3(x, 2, z), NETHER_WART, 0);
+        }
+    }
+
+    // Staircase down to farm
+    place_block(p + ivec3(3, 0, 1), NETHER_BRICK_STAIRS, 2);
+    place_block(p + ivec3(3, 0, 5), NETHER_BRICK_STAIRS, 3);
+
+    // Chest with loot
+    place_block(p + ivec3(1, 1, 3), CHEST, 0);
+}
+
+void place_entrance(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Large entrance hall floor
+    for (int x = 0; x < 13; x++) {
+        for (int z = 0; z < 13; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Walls
+    for (int y = 1; y < 14; y++) {
+        for (int x = 0; x < 13; x++) {
+            place_block(p + ivec3(x, y, 0), NETHER_BRICK, 0);
+            place_block(p + ivec3(x, y, 12), NETHER_BRICK, 0);
+        }
+        for (int z = 1; z < 12; z++) {
+            place_block(p + ivec3(0, y, z), NETHER_BRICK, 0);
+            place_block(p + ivec3(12, y, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Ceiling
+    for (int x = 0; x < 13; x++) {
+        for (int z = 0; z < 13; z++) {
+            place_block(p + ivec3(x, 13, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Four internal pillars
+    for (int y = 1; y < 13; y++) {
+        place_block(p + ivec3(3, y, 3), NETHER_BRICK, 0);
+        place_block(p + ivec3(9, y, 3), NETHER_BRICK, 0);
+        place_block(p + ivec3(3, y, 9), NETHER_BRICK, 0);
+        place_block(p + ivec3(9, y, 9), NETHER_BRICK, 0);
+    }
+
+    // Doorway openings (clear blocks for exits)
+    for (int y = 1; y < 4; y++) {
+        for (int i = -1; i <= 1; i++) {
+            place_block(p + ivec3(6 + i, y, 0), AIR, 0);
+            place_block(p + ivec3(6 + i, y, 12), AIR, 0);
+            place_block(p + ivec3(0, y, 6 + i), AIR, 0);
+            place_block(p + ivec3(12, y, 6 + i), AIR, 0);
+        }
+    }
+}
+
+void place_crossing(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Floor
+    for (int x = 0; x < 7; x++) {
+        for (int z = 0; z < 7; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Partial walls with openings
+    for (int y = 1; y < 5; y++) {
+        // Corner posts
+        place_block(p + ivec3(0, y, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(6, y, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(0, y, 6), NETHER_BRICK, 0);
+        place_block(p + ivec3(6, y, 6), NETHER_BRICK, 0);
+
+        // Wall segments (with gaps for passages)
+        place_block(p + ivec3(1, y, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(5, y, 0), NETHER_BRICK, 0);
+        place_block(p + ivec3(1, y, 6), NETHER_BRICK, 0);
+        place_block(p + ivec3(5, y, 6), NETHER_BRICK, 0);
+        place_block(p + ivec3(0, y, 1), NETHER_BRICK, 0);
+        place_block(p + ivec3(0, y, 5), NETHER_BRICK, 0);
+        place_block(p + ivec3(6, y, 1), NETHER_BRICK, 0);
+        place_block(p + ivec3(6, y, 5), NETHER_BRICK, 0);
+    }
+
+    // Ceiling
+    for (int x = 0; x < 7; x++) {
+        for (int z = 0; z < 7; z++) {
+            place_block(p + ivec3(x, 4, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Central pillar
+    for (int y = 1; y < 4; y++) {
+        place_block(p + ivec3(3, y, 3), NETHER_BRICK, 0);
+    }
+}
+
+void place_balcony(FortressPiece piece) {
+    ivec3 p = piece.position;
+
+    // Floor with partial coverage
+    for (int x = 0; x < 5; x++) {
+        for (int z = 0; z < 3; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+    }
+
+    // Back wall
+    for (int y = 1; y < 8; y++) {
+        for (int x = 0; x < 5; x++) {
+            place_block(p + ivec3(x, y, 0), NETHER_BRICK, 0);
+        }
+    }
+
+    // Side walls (partial)
+    for (int y = 1; y < 5; y++) {
+        place_block(p + ivec3(0, y, 1), NETHER_BRICK, 0);
+        place_block(p + ivec3(0, y, 2), NETHER_BRICK, 0);
+        place_block(p + ivec3(4, y, 1), NETHER_BRICK, 0);
+        place_block(p + ivec3(4, y, 2), NETHER_BRICK, 0);
+    }
+
+    // Fence railing at edge
+    for (int x = 0; x < 5; x++) {
+        place_block(p + ivec3(x, 1, 2), NETHER_BRICK_FENCE, 0);
+    }
+
+    // Balcony extends out into open air
+    for (int x = 1; x < 4; x++) {
+        for (int z = 3; z < 5; z++) {
+            place_block(p + ivec3(x, 0, z), NETHER_BRICK, 0);
+        }
+        place_block(p + ivec3(x, 1, 4), NETHER_BRICK_FENCE, 0);
+    }
+    place_block(p + ivec3(1, 1, 3), NETHER_BRICK_FENCE, 0);
+    place_block(p + ivec3(3, 1, 3), NETHER_BRICK_FENCE, 0);
+}
+
+void place_piece_blocks(uint piece_idx) {
+    FortressPiece piece = fortress.pieces[piece_idx];
+
+    switch (piece.piece_type) {
+        case PIECE_ENTRANCE:
+            place_entrance(piece);
+            break;
+        case PIECE_STRAIGHT_CORRIDOR:
+            place_straight_corridor(piece);
+            break;
+        case PIECE_TURN_CORRIDOR:
+            place_turn_corridor(piece);
+            break;
+        case PIECE_STAIRS:
+            place_stairs(piece);
+            break;
+        case PIECE_BRIDGE:
+            place_bridge(piece);
+            break;
+        case PIECE_BLAZE_SPAWNER_ROOM:
+            place_blaze_spawner_room(piece);
+            break;
+        case PIECE_NETHER_WART_ROOM:
+            place_nether_wart_room(piece);
+            break;
+        case PIECE_CROSSING:
+            place_crossing(piece);
+            break;
+        case PIECE_BALCONY:
+            place_balcony(piece);
+            break;
+    }
+}
+
+// ============================================================================
+// Main Entry Points
+// ============================================================================
+
+void init_fortress() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    fortress.piece_count = 0;
+    fortress.blaze_room_count = 0;
+    fortress.wart_room_count = 0;
+    fortress.generation_seed = pc.seed;
+    fortress.origin = pc.chunk_origin;
+    fortress.generation_pass = 0;
+    fortress.queue_head = 0;
+    fortress.queue_tail = 0;
+
+    // Create entrance piece
+    FortressPiece entrance;
+    entrance.position = pc.chunk_origin;
+    entrance.piece_type = PIECE_ENTRANCE;
+    entrance.rotation = 0;
+    entrance.flags = PIECE_FLAG_PLACED;
+    entrance.depth = 0;
+    entrance.parent_idx = 0;
+
+    ivec3 size;
+    uint exit_cnt;
+    get_piece_info(PIECE_ENTRANCE, size, exit_cnt);
+    entrance.size = size;
+    entrance.exit_count = exit_cnt;
+    init_piece_exits(entrance);
+
+    fortress.pieces[0] = entrance;
+    fortress.piece_count = 1;
+    fortress.queue_tail = 1;
+}
+
+void expand_fortress() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Each thread processes one piece in the queue
+    uint queue_idx = fortress.queue_head + idx;
+    if (queue_idx >= fortress.queue_tail) return;
+    if (queue_idx >= fortress.piece_count) return;
+
+    FortressPiece piece = fortress.pieces[queue_idx];
+    if ((piece.flags & PIECE_FLAG_PROCESSED) != 0) return;
+
+    uint seed = fortress.generation_seed ^ uint(queue_idx * 12345);
+
+    // Try to add piece from each exit
+    for (uint e = 0; e < piece.exit_count; e++) {
+        // Random chance to skip exit (creates dead ends)
+        if (random_float(seed) < 0.15) continue;
+
+        try_add_piece(queue_idx, e, seed);
+    }
+
+    // Mark processed
+    fortress.pieces[queue_idx].flags |= PIECE_FLAG_PROCESSED;
+}
+
+void place_blocks() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= fortress.piece_count) return;
+
+    place_piece_blocks(idx);
+}
+
+void main() {
+    switch (pc.generation_mode) {
+        case 0:
+            init_fortress();
+            break;
+        case 1:
+            expand_fortress();
+            break;
+        case 2:
+            place_blocks();
+            break;
+    }
+}

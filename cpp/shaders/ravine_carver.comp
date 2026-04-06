@@ -1,0 +1,326 @@
+#version 450
+
+// Ravine/canyon carver compute shader
+// Creates long, narrow, deep cuts in terrain - characteristic Minecraft ravines
+//
+// Ravine characteristics:
+// - Long, narrow, deep cuts into terrain
+// - Mostly vertical with slight tilt angle
+// - Wider at top (V-shaped cross-section), narrower at bottom
+// - Expose ore veins and intersect cave systems
+// - ~1 ravine per 50 chunks (rarity controlled by spawn_chance)
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 16) in;
+
+// Chunk dimensions (MC 1.8.9 standard)
+#define CHUNK_SIZE_X 16
+#define CHUNK_SIZE_Y 256
+#define CHUNK_SIZE_Z 16
+
+// Block IDs
+#define AIR 0
+#define WATER 9
+#define LAVA 11
+
+// Ravine generation parameters
+#define RAVINE_SPAWN_CHANCE 0.02        // ~1 per 50 chunks
+#define MIN_LENGTH 30.0
+#define MAX_LENGTH 130.0
+#define MIN_BOTTOM_Y 10.0
+#define MAX_BOTTOM_Y 40.0
+#define MIN_TOP_Y 50.0
+#define MAX_TOP_Y 72.0
+#define BASE_WIDTH_TOP 3.0              // Width at top of ravine
+#define BASE_WIDTH_BOTTOM 0.5           // Width at bottom of ravine
+#define LAVA_LEVEL 10                   // Fill with lava below this Y
+
+// Direction wobble parameters
+#define WOBBLE_FREQUENCY 0.08
+#define WOBBLE_AMPLITUDE 0.15
+#define VERTICAL_TILT_MAX 0.2           // Max tilt from vertical
+
+// Push constants
+layout(push_constant) uniform RavineParams {
+    ivec3 chunk_pos;          // Chunk coordinates
+    int seed;                 // World seed
+    int carve_pass;           // 0 = detect ravines, 1 = carve
+    int reserved1;
+    int reserved2;
+    int reserved3;
+} params;
+
+// Chunk voxel data - read/write
+layout(std430, binding = 0) buffer ChunkData {
+    int voxels[];
+} chunk_data;
+
+// Heightmap for surface detection
+layout(std430, binding = 1) readonly buffer HeightmapCache {
+    int heightmap[256];
+} height_cache;
+
+// Ravine segment data (computed in pass 0, used in pass 1)
+struct RavineSegment {
+    vec2 pos;          // XZ position
+    float bottom_y;    // Bottom of ravine at this point
+    float top_y;       // Top of ravine at this point
+    float width_scale; // Width multiplier (for variation)
+};
+
+layout(std430, binding = 2) buffer RavineData {
+    int ravine_count;          // Number of ravines affecting this chunk
+    int segment_count;         // Total segments across all ravines
+    RavineSegment segments[512]; // Max segments
+} ravine_data;
+
+// Noise permutation table
+layout(std430, binding = 3) readonly buffer PermTable {
+    int perm[512];
+} perm_table;
+
+// ============================================================================
+// Hash and noise functions
+// ============================================================================
+
+uint hash(uint x) {
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = (x >> 16) ^ x;
+    return x;
+}
+
+uint hash2(uint x, uint y) {
+    return hash(x ^ (y * 0x1f1f1f1f));
+}
+
+uint hash3(uint x, uint y, uint z) {
+    return hash(x ^ (y * 0x1f1f1f1f) ^ (z * 0x3c3c3c3c));
+}
+
+// Seeded random [0, 1]
+float random(uint seed_val) {
+    return float(hash(seed_val)) / float(0xFFFFFFFF);
+}
+
+float random2(uint s1, uint s2) {
+    return float(hash2(s1, s2)) / float(0xFFFFFFFF);
+}
+
+// Perlin noise fade function
+float fade(float t) {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// Gradient function
+float grad(int hash_val, float x, float y) {
+    int h = hash_val & 7;
+    float u = h < 4 ? x : y;
+    float v = h < 4 ? y : x;
+    return ((h & 1) != 0 ? -u : u) + ((h & 2) != 0 ? -2.0 * v : 2.0 * v);
+}
+
+// 2D Perlin noise
+float perlin2D(vec2 p) {
+    int X = int(floor(p.x)) & 255;
+    int Y = int(floor(p.y)) & 255;
+    float x = fract(p.x);
+    float y = fract(p.y);
+    float u = fade(x);
+    float v = fade(y);
+
+    int A = perm_table.perm[X] + Y;
+    int B = perm_table.perm[X + 1] + Y;
+
+    return mix(
+        mix(grad(perm_table.perm[A], x, y), grad(perm_table.perm[B], x - 1, y), u),
+        mix(grad(perm_table.perm[A + 1], x, y - 1), grad(perm_table.perm[B + 1], x - 1, y - 1), u),
+        v
+    );
+}
+
+// ============================================================================
+// Ravine generation functions
+// ============================================================================
+
+// Get random starting point for ravine within a "ravine region"
+// Ravines are seeded per-region (larger than chunk) to ensure consistency
+vec2 getRavineStart(int region_x, int region_z, uint world_seed) {
+    uint region_seed = hash3(uint(region_x), uint(region_z), world_seed);
+    float rx = random(region_seed) * 256.0 + float(region_x) * 256.0;
+    float rz = random(region_seed + 1) * 256.0 + float(region_z) * 256.0;
+    return vec2(rx, rz);
+}
+
+// Get random direction for ravine (mostly horizontal, cardinal-ish)
+vec2 getRavineDirection(uint seed_val) {
+    float angle = random(seed_val) * 6.28318;
+    // Bias toward cardinal directions
+    float cardinal_bias = random(seed_val + 100);
+    if (cardinal_bias < 0.3) {
+        // Snap to nearest cardinal/diagonal
+        angle = round(angle / 0.7854) * 0.7854;
+    }
+    return normalize(vec2(cos(angle), sin(angle)));
+}
+
+// Get ravine length
+float getRavineLength(uint seed_val) {
+    return MIN_LENGTH + random(seed_val) * (MAX_LENGTH - MIN_LENGTH);
+}
+
+// Get vertical bounds for ravine at parameter t
+void getRavineBounds(float t, float length, uint seed_val, out float bottom_y, out float top_y) {
+    // Bottom Y varies along length
+    float base_bottom = MIN_BOTTOM_Y + random(seed_val + 200) * (MAX_BOTTOM_Y - MIN_BOTTOM_Y);
+    float bottom_variation = perlin2D(vec2(t * 0.1, float(seed_val) * 0.01)) * 10.0;
+    bottom_y = max(2.0, base_bottom + bottom_variation);
+
+    // Top Y - generally tracks surface but has own variation
+    float base_top = MIN_TOP_Y + random(seed_val + 300) * (MAX_TOP_Y - MIN_TOP_Y);
+    float top_variation = perlin2D(vec2(t * 0.08 + 100.0, float(seed_val) * 0.01)) * 15.0;
+    top_y = min(120.0, base_top + top_variation);
+
+    // Ensure reasonable depth
+    if (top_y - bottom_y < 20.0) {
+        top_y = bottom_y + 20.0;
+    }
+}
+
+// Get width at height Y within ravine (V-shape: wider at top)
+float getRavineWidth(float y, float bottom_y, float top_y, float width_scale) {
+    // Normalized height [0=bottom, 1=top]
+    float t = clamp((y - bottom_y) / (top_y - bottom_y), 0.0, 1.0);
+
+    // V-shape: linear interpolation with slight curve
+    float width = mix(BASE_WIDTH_BOTTOM, BASE_WIDTH_TOP, t);
+
+    // Add some waviness
+    width *= 0.8 + 0.4 * sin(y * 0.3);
+
+    return width * width_scale;
+}
+
+// Check if world position should be carved by ravine
+bool isInRavine(vec3 world_pos, vec2 ravine_start, vec2 ravine_dir, float length, uint seed_val) {
+    // Project point onto ravine line
+    vec2 to_point = world_pos.xz - ravine_start;
+    float t = dot(to_point, ravine_dir);
+
+    // Outside ravine length
+    if (t < 0.0 || t > length) {
+        return false;
+    }
+
+    // Distance from ravine centerline
+    vec2 closest_point = ravine_start + ravine_dir * t;
+
+    // Add wobble to centerline
+    float wobble = perlin2D(vec2(t * WOBBLE_FREQUENCY, float(seed_val) * 0.001)) * WOBBLE_AMPLITUDE * t;
+    vec2 perpendicular = vec2(-ravine_dir.y, ravine_dir.x);
+    closest_point += perpendicular * wobble;
+
+    float dist_xz = distance(world_pos.xz, closest_point);
+
+    // Get vertical bounds at this position
+    float bottom_y, top_y;
+    getRavineBounds(t, length, seed_val, bottom_y, top_y);
+
+    // Outside vertical bounds
+    if (world_pos.y < bottom_y || world_pos.y > top_y) {
+        return false;
+    }
+
+    // Add slight vertical tilt
+    float tilt = perlin2D(vec2(t * 0.05, float(seed_val) * 0.002)) * VERTICAL_TILT_MAX;
+    float y_offset = (world_pos.y - (bottom_y + top_y) * 0.5) * tilt;
+    closest_point += ravine_dir * y_offset;
+    dist_xz = distance(world_pos.xz, closest_point);
+
+    // Width scale varies along length (thinner at ends)
+    float end_taper = 1.0 - pow(abs(t / length - 0.5) * 2.0, 2.0);
+    end_taper = max(0.3, end_taper);
+
+    float width = getRavineWidth(world_pos.y, bottom_y, top_y, end_taper);
+
+    return dist_xz < width;
+}
+
+// ============================================================================
+// Voxel access
+// ============================================================================
+
+uint voxelIndex(uint x, uint y, uint z) {
+    return z * CHUNK_SIZE_X * CHUNK_SIZE_Y + y * CHUNK_SIZE_X + x;
+}
+
+uint heightIndex(uint x, uint z) {
+    return z * CHUNK_SIZE_X + x;
+}
+
+// ============================================================================
+// Main carving logic
+// ============================================================================
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+    // Local coordinates within chunk
+    uint localX = gid.x;
+    uint localZ = gid.z;
+
+    if (localX >= CHUNK_SIZE_X || localZ >= CHUNK_SIZE_Z) {
+        return;
+    }
+
+    // World coordinates
+    int worldX = params.chunk_pos.x * CHUNK_SIZE_X + int(localX);
+    int worldZ = params.chunk_pos.z * CHUNK_SIZE_Z + int(localZ);
+
+    uint world_seed = uint(params.seed);
+
+    // Check ravines from nearby regions (ravines can span multiple chunks)
+    // Ravine regions are 16 chunks (256 blocks) wide
+    int region_x = worldX >> 8;
+    int region_z = worldZ >> 8;
+
+    // Check 3x3 region neighborhood
+    for (int rx = region_x - 1; rx <= region_x + 1; rx++) {
+        for (int rz = region_z - 1; rz <= region_z + 1; rz++) {
+            uint region_seed = hash3(uint(rx + 10000), uint(rz + 10000), world_seed);
+
+            // Check if this region has a ravine
+            if (random(region_seed) > RAVINE_SPAWN_CHANCE) {
+                continue;
+            }
+
+            // Get ravine parameters
+            vec2 start = getRavineStart(rx, rz, world_seed);
+            vec2 dir = getRavineDirection(region_seed + 500);
+            float length = getRavineLength(region_seed + 600);
+
+            // Carve column
+            int surface_y = height_cache.heightmap[heightIndex(localX, localZ)];
+
+            for (int y = 1; y < surface_y; y++) {
+                vec3 world_pos = vec3(float(worldX), float(y), float(worldZ));
+
+                if (isInRavine(world_pos, start, dir, length, region_seed)) {
+                    uint idx = voxelIndex(localX, uint(y), localZ);
+                    int current_block = chunk_data.voxels[idx];
+
+                    // Don't carve bedrock or air
+                    if (current_block == 7 || current_block == AIR) {
+                        continue;
+                    }
+
+                    // Below lava level: fill with lava
+                    if (y < LAVA_LEVEL) {
+                        chunk_data.voxels[idx] = LAVA;
+                    } else {
+                        chunk_data.voxels[idx] = AIR;
+                    }
+                }
+            }
+        }
+    }
+}

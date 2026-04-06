@@ -1,0 +1,463 @@
+{
+  "metadata": {
+    "version": "1.0",
+    "mc_version": "1.8.9",
+    "description": "Oracle test cases for MC 1.8.9 combat damage calculations",
+    "formulas": {
+      "armor_reduction": "min(20, max(armor / 25, armor - raw_damage / (toughness / 4 + 2)))",
+      "armor_reduction_1_8": "armor * 0.04",
+      "protection_reduction": "min(20, sum(protection_levels) * factor)",
+      "protection_factor_generic": 0.04,
+      "resistance_reduction": "resistance_level * 0.2",
+      "final_damage": "raw_damage * (1 - armor_reduction) * (1 - protection_reduction) * (1 - resistance_reduction)"
+    },
+    "notes": [
+      "MC 1.8.9 armor formula: each armor point reduces damage by 4%",
+      "Protection enchantment: each level adds 4% reduction (max 80% from all sources)",
+      "Resistance effect: each level reduces damage by 20%",
+      "All reductions are multiplicative in final calculation"
+    ]
+  },
+  "damage_tests": [
+    {
+      "name": "unarmored_10_damage",
+      "description": "10 damage to unarmored target",
+      "raw_damage": 10.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 10.0,
+      "expected_reduction": 0.0,
+      "calculation": "10.0 * 1.0 * 1.0 * 1.0 = 10.0"
+    },
+    {
+      "name": "full_diamond_10_damage",
+      "description": "10 damage to full diamond armor (20 armor points)",
+      "raw_damage": 10.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 2.0,
+      "expected_reduction": 0.8,
+      "calculation": "20 armor * 0.04 = 80% reduction, 10.0 * 0.2 = 2.0"
+    },
+    {
+      "name": "diamond_with_prot4_single_piece",
+      "description": "10 damage with Protection IV on one armor piece",
+      "raw_damage": 10.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 4,
+      "resistance_level": 0,
+      "expected_damage": 1.68,
+      "expected_reduction": 0.832,
+      "calculation": "armor: 80%, prot4: 16%, 10.0 * 0.2 * 0.84 = 1.68"
+    },
+    {
+      "name": "diamond_full_prot4",
+      "description": "10 damage with Protection IV on all 4 armor pieces (16 total prot levels)",
+      "raw_damage": 10.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 16,
+      "resistance_level": 0,
+      "expected_damage": 0.4,
+      "expected_reduction": 0.96,
+      "calculation": "armor: 80%, prot: 64% (capped at 80% combined), 10.0 * 0.2 * 0.2 = 0.4"
+    },
+    {
+      "name": "iron_armor_10_damage",
+      "description": "10 damage to full iron armor (15 armor points)",
+      "raw_damage": 10.0,
+      "armor": 15,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 4.0,
+      "expected_reduction": 0.6,
+      "calculation": "15 armor * 0.04 = 60% reduction, 10.0 * 0.4 = 4.0"
+    },
+    {
+      "name": "chainmail_10_damage",
+      "description": "10 damage to full chainmail armor (12 armor points)",
+      "raw_damage": 10.0,
+      "armor": 12,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 5.2,
+      "expected_reduction": 0.48,
+      "calculation": "12 armor * 0.04 = 48% reduction, 10.0 * 0.52 = 5.2"
+    },
+    {
+      "name": "leather_armor_10_damage",
+      "description": "10 damage to full leather armor (7 armor points)",
+      "raw_damage": 10.0,
+      "armor": 7,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 7.2,
+      "expected_reduction": 0.28,
+      "calculation": "7 armor * 0.04 = 28% reduction, 10.0 * 0.72 = 7.2"
+    },
+    {
+      "name": "resistance_1_10_damage",
+      "description": "10 damage with Resistance I effect",
+      "raw_damage": 10.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 1,
+      "expected_damage": 8.0,
+      "expected_reduction": 0.2,
+      "calculation": "Resistance I: 20% reduction, 10.0 * 0.8 = 8.0"
+    },
+    {
+      "name": "resistance_2_10_damage",
+      "description": "10 damage with Resistance II effect",
+      "raw_damage": 10.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 2,
+      "expected_damage": 6.0,
+      "expected_reduction": 0.4,
+      "calculation": "Resistance II: 40% reduction, 10.0 * 0.6 = 6.0"
+    },
+    {
+      "name": "diamond_resistance_2_10_damage",
+      "description": "10 damage to full diamond with Resistance II",
+      "raw_damage": 10.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 2,
+      "expected_damage": 1.2,
+      "expected_reduction": 0.88,
+      "calculation": "armor: 80%, resist: 40%, 10.0 * 0.2 * 0.6 = 1.2"
+    },
+    {
+      "name": "ender_dragon_contact_unarmored",
+      "description": "Ender Dragon contact damage (10) to unarmored player",
+      "raw_damage": 10.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 10.0,
+      "expected_reduction": 0.0,
+      "damage_source": "dragon_contact"
+    },
+    {
+      "name": "ender_dragon_contact_diamond",
+      "description": "Ender Dragon contact damage (10) to full diamond player",
+      "raw_damage": 10.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 2.0,
+      "expected_reduction": 0.8,
+      "damage_source": "dragon_contact"
+    },
+    {
+      "name": "ender_dragon_breath_unarmored",
+      "description": "Ender Dragon breath damage (6/sec) to unarmored player",
+      "raw_damage": 6.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 6.0,
+      "expected_reduction": 0.0,
+      "damage_source": "dragon_breath"
+    },
+    {
+      "name": "diamond_sword_crit_unarmored",
+      "description": "Diamond sword critical hit (10.5 damage) to unarmored target",
+      "raw_damage": 10.5,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 10.5,
+      "expected_reduction": 0.0,
+      "damage_source": "player_melee"
+    },
+    {
+      "name": "diamond_sword_crit_iron",
+      "description": "Diamond sword critical hit to full iron armor",
+      "raw_damage": 10.5,
+      "armor": 15,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 4.2,
+      "expected_reduction": 0.6,
+      "damage_source": "player_melee"
+    },
+    {
+      "name": "bow_power5_unarmored",
+      "description": "Fully charged bow with Power V (25 damage) to unarmored target",
+      "raw_damage": 25.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 25.0,
+      "expected_reduction": 0.0,
+      "damage_source": "arrow"
+    },
+    {
+      "name": "bow_power5_diamond",
+      "description": "Fully charged bow with Power V to full diamond armor",
+      "raw_damage": 25.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 5.0,
+      "expected_reduction": 0.8,
+      "damage_source": "arrow"
+    },
+    {
+      "name": "fall_damage_5_blocks",
+      "description": "Fall damage from 5 blocks (2 damage)",
+      "raw_damage": 2.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 2.0,
+      "expected_reduction": 0.0,
+      "damage_source": "fall",
+      "note": "Fall damage bypasses armor but not Feather Falling/Protection"
+    },
+    {
+      "name": "fall_damage_10_blocks_feather4",
+      "description": "Fall damage from 10 blocks (7 damage) with Feather Falling IV",
+      "raw_damage": 7.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "feather_falling_level": 4,
+      "resistance_level": 0,
+      "expected_damage": 2.8,
+      "expected_reduction": 0.6,
+      "damage_source": "fall",
+      "note": "Feather Falling IV: 48% reduction (12% per level)"
+    },
+    {
+      "name": "fire_damage_tick",
+      "description": "Fire damage tick (1 damage) to unarmored player",
+      "raw_damage": 1.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "fire_protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 1.0,
+      "expected_reduction": 0.0,
+      "damage_source": "fire"
+    },
+    {
+      "name": "fire_damage_fire_prot4",
+      "description": "Fire damage with Fire Protection IV (32% reduction)",
+      "raw_damage": 1.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "fire_protection_level": 4,
+      "resistance_level": 0,
+      "expected_damage": 0.68,
+      "expected_reduction": 0.32,
+      "damage_source": "fire"
+    },
+    {
+      "name": "explosion_creeper_unarmored",
+      "description": "Creeper explosion at close range (49 max damage) unarmored",
+      "raw_damage": 49.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "blast_protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 49.0,
+      "expected_reduction": 0.0,
+      "damage_source": "explosion"
+    },
+    {
+      "name": "explosion_creeper_diamond_blast4",
+      "description": "Creeper explosion with full diamond + Blast Protection IV",
+      "raw_damage": 49.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "blast_protection_level": 16,
+      "resistance_level": 0,
+      "expected_damage": 1.96,
+      "expected_reduction": 0.96,
+      "damage_source": "explosion",
+      "note": "Blast Prot IV on all pieces: 64% reduction, armor: 80%"
+    },
+    {
+      "name": "wither_skull_unarmored",
+      "description": "Wither skull direct hit (8 damage) unarmored",
+      "raw_damage": 8.0,
+      "armor": 0,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 8.0,
+      "expected_reduction": 0.0,
+      "damage_source": "wither_skull"
+    },
+    {
+      "name": "wither_effect_tick",
+      "description": "Wither status effect tick (1 damage) - bypasses armor",
+      "raw_damage": 1.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 1.0,
+      "expected_reduction": 0.0,
+      "damage_source": "wither_effect",
+      "note": "Wither effect bypasses armor"
+    },
+    {
+      "name": "void_damage",
+      "description": "Void damage (4 damage/tick) - bypasses everything",
+      "raw_damage": 4.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 16,
+      "resistance_level": 2,
+      "expected_damage": 4.0,
+      "expected_reduction": 0.0,
+      "damage_source": "void",
+      "note": "Void damage bypasses all damage reduction"
+    },
+    {
+      "name": "starvation_damage",
+      "description": "Starvation damage (1 damage/tick) - bypasses armor",
+      "raw_damage": 1.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 1.0,
+      "expected_reduction": 0.0,
+      "damage_source": "starvation",
+      "note": "Starvation bypasses armor"
+    },
+    {
+      "name": "drowning_damage",
+      "description": "Drowning damage (2 damage/tick) - bypasses armor",
+      "raw_damage": 2.0,
+      "armor": 20,
+      "armor_toughness": 0,
+      "protection_level": 0,
+      "resistance_level": 0,
+      "expected_damage": 2.0,
+      "expected_reduction": 0.0,
+      "damage_source": "drowning",
+      "note": "Drowning bypasses armor, Respiration helps air supply"
+    }
+  ],
+  "weapon_damage_table": {
+    "comment": "Base damage values for common weapons in MC 1.8.9",
+    "fist": 1.0,
+    "wooden_sword": 5.0,
+    "stone_sword": 6.0,
+    "iron_sword": 7.0,
+    "diamond_sword": 7.0,
+    "wooden_axe": 4.0,
+    "stone_axe": 5.0,
+    "iron_axe": 6.0,
+    "diamond_axe": 6.0,
+    "bow_no_charge": 1.0,
+    "bow_medium_charge": 6.0,
+    "bow_full_charge": 9.0,
+    "bow_full_charge_crit": 10.0
+  },
+  "armor_values_table": {
+    "comment": "Armor point values for armor sets in MC 1.8.9",
+    "leather": {
+      "helmet": 1,
+      "chestplate": 3,
+      "leggings": 2,
+      "boots": 1,
+      "total": 7
+    },
+    "chainmail": {
+      "helmet": 2,
+      "chestplate": 5,
+      "leggings": 4,
+      "boots": 1,
+      "total": 12
+    },
+    "iron": {
+      "helmet": 2,
+      "chestplate": 6,
+      "leggings": 5,
+      "boots": 2,
+      "total": 15
+    },
+    "diamond": {
+      "helmet": 3,
+      "chestplate": 8,
+      "leggings": 6,
+      "boots": 3,
+      "total": 20
+    }
+  },
+  "enchantment_reduction_rates": {
+    "protection": 0.04,
+    "fire_protection": 0.08,
+    "blast_protection": 0.08,
+    "projectile_protection": 0.08,
+    "feather_falling": 0.12
+  },
+  "damage_source_properties": {
+    "comment": "Which damage sources bypass which protections",
+    "standard": {
+      "bypasses_armor": false,
+      "bypasses_protection": false,
+      "bypasses_resistance": false
+    },
+    "fire": {
+      "bypasses_armor": true,
+      "bypasses_protection": false,
+      "bypasses_resistance": false
+    },
+    "fall": {
+      "bypasses_armor": true,
+      "bypasses_protection": false,
+      "bypasses_resistance": false
+    },
+    "drowning": {
+      "bypasses_armor": true,
+      "bypasses_protection": true,
+      "bypasses_resistance": false
+    },
+    "starvation": {
+      "bypasses_armor": true,
+      "bypasses_protection": true,
+      "bypasses_resistance": true
+    },
+    "void": {
+      "bypasses_armor": true,
+      "bypasses_protection": true,
+      "bypasses_resistance": true
+    },
+    "wither_effect": {
+      "bypasses_armor": true,
+      "bypasses_protection": true,
+      "bypasses_resistance": false
+    }
+  }
+}

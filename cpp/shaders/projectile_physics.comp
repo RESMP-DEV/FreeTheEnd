@@ -1,0 +1,635 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 Projectile Physics Compute Shader
+//
+// Simulates all throwable/shootable projectiles:
+// - Arrow: affected by gravity, pierces or sticks, damage scales with velocity
+// - Ghast Fireball: no gravity, large explosion on impact
+// - Blaze Fireball: slight gravity, sets fire on impact
+// - Ender Pearl: gravity, teleports thrower on impact
+// - Snowball: gravity, knockback only (no damage except to blazes/ender dragon)
+// - Egg: gravity, knockback, chance to spawn chicken
+//
+// Physics: 20 TPS, position += velocity, velocity.y -= gravity, velocity *= (1 - drag)
+// Collision: Block raycast + entity AABB intersection
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "damage.glsl"
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const float PI = 3.14159265359;
+
+// Projectile types
+const uint PROJ_ARROW          = 0;
+const uint PROJ_FIREBALL_GHAST = 1;
+const uint PROJ_FIREBALL_BLAZE = 2;
+const uint PROJ_ENDER_PEARL    = 3;
+const uint PROJ_SNOWBALL       = 4;
+const uint PROJ_EGG            = 5;
+const uint PROJ_FISHING_BOBBER = 6;
+const uint PROJ_POTION         = 7;
+
+// Physics constants per projectile type
+// [gravity, drag, base_damage, explosion_radius]
+const vec4 PROJ_PHYSICS[8] = vec4[8](
+    vec4(0.05, 0.01, 2.0,  0.0),   // Arrow: gravity 0.05, drag 0.01, base damage 2
+    vec4(0.00, 0.00, 0.0,  1.0),   // Ghast fireball: no gravity, explosion radius 1 (power)
+    vec4(0.01, 0.01, 5.0,  0.0),   // Blaze fireball: slight gravity, fire damage 5
+    vec4(0.03, 0.01, 0.0,  0.0),   // Ender pearl: gravity 0.03, teleport on impact
+    vec4(0.03, 0.01, 0.0,  0.0),   // Snowball: gravity 0.03, knockback only
+    vec4(0.03, 0.01, 0.0,  0.0),   // Egg: gravity 0.03, knockback + chicken spawn
+    vec4(0.03, 0.04, 0.0,  0.0),   // Fishing bobber: gravity 0.03, high drag in water
+    vec4(0.05, 0.01, 0.0,  0.0)    // Potion: gravity 0.05, effect splash
+);
+
+// Arrow damage calculation: base + velocity^2 * 0.5, clamped to [2, 5] base
+const float ARROW_DAMAGE_MIN = 2.0;
+const float ARROW_DAMAGE_MAX = 11.0;  // Critical hit at max power
+const float ARROW_POWER_DAMAGE_MULT = 0.5;
+
+// Hitbox sizes (half-extents)
+const vec3 PROJ_HITBOX_ARROW = vec3(0.25, 0.25, 0.25);
+const vec3 PROJ_HITBOX_FIREBALL_GHAST = vec3(0.5, 0.5, 0.5);
+const vec3 PROJ_HITBOX_FIREBALL_BLAZE = vec3(0.15625, 0.15625, 0.15625);
+const vec3 PROJ_HITBOX_SMALL = vec3(0.125, 0.125, 0.125);  // Pearl, snowball, egg
+
+// Entity hitbox constants (typical values)
+const vec3 ENTITY_HITBOX_PLAYER = vec3(0.3, 0.9, 0.3);
+const vec3 ENTITY_HITBOX_DEFAULT = vec3(0.4, 0.9, 0.4);
+
+// Max projectile lifetime in ticks
+const uint MAX_AGE_ARROW = 1200;         // 60 seconds
+const uint MAX_AGE_FIREBALL = 600;       // 30 seconds
+const uint MAX_AGE_ENDER_PEARL = 80;     // 4 seconds (faster despawn)
+const uint MAX_AGE_THROWABLE = 300;      // 15 seconds
+const uint MAX_AGE_FISHING = 2400;       // 2 minutes
+
+// Projectile flags
+const uint PROJ_FLAG_ACTIVE       = 1 << 0;
+const uint PROJ_FLAG_IN_GROUND    = 1 << 1;
+const uint PROJ_FLAG_CRITICAL     = 1 << 2;
+const uint PROJ_FLAG_FROM_PLAYER  = 1 << 3;
+const uint PROJ_FLAG_FLAME        = 1 << 4;  // Flame enchant (arrow)
+const uint PROJ_FLAG_INFINITY     = 1 << 5;  // Infinity enchant (arrow)
+const uint PROJ_FLAG_PICKUP       = 1 << 6;  // Can be picked up
+
+// Event types for CPU processing
+const uint EVENT_PROJ_DESPAWN       = 0;
+const uint EVENT_PROJ_HIT_BLOCK     = 1;
+const uint EVENT_PROJ_HIT_ENTITY    = 2;
+const uint EVENT_PROJ_EXPLODE       = 3;
+const uint EVENT_PROJ_TELEPORT      = 4;  // Ender pearl
+const uint EVENT_PROJ_SPAWN_CHICKEN = 5;  // Egg
+const uint EVENT_PROJ_SPLASH        = 6;  // Potion
+
+// Block types for collision
+const uint BLOCK_AIR = 0;
+const uint BLOCK_WATER = 8;
+const uint BLOCK_WATER_FLOWING = 9;
+const uint BLOCK_LAVA = 10;
+const uint BLOCK_LAVA_FLOWING = 11;
+const uint BLOCK_COBWEB = 30;
+const uint BLOCK_FIRE = 51;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct Projectile {
+    vec3 position;
+    uint proj_type;
+    vec3 velocity;
+    uint flags;
+    uint owner_id;      // Entity ID of thrower/shooter
+    uint target_id;     // Entity ID of target (for homing, or hit result)
+    uint age;           // Ticks since spawn
+    uint stuck_time;    // Ticks since stuck in block (arrows)
+    float damage;       // Calculated damage (for arrows, based on velocity + power)
+    float knockback;    // Knockback strength
+    uint power_level;   // Power enchant level (arrows)
+    uint punch_level;   // Punch enchant level (arrows)
+};
+
+struct Entity {
+    vec3 position;
+    uint entity_id;
+    vec3 velocity;
+    uint entity_type;
+    vec3 hitbox_size;   // Half-extents
+    uint flags;
+    float health;
+    float _pad[3];
+};
+
+struct ProjectileEvent {
+    uint proj_index;
+    uint event_type;
+    vec3 position;
+    uint target_entity;
+    float damage;
+    uint extra_data;    // Block type for HIT_BLOCK, effect ID for SPLASH, etc.
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    uint projectile_count;
+    uint entity_count;
+    float delta_time;       // Should be 0.05 for 20 TPS
+    uint current_tick;
+    uint random_seed;
+    uvec3 world_size;       // World bounds in blocks
+    uint _pad;
+} pc;
+
+// Projectile state buffer
+layout(std430, set = 0, binding = 0) buffer ProjectileBuffer {
+    Projectile projectiles[];
+};
+
+// Entity buffer (read-only for collision detection)
+layout(std430, set = 0, binding = 1) readonly buffer EntityBuffer {
+    Entity entities[];
+};
+
+// World blocks (packed, 1 byte per block)
+layout(std430, set = 0, binding = 2) readonly buffer WorldBlocks {
+    uint world_blocks[];
+};
+
+// Event output buffer
+layout(std430, set = 0, binding = 3) writeonly buffer EventBuffer {
+    ProjectileEvent events[];
+};
+
+layout(std430, set = 0, binding = 4) buffer EventCounter {
+    uint event_count;
+};
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+uint pcg_hash(uint input_val) {
+    uint state = input_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+// World coordinate to block index
+ivec3 pos_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+// Get block at world position
+uint get_block_at(ivec3 block_pos) {
+    // Bounds check
+    if (any(lessThan(block_pos, ivec3(0))) ||
+        any(greaterThanEqual(uvec3(block_pos), pc.world_size))) {
+        return BLOCK_AIR;
+    }
+
+    uint idx = block_pos.y * pc.world_size.x * pc.world_size.z +
+               block_pos.z * pc.world_size.x +
+               block_pos.x;
+
+    // Packed 4 blocks per uint
+    return (world_blocks[idx >> 2] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// Check if block is solid for collision
+bool is_solid_block(uint block_id) {
+    // Non-solid: air, water, lava, fire, cobweb (slows but doesn't stop)
+    return block_id != BLOCK_AIR &&
+           block_id != BLOCK_WATER &&
+           block_id != BLOCK_WATER_FLOWING &&
+           block_id != BLOCK_LAVA &&
+           block_id != BLOCK_LAVA_FLOWING &&
+           block_id != BLOCK_FIRE;
+}
+
+// Check if position is in water
+bool is_in_water(vec3 pos) {
+    uint block = get_block_at(pos_to_block(pos));
+    return block == BLOCK_WATER || block == BLOCK_WATER_FLOWING;
+}
+
+// Check if position is in lava
+bool is_in_lava(vec3 pos) {
+    uint block = get_block_at(pos_to_block(pos));
+    return block == BLOCK_LAVA || block == BLOCK_LAVA_FLOWING;
+}
+
+// AABB intersection test
+bool aabb_intersect(vec3 pos_a, vec3 half_a, vec3 pos_b, vec3 half_b) {
+    vec3 diff = abs(pos_a - pos_b);
+    vec3 combined = half_a + half_b;
+    return all(lessThan(diff, combined));
+}
+
+// Ray-AABB intersection for block collision
+// Returns t value (0-1) if hit within segment, -1 if no hit
+float ray_aabb_intersect(vec3 ray_start, vec3 ray_dir, vec3 box_min, vec3 box_max) {
+    vec3 inv_dir = 1.0 / ray_dir;
+
+    vec3 t1 = (box_min - ray_start) * inv_dir;
+    vec3 t2 = (box_max - ray_start) * inv_dir;
+
+    vec3 t_min = min(t1, t2);
+    vec3 t_max = max(t1, t2);
+
+    float t_enter = max(max(t_min.x, t_min.y), t_min.z);
+    float t_exit = min(min(t_max.x, t_max.y), t_max.z);
+
+    // No intersection
+    if (t_enter > t_exit || t_exit < 0.0) {
+        return -1.0;
+    }
+
+    // Return entry point, clamped to [0, 1]
+    return t_enter > 0.0 ? t_enter : 0.0;
+}
+
+// Raycast through blocks from start to end
+// Returns true if hit, sets hit_pos and hit_block
+bool raycast_blocks(vec3 start, vec3 end, out vec3 hit_pos, out uint hit_block) {
+    vec3 direction = end - start;
+    float length = length(direction);
+
+    if (length < 0.001) {
+        hit_pos = start;
+        hit_block = get_block_at(pos_to_block(start));
+        return is_solid_block(hit_block);
+    }
+
+    vec3 dir = direction / length;
+
+    // Step through blocks using DDA (Digital Differential Analyzer)
+    ivec3 current_block = pos_to_block(start);
+    ivec3 end_block = pos_to_block(end);
+
+    ivec3 step = ivec3(sign(dir));
+    vec3 t_delta = abs(1.0 / dir);
+
+    // Calculate initial t values to next block boundaries
+    vec3 t_max;
+    for (int i = 0; i < 3; i++) {
+        if (dir[i] > 0) {
+            t_max[i] = (float(current_block[i] + 1) - start[i]) / dir[i];
+        } else if (dir[i] < 0) {
+            t_max[i] = (float(current_block[i]) - start[i]) / dir[i];
+        } else {
+            t_max[i] = 1e30;
+        }
+    }
+
+    // Maximum iterations to prevent infinite loop
+    int max_iter = int(length) + 3;
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        uint block = get_block_at(current_block);
+
+        if (is_solid_block(block)) {
+            // Calculate exact hit position
+            float t = min(min(t_max.x, t_max.y), t_max.z);
+            hit_pos = start + dir * max(t - 0.01, 0.0);
+            hit_block = block;
+            return true;
+        }
+
+        // Move to next block
+        if (t_max.x < t_max.y) {
+            if (t_max.x < t_max.z) {
+                if (t_max.x > length) break;
+                current_block.x += step.x;
+                t_max.x += t_delta.x;
+            } else {
+                if (t_max.z > length) break;
+                current_block.z += step.z;
+                t_max.z += t_delta.z;
+            }
+        } else {
+            if (t_max.y < t_max.z) {
+                if (t_max.y > length) break;
+                current_block.y += step.y;
+                t_max.y += t_delta.y;
+            } else {
+                if (t_max.z > length) break;
+                current_block.z += step.z;
+                t_max.z += t_delta.z;
+            }
+        }
+    }
+
+    hit_pos = end;
+    hit_block = BLOCK_AIR;
+    return false;
+}
+
+// Get projectile hitbox size
+vec3 get_proj_hitbox(uint proj_type) {
+    switch (proj_type) {
+        case PROJ_ARROW:          return PROJ_HITBOX_ARROW;
+        case PROJ_FIREBALL_GHAST: return PROJ_HITBOX_FIREBALL_GHAST;
+        case PROJ_FIREBALL_BLAZE: return PROJ_HITBOX_FIREBALL_BLAZE;
+        default:                  return PROJ_HITBOX_SMALL;
+    }
+}
+
+// Get max age for projectile type
+uint get_max_age(uint proj_type) {
+    switch (proj_type) {
+        case PROJ_ARROW:          return MAX_AGE_ARROW;
+        case PROJ_FIREBALL_GHAST: return MAX_AGE_FIREBALL;
+        case PROJ_FIREBALL_BLAZE: return MAX_AGE_FIREBALL;
+        case PROJ_ENDER_PEARL:    return MAX_AGE_ENDER_PEARL;
+        case PROJ_FISHING_BOBBER: return MAX_AGE_FISHING;
+        default:                  return MAX_AGE_THROWABLE;
+    }
+}
+
+// Write event to output buffer
+void emit_event(uint proj_idx, uint event_type, vec3 position,
+                uint target, float damage, uint extra) {
+    uint idx = atomicAdd(event_count, 1u);
+    if (idx < 1024) {  // Max events per tick
+        events[idx].proj_index = proj_idx;
+        events[idx].event_type = event_type;
+        events[idx].position = position;
+        events[idx].target_entity = target;
+        events[idx].damage = damage;
+        events[idx].extra_data = extra;
+    }
+}
+
+// ============================================================================
+// Projectile-Specific Logic
+// ============================================================================
+
+// Calculate arrow damage based on velocity and enchantments
+float calculate_arrow_damage(Projectile p) {
+    float speed = length(p.velocity);
+    float base = PROJ_PHYSICS[PROJ_ARROW].z;
+
+    // Damage = ceil(speed * (damage_base + power_bonus))
+    // Power enchant adds 25% per level + 0.5 bonus
+    float power_bonus = p.power_level > 0u ?
+        (float(p.power_level) * 0.5 + 0.5) : 0.0;
+
+    float damage = speed * (base + power_bonus);
+
+    // Critical hit (shot at full charge, flagged during spawn)
+    if ((p.flags & PROJ_FLAG_CRITICAL) != 0u) {
+        damage *= 1.5;  // 50% bonus
+    }
+
+    return clamp(damage, ARROW_DAMAGE_MIN, ARROW_DAMAGE_MAX);
+}
+
+// Handle arrow impact
+void on_arrow_hit_block(inout Projectile p, uint proj_idx, vec3 hit_pos, uint block_id) {
+    p.flags |= PROJ_FLAG_IN_GROUND;
+    p.flags |= PROJ_FLAG_PICKUP;  // Can be picked up after sticking
+    p.velocity = vec3(0.0);
+    p.position = hit_pos;
+    p.stuck_time = 0u;
+
+    emit_event(proj_idx, EVENT_PROJ_HIT_BLOCK, hit_pos, 0u, 0.0, block_id);
+}
+
+void on_arrow_hit_entity(inout Projectile p, uint proj_idx, Entity target) {
+    float damage = calculate_arrow_damage(p);
+
+    // Punch enchant knockback
+    float knockback = p.knockback;
+    if (p.punch_level > 0u) {
+        knockback += float(p.punch_level) * 0.4;
+    }
+
+    emit_event(proj_idx, EVENT_PROJ_HIT_ENTITY, target.position,
+               target.entity_id, damage, p.punch_level);
+
+    // Flame enchant sets target on fire (handled by CPU)
+    if ((p.flags & PROJ_FLAG_FLAME) != 0u) {
+        // Extra data encodes flame flag
+    }
+
+    // Arrow despawns on entity hit
+    p.flags &= ~PROJ_FLAG_ACTIVE;
+}
+
+// Handle ghast fireball impact
+void on_ghast_fireball_hit(inout Projectile p, uint proj_idx, vec3 hit_pos, uint target_id) {
+    // Explosion power 1 (configurable via PROJ_PHYSICS)
+    float power = PROJ_PHYSICS[PROJ_FIREBALL_GHAST].w;
+
+    emit_event(proj_idx, EVENT_PROJ_EXPLODE, hit_pos, target_id, power, 0u);
+
+    p.flags &= ~PROJ_FLAG_ACTIVE;
+}
+
+// Handle blaze fireball impact
+void on_blaze_fireball_hit(inout Projectile p, uint proj_idx, vec3 hit_pos, uint target_id) {
+    float damage = PROJ_PHYSICS[PROJ_FIREBALL_BLAZE].z;
+
+    emit_event(proj_idx, EVENT_PROJ_HIT_ENTITY, hit_pos, target_id, damage, 1u);  // 1 = fire flag
+
+    p.flags &= ~PROJ_FLAG_ACTIVE;
+}
+
+// Handle ender pearl impact
+void on_ender_pearl_hit(inout Projectile p, uint proj_idx, vec3 hit_pos) {
+    // Teleport thrower to hit location, deal 5 fall damage
+    emit_event(proj_idx, EVENT_PROJ_TELEPORT, hit_pos, p.owner_id, 5.0, 0u);
+
+    p.flags &= ~PROJ_FLAG_ACTIVE;
+}
+
+// Handle snowball/egg impact
+void on_throwable_hit(inout Projectile p, uint proj_idx, vec3 hit_pos, uint target_id, inout uint seed) {
+    // Knockback only (0.1 blocks)
+    float knockback = 0.1;
+
+    // Snowballs deal 3 damage to blazes and ender dragon
+    // Eggs have 1/8 chance to spawn chicken, 1/256 for 4 chickens
+    uint extra = 0u;
+    if (p.proj_type == PROJ_EGG) {
+        float roll = random_float(seed);
+        if (roll < 1.0 / 8.0) {
+            extra = roll < 1.0 / 256.0 ? 4u : 1u;  // Chicken count
+            emit_event(proj_idx, EVENT_PROJ_SPAWN_CHICKEN, hit_pos, 0u, 0.0, extra);
+        }
+    }
+
+    emit_event(proj_idx, EVENT_PROJ_HIT_ENTITY, hit_pos, target_id, knockback, 0u);
+
+    p.flags &= ~PROJ_FLAG_ACTIVE;
+}
+
+// ============================================================================
+// Main Physics Update
+// ============================================================================
+
+void update_projectile(inout Projectile p, uint proj_idx, inout uint seed) {
+    // Get physics params for this projectile type
+    uint type_idx = min(p.proj_type, 7u);
+    float gravity = PROJ_PHYSICS[type_idx].x;
+    float drag = PROJ_PHYSICS[type_idx].y;
+
+    // Check if stuck in ground (arrows only)
+    if ((p.flags & PROJ_FLAG_IN_GROUND) != 0u) {
+        p.stuck_time++;
+
+        // Despawn after 60 seconds stuck, or 200 ticks with pickup flag
+        if (p.stuck_time > 1200u ||
+            (p.stuck_time > 200u && (p.flags & PROJ_FLAG_PICKUP) != 0u)) {
+            p.flags &= ~PROJ_FLAG_ACTIVE;
+            emit_event(proj_idx, EVENT_PROJ_DESPAWN, p.position, 0u, 0.0, 0u);
+        }
+        return;
+    }
+
+    // Apply gravity
+    p.velocity.y -= gravity;
+
+    // Apply drag (air resistance)
+    // In water, drag is much higher
+    float effective_drag = drag;
+    if (is_in_water(p.position)) {
+        effective_drag = 0.8;  // High water drag
+    }
+    p.velocity *= (1.0 - effective_drag);
+
+    // Calculate new position
+    vec3 new_pos = p.position + p.velocity;
+
+    // Block collision check via raycast
+    vec3 hit_pos;
+    uint hit_block;
+    if (raycast_blocks(p.position, new_pos, hit_pos, hit_block)) {
+        // Hit a block
+        switch (p.proj_type) {
+            case PROJ_ARROW:
+                on_arrow_hit_block(p, proj_idx, hit_pos, hit_block);
+                break;
+            case PROJ_FIREBALL_GHAST:
+                on_ghast_fireball_hit(p, proj_idx, hit_pos, 0u);
+                break;
+            case PROJ_FIREBALL_BLAZE:
+                on_blaze_fireball_hit(p, proj_idx, hit_pos, 0u);
+                break;
+            case PROJ_ENDER_PEARL:
+                on_ender_pearl_hit(p, proj_idx, hit_pos);
+                break;
+            case PROJ_SNOWBALL:
+            case PROJ_EGG:
+                on_throwable_hit(p, proj_idx, hit_pos, 0u, seed);
+                break;
+            default:
+                p.flags &= ~PROJ_FLAG_ACTIVE;
+                break;
+        }
+        return;
+    }
+
+    // Entity collision check
+    vec3 proj_hitbox = get_proj_hitbox(p.proj_type);
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        Entity ent = entities[i];
+
+        // Skip self (thrower) for first few ticks
+        if (ent.entity_id == p.owner_id && p.age < 5u) {
+            continue;
+        }
+
+        // Skip dead entities
+        if (ent.health <= 0.0) {
+            continue;
+        }
+
+        // AABB intersection
+        if (aabb_intersect(new_pos, proj_hitbox, ent.position, ent.hitbox_size)) {
+            // Hit entity
+            switch (p.proj_type) {
+                case PROJ_ARROW:
+                    on_arrow_hit_entity(p, proj_idx, ent);
+                    break;
+                case PROJ_FIREBALL_GHAST:
+                    on_ghast_fireball_hit(p, proj_idx, ent.position, ent.entity_id);
+                    break;
+                case PROJ_FIREBALL_BLAZE:
+                    on_blaze_fireball_hit(p, proj_idx, ent.position, ent.entity_id);
+                    break;
+                case PROJ_ENDER_PEARL:
+                    on_ender_pearl_hit(p, proj_idx, new_pos);
+                    break;
+                case PROJ_SNOWBALL:
+                case PROJ_EGG:
+                    on_throwable_hit(p, proj_idx, ent.position, ent.entity_id, seed);
+                    break;
+                default:
+                    p.flags &= ~PROJ_FLAG_ACTIVE;
+                    break;
+            }
+            return;
+        }
+    }
+
+    // No collision - update position
+    p.position = new_pos;
+    p.age++;
+
+    // Age-based despawn
+    if (p.age > get_max_age(p.proj_type)) {
+        p.flags &= ~PROJ_FLAG_ACTIVE;
+        emit_event(proj_idx, EVENT_PROJ_DESPAWN, p.position, 0u, 0.0, 0u);
+    }
+
+    // Lava destroys most projectiles
+    if (is_in_lava(p.position)) {
+        if (p.proj_type != PROJ_FIREBALL_GHAST && p.proj_type != PROJ_FIREBALL_BLAZE) {
+            p.flags &= ~PROJ_FLAG_ACTIVE;
+            emit_event(proj_idx, EVENT_PROJ_DESPAWN, p.position, 0u, 0.0, 1u);  // 1 = burned
+        }
+    }
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.projectile_count) {
+        return;
+    }
+
+    Projectile proj = projectiles[idx];
+
+    // Skip inactive projectiles
+    if ((proj.flags & PROJ_FLAG_ACTIVE) == 0u) {
+        return;
+    }
+
+    // Initialize random seed
+    uint seed = proj.owner_id ^ pc.random_seed ^ idx ^ pc.current_tick;
+
+    // Update projectile physics
+    update_projectile(proj, idx, seed);
+
+    // Write back
+    projectiles[idx] = proj;
+}

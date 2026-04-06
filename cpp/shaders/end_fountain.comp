@@ -1,0 +1,240 @@
+#version 450
+#extension GL_EXT_shader_atomic_int64 : enable
+
+// End Fountain and Exit Portal Compute Shader
+// Generates the bedrock fountain structure with dragon egg perch
+// and manages the exit portal state
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Block type constants
+const uint BLOCK_AIR = 0;
+const uint BLOCK_BEDROCK = 7;
+const uint BLOCK_END_PORTAL_FRAME = 120;
+const uint BLOCK_END_PORTAL = 119;
+const uint BLOCK_TORCH = 50;
+const uint BLOCK_DRAGON_EGG = 122;
+
+// Fountain center position
+const ivec3 FOUNTAIN_CENTER = ivec3(0, 64, 0);
+
+// Portal state buffer
+layout(std430, binding = 0) buffer PortalState {
+    uint dragon_alive;      // 1 = alive, 0 = dead
+    uint portal_active;     // 1 = portal blocks present, 0 = empty frames
+    uint egg_placed;        // 1 = dragon egg placed on fountain
+    uint victory_triggered; // 1 = player entered portal
+    uint padding[4];        // Alignment
+} state;
+
+// World voxel buffer - 3D grid of block IDs
+layout(std430, binding = 1) buffer WorldVoxels {
+    uint blocks[];
+} world;
+
+// World dimensions (uniform)
+layout(push_constant) uniform PushConstants {
+    ivec3 world_min;        // Minimum world coordinates
+    ivec3 world_size;       // World dimensions (blocks)
+    uint generate_mode;     // 0 = check state, 1 = generate fountain, 2 = activate portal
+} pc;
+
+// Convert world coordinates to buffer index
+uint worldToIndex(ivec3 pos) {
+    ivec3 local = pos - pc.world_min;
+    if (any(lessThan(local, ivec3(0))) || any(greaterThanEqual(local, pc.world_size))) {
+        return 0xFFFFFFFF; // Invalid index
+    }
+    return uint(local.x + local.y * pc.world_size.x + local.z * pc.world_size.x * pc.world_size.y);
+}
+
+// Set block at world position
+void setBlock(ivec3 pos, uint blockType) {
+    uint idx = worldToIndex(pos);
+    if (idx != 0xFFFFFFFF) {
+        world.blocks[idx] = blockType;
+    }
+}
+
+// Get block at world position
+uint getBlock(ivec3 pos) {
+    uint idx = worldToIndex(pos);
+    if (idx != 0xFFFFFFFF) {
+        return world.blocks[idx];
+    }
+    return BLOCK_AIR;
+}
+
+// Check if position is within fountain bedrock platform (Layer 1: y=64)
+bool isLayer1Bedrock(ivec3 pos) {
+    // 7x7 platform centered at (0, 64, 0)
+    return pos.y == 64 &&
+           abs(pos.x) <= 3 &&
+           abs(pos.z) <= 3;
+}
+
+// Check if position is Layer 2 bedrock ring (y=65)
+bool isLayer2Bedrock(ivec3 pos) {
+    // 5x5 ring (not solid - hollow center for portal)
+    if (pos.y != 65) return false;
+    int ax = abs(pos.x);
+    int az = abs(pos.z);
+    // Outer ring of 5x5 (max distance 2) but not center 3x3
+    return (ax <= 2 && az <= 2) && (ax == 2 || az == 2);
+}
+
+// Check if position is Layer 3 bedrock ring (y=66)
+bool isLayer3Bedrock(ivec3 pos) {
+    // 3x3 ring
+    if (pos.y != 66) return false;
+    int ax = abs(pos.x);
+    int az = abs(pos.z);
+    return (ax <= 1 && az <= 1) && (ax == 1 || az == 1);
+}
+
+// Check if position is Layer 4 bedrock pillar (y=67)
+bool isLayer4Bedrock(ivec3 pos) {
+    // Single bedrock pillar at center
+    return pos.y == 67 && pos.x == 0 && pos.z == 0;
+}
+
+// Check if position is a torch location (y=67, on pillar sides)
+bool isTorchPosition(ivec3 pos) {
+    if (pos.y != 67) return false;
+    // Torches on the four sides of the pillar
+    return (abs(pos.x) == 1 && pos.z == 0) ||
+           (pos.x == 0 && abs(pos.z) == 1);
+}
+
+// Check if position is dragon egg location (y=68)
+bool isDragonEggPosition(ivec3 pos) {
+    return pos.y == 68 && pos.x == 0 && pos.z == 0;
+}
+
+// Check if position is end portal frame (3x3 in center at y=64)
+bool isPortalFrame(ivec3 pos) {
+    if (pos.y != 64) return false;
+    // 3x3 portal frames in center, but corners are empty
+    int ax = abs(pos.x);
+    int az = abs(pos.z);
+    // Ring pattern: not center, not corners
+    return (ax <= 1 && az <= 1) &&
+           !(ax == 0 && az == 0) &&  // Not center
+           !(ax == 1 && az == 1);     // Not corners
+}
+
+// Check if position is portal block (center of frame, y=64)
+bool isPortalBlock(ivec3 pos) {
+    return pos.y == 64 && pos.x == 0 && pos.z == 0;
+}
+
+// Generate fountain structure
+void generateFountain(ivec3 pos) {
+    // Layer 1: 7x7 bedrock platform with portal frames
+    if (isLayer1Bedrock(pos)) {
+        if (isPortalFrame(pos)) {
+            setBlock(pos, BLOCK_END_PORTAL_FRAME);
+        } else if (isPortalBlock(pos)) {
+            // Portal center - active or not based on dragon state
+            if (state.portal_active == 1) {
+                setBlock(pos, BLOCK_END_PORTAL);
+            } else {
+                setBlock(pos, BLOCK_AIR);
+            }
+        } else {
+            setBlock(pos, BLOCK_BEDROCK);
+        }
+        return;
+    }
+
+    // Layer 2: 5x5 bedrock ring
+    if (isLayer2Bedrock(pos)) {
+        setBlock(pos, BLOCK_BEDROCK);
+        return;
+    }
+
+    // Layer 3: 3x3 bedrock ring
+    if (isLayer3Bedrock(pos)) {
+        setBlock(pos, BLOCK_BEDROCK);
+        return;
+    }
+
+    // Layer 4: pillar + torches
+    if (isLayer4Bedrock(pos)) {
+        setBlock(pos, BLOCK_BEDROCK);
+        return;
+    }
+    if (isTorchPosition(pos)) {
+        setBlock(pos, BLOCK_TORCH);
+        return;
+    }
+
+    // Layer 5: Dragon egg (only if placed)
+    if (isDragonEggPosition(pos) && state.egg_placed == 1) {
+        setBlock(pos, BLOCK_DRAGON_EGG);
+        return;
+    }
+}
+
+// Activate portal (called when dragon dies)
+void activatePortal(ivec3 pos) {
+    if (isPortalBlock(pos)) {
+        setBlock(pos, BLOCK_END_PORTAL);
+    }
+    if (isDragonEggPosition(pos)) {
+        setBlock(pos, BLOCK_DRAGON_EGG);
+    }
+}
+
+// Check if player position is in portal (victory condition)
+// This would be called from game logic with player position
+bool checkVictory(ivec3 playerPos) {
+    return state.portal_active == 1 &&
+           playerPos.x == 0 &&
+           playerPos.z == 0 &&
+           playerPos.y >= 64 &&
+           playerPos.y <= 65;
+}
+
+void main() {
+    // Calculate world position for this invocation
+    ivec3 localPos = ivec3(gl_GlobalInvocationID);
+    ivec3 worldPos = pc.world_min + localPos;
+
+    // Bounds check
+    if (any(greaterThanEqual(localPos, pc.world_size))) {
+        return;
+    }
+
+    // Mode 0: State check only (no generation)
+    if (pc.generate_mode == 0) {
+        return;
+    }
+
+    // Mode 1: Generate fountain structure
+    if (pc.generate_mode == 1) {
+        // Only process blocks near the fountain
+        ivec3 diff = worldPos - FOUNTAIN_CENTER;
+        if (abs(diff.x) <= 4 && abs(diff.z) <= 4 && diff.y >= 0 && diff.y <= 5) {
+            generateFountain(worldPos);
+        }
+        return;
+    }
+
+    // Mode 2: Activate portal (dragon just died)
+    if (pc.generate_mode == 2) {
+        // Update state
+        if (gl_GlobalInvocationID == uvec3(0, 0, 0)) {
+            state.dragon_alive = 0;
+            state.portal_active = 1;
+            state.egg_placed = 1;
+        }
+
+        // Activate portal blocks
+        ivec3 diff = worldPos - FOUNTAIN_CENTER;
+        if (abs(diff.x) <= 1 && abs(diff.z) <= 1 && diff.y >= 0 && diff.y <= 5) {
+            activatePortal(worldPos);
+        }
+        return;
+    }
+}

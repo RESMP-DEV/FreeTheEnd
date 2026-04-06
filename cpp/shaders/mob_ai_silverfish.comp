@@ -1,0 +1,704 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const uint MOB_TYPE_SILVERFISH = 5;
+
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;
+const uint AI_STATE_HIDE = 10;       // Burrowing into blocks
+const uint AI_STATE_CALL_SWARM = 11; // Calling nearby silverfish when hit
+const uint AI_STATE_DEAD = 9;
+
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_IN_WATER = 1 << 1;
+const uint MOB_FLAG_IN_LAVA = 1 << 2;
+const uint MOB_FLAG_NO_AI = 1 << 3;
+
+// Silverfish-specific constants
+const float SILVERFISH_HEALTH = 8.0;
+const float SILVERFISH_SPEED = 0.25;
+const float SILVERFISH_DETECTION_RANGE = 16.0;
+const float SILVERFISH_ATTACK_RANGE = 1.2;      // Tiny hitbox
+const float SILVERFISH_MELEE_DAMAGE = 1.0;
+const uint SILVERFISH_ATTACK_COOLDOWN = 20;     // 1 second
+const float SILVERFISH_CALL_RANGE = 21.0;       // Range to call other silverfish
+const uint SILVERFISH_HIDE_CHANCE = 10;         // % chance to burrow when idle
+
+// Block IDs
+const uint BLOCK_AIR = 0;
+const uint BLOCK_STONE = 1;
+const uint BLOCK_COBBLESTONE = 4;
+const uint BLOCK_MONSTER_EGG = 97;              // Infested stone/cobble/brick
+const uint BLOCK_STONE_BRICKS = 98;
+
+// Type data indices
+const uint TD_WAS_HIT = 0;           // Flag set when damaged
+const uint TD_CALL_TIMER = 1;        // Ticks remaining in call state
+const uint TD_HIDE_TARGET_X = 2;     // Target block for burrowing
+const uint TD_HIDE_TARGET_Y = 3;
+const uint TD_HIDE_TARGET_Z = 4;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+};
+
+// Melee attack output for CPU-side damage processing
+struct MeleeAttack {
+    uint source_entity;
+    uint target_entity;
+    float damage;
+    uint knockback_type;  // 0=normal, 1=tiny (silverfish)
+};
+
+// Silverfish spawn request (when calling swarm or spawning from blocks)
+struct SilverfishSpawn {
+    vec3 position;
+    uint source_mob_id;
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer MeleeBuffer {
+    uint melee_count;
+    MeleeAttack melee_attacks[];
+};
+
+layout(set = 0, binding = 4) buffer SpawnBuffer {
+    uint spawn_count;
+    SilverfishSpawn spawns[];
+};
+
+// Block destruction events (from block_breaking.comp)
+struct BlockBreakEvent {
+    ivec3 position;
+    uint block_id;
+    uint breaker_entity;
+    uint _pad;
+};
+
+layout(set = 0, binding = 5) buffer readonly BlockBreakBuffer {
+    uint break_count;
+    BlockBreakEvent breaks[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+} pc;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+uint random_int(inout uint seed, uint max_val) {
+    seed = pcg_hash(seed);
+    return seed % max_val;
+}
+
+vec2 random_horizontal(inout uint seed) {
+    float angle = random_float(seed) * 6.28318530718;
+    return vec2(cos(angle), sin(angle));
+}
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float angle_to(vec3 from, vec3 to) {
+    vec2 dir = normalize(to.xz - from.xz);
+    return atan(dir.x, dir.y);
+}
+
+// Block queries
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+void set_block_at(ivec3 pos, uint block_id) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    uint array_idx = idx >> 2;
+    uint shift = (idx & 3) * 8;
+    uint mask = ~(0xFFu << shift);
+    atomicAnd(world_blocks[array_idx], mask);
+    atomicOr(world_blocks[array_idx], block_id << shift);
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+// Check if block can be infested (turned into monster egg)
+bool can_infest(uint block_id) {
+    return block_id == BLOCK_STONE ||
+           block_id == BLOCK_COBBLESTONE ||
+           block_id == BLOCK_STONE_BRICKS;
+}
+
+// Check if block is already infested (monster egg)
+bool is_infested(uint block_id) {
+    return block_id == BLOCK_MONSTER_EGG;
+}
+
+bool is_walkable(vec3 pos) {
+    ivec3 block = world_to_block(pos);
+    return !is_solid(get_block_at(block)) &&
+           !is_solid(get_block_at(block + ivec3(0, 1, 0))) &&
+           is_solid(get_block_at(block + ivec3(0, -1, 0)));
+}
+
+// Entity queries
+vec3 get_entity_position(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool entity_exists(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint find_nearest_entity(vec3 pos, float max_range, out float out_distance) {
+    uint nearest = 0xFFFFFFFF;
+    float nearest_dist = max_range * max_range;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist_sq = distance_squared(pos, entities[i].position);
+        if (dist_sq < nearest_dist) {
+            nearest_dist = dist_sq;
+            nearest = entities[i].entity_id;
+        }
+    }
+
+    out_distance = sqrt(nearest_dist);
+    return nearest;
+}
+
+// ============================================================================
+// Swarm Behavior - Find and alert nearby silverfish
+// ============================================================================
+
+void call_nearby_silverfish(MobState caller, inout uint seed) {
+    // Search for other silverfish within range
+    for (uint i = 0; i < pc.mob_count; i++) {
+        MobState other = mobs[i];
+        if (other.mob_type != MOB_TYPE_SILVERFISH) continue;
+        if (other.ai_state == AI_STATE_DEAD) continue;
+
+        float dist = distance(caller.position, other.position);
+        if (dist > SILVERFISH_CALL_RANGE) continue;
+        if (dist < 0.1) continue; // Skip self
+
+        // Alert this silverfish - make it chase the caller's target
+        if (caller.target_entity_id != 0xFFFFFFFF && other.ai_state != AI_STATE_CHASE) {
+            mobs[i].target_entity_id = caller.target_entity_id;
+            mobs[i].ai_state = AI_STATE_CHASE;
+            mobs[i].state_timer = 0;
+        }
+    }
+
+    // Also wake up silverfish from nearby infested blocks
+    // Search a 5x5x5 area around the caller
+    ivec3 center = world_to_block(caller.position);
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                ivec3 pos = center + ivec3(dx, dy, dz);
+                uint block = get_block_at(pos);
+
+                if (is_infested(block) && random_int(seed, 100) < 20) {
+                    // Spawn a silverfish from this block
+                    uint spawn_idx = atomicAdd(spawn_count, 1);
+                    if (spawn_idx < 16) { // Max spawns per frame
+                        spawns[spawn_idx].position = vec3(pos) + vec3(0.5, 0.0, 0.5);
+                        spawns[spawn_idx].source_mob_id = 0xFFFFFFFF;
+                    }
+                    // Replace block with air
+                    set_block_at(pos, BLOCK_AIR);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Find infestable block for hiding
+// ============================================================================
+
+bool find_hide_block(vec3 pos, inout ivec3 out_block, inout uint seed) {
+    ivec3 center = world_to_block(pos);
+
+    // Search in expanding rings
+    for (int r = 1; r <= 5; r++) {
+        for (int attempts = 0; attempts < 8; attempts++) {
+            int dx = int(random_float(seed) * float(r * 2 + 1)) - r;
+            int dy = int(random_float(seed) * 3.0) - 1;
+            int dz = int(random_float(seed) * float(r * 2 + 1)) - r;
+
+            ivec3 check = center + ivec3(dx, dy, dz);
+            uint block = get_block_at(check);
+
+            if (can_infest(block)) {
+                out_block = check;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Physics
+// ============================================================================
+
+const float GRAVITY = 0.08;
+const float DRAG = 0.02;
+const float TERMINAL_VELOCITY = 3.92;
+
+void apply_physics(inout MobState mob, float dt) {
+    // Gravity
+    if ((mob.flags & MOB_FLAG_ON_GROUND) == 0) {
+        mob.velocity.y -= GRAVITY * dt * 20.0;
+        mob.velocity.y = max(mob.velocity.y, -TERMINAL_VELOCITY);
+    }
+
+    // Drag
+    mob.velocity *= (1.0 - DRAG);
+
+    // Apply velocity
+    mob.position += mob.velocity * dt * 20.0;
+
+    // Ground check
+    ivec3 feet = world_to_block(mob.position - vec3(0.0, 0.1, 0.0));
+    if (is_solid(get_block_at(feet))) {
+        mob.flags |= MOB_FLAG_ON_GROUND;
+        mob.velocity.y = max(mob.velocity.y, 0.0);
+    } else {
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+void move_toward(inout MobState mob, vec3 target, float speed) {
+    vec3 dir = normalize_safe(target - mob.position);
+    dir.y = 0.0;
+    mob.velocity.x = dir.x * speed;
+    mob.velocity.z = dir.z * speed;
+    mob.yaw = angle_to(mob.position, target);
+}
+
+void jump(inout MobState mob) {
+    if ((mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        mob.velocity.y = mob.jump_velocity;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+// ============================================================================
+// AI States
+// ============================================================================
+
+void silverfish_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, SILVERFISH_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Maybe try to hide in a block
+    if (mob.state_timer > 100 && random_int(seed, 100) < SILVERFISH_HIDE_CHANCE) {
+        ivec3 hide_block;
+        if (find_hide_block(mob.position, hide_block, seed)) {
+            mob.type_data[TD_HIDE_TARGET_X] = uint(hide_block.x);
+            mob.type_data[TD_HIDE_TARGET_Y] = uint(hide_block.y);
+            mob.type_data[TD_HIDE_TARGET_Z] = uint(hide_block.z);
+            mob.ai_state = AI_STATE_HIDE;
+            mob.state_timer = 0;
+            return;
+        }
+    }
+
+    // Random wander
+    if (mob.state_timer > 40 + random_int(seed, 60)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec2 offset = random_horizontal(seed) * 4.0;
+        mob.path_target = mob.position + vec3(offset.x, 0.0, offset.y);
+        mob.state_timer = 0;
+    }
+
+    // Slow down
+    mob.velocity.x *= 0.8;
+    mob.velocity.z *= 0.8;
+}
+
+void silverfish_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, SILVERFISH_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Move toward wander target
+    float target_dist = length(mob.position.xz - mob.path_target.xz);
+    if (target_dist < 1.0 || mob.state_timer > 100) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    move_toward(mob, mob.path_target, SILVERFISH_SPEED * 0.5);
+
+    // Jump over obstacles
+    ivec3 front_block = world_to_block(mob.position + normalize_safe(mob.velocity) * 0.3);
+    if (is_solid(get_block_at(front_block))) {
+        jump(mob);
+    }
+}
+
+void silverfish_chase(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target
+    if (dist > SILVERFISH_DETECTION_RANGE * 2.0) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In attack range
+    if (dist < SILVERFISH_ATTACK_RANGE) {
+        mob.ai_state = AI_STATE_ATTACK;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Chase - silverfish are fast and erratic
+    move_toward(mob, target_pos, SILVERFISH_SPEED);
+
+    // Erratic movement - slight random deviation
+    if (random_int(seed, 10) == 0) {
+        vec2 jitter = random_horizontal(seed) * 0.1;
+        mob.velocity.x += jitter.x;
+        mob.velocity.z += jitter.y;
+    }
+
+    // Jump over obstacles frequently
+    ivec3 front_block = world_to_block(mob.position + normalize_safe(mob.velocity) * 0.3);
+    if (is_solid(get_block_at(front_block))) {
+        jump(mob);
+    }
+}
+
+void silverfish_attack(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Out of attack range
+    if (dist > SILVERFISH_ATTACK_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Face target
+    mob.yaw = angle_to(mob.position, target_pos);
+
+    // Attack on cooldown
+    if (mob.attack_cooldown == 0) {
+        // Queue melee attack
+        uint attack_idx = atomicAdd(melee_count, 1);
+        if (attack_idx < 64) {
+            melee_attacks[attack_idx].source_entity = 0xFFFFFFFF; // Mob attacks use different ID system
+            melee_attacks[attack_idx].target_entity = mob.target_entity_id;
+            melee_attacks[attack_idx].damage = SILVERFISH_MELEE_DAMAGE;
+            melee_attacks[attack_idx].knockback_type = 1; // Tiny knockback
+        }
+        mob.attack_cooldown = SILVERFISH_ATTACK_COOLDOWN;
+    }
+
+    // Slight movement toward target even while attacking
+    if (dist > SILVERFISH_ATTACK_RANGE * 0.5) {
+        move_toward(mob, target_pos, SILVERFISH_SPEED * 0.3);
+    }
+}
+
+void silverfish_call_swarm(inout MobState mob, inout uint seed) {
+    // Called when silverfish is hit - alerts nearby silverfish
+    mob.type_data[TD_CALL_TIMER]++;
+
+    if (mob.type_data[TD_CALL_TIMER] == 1) {
+        // First tick - do the actual calling
+        call_nearby_silverfish(mob, seed);
+    }
+
+    // Stay in call state for a moment
+    if (mob.type_data[TD_CALL_TIMER] > 10) {
+        mob.type_data[TD_WAS_HIT] = 0;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+
+    // Still move toward target while calling
+    if (entity_exists(mob.target_entity_id)) {
+        vec3 target_pos = get_entity_position(mob.target_entity_id);
+        move_toward(mob, target_pos, SILVERFISH_SPEED * 0.5);
+    }
+}
+
+void silverfish_hide(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Get hide target
+    ivec3 target = ivec3(
+        int(mob.type_data[TD_HIDE_TARGET_X]),
+        int(mob.type_data[TD_HIDE_TARGET_Y]),
+        int(mob.type_data[TD_HIDE_TARGET_Z])
+    );
+
+    // Check if target is still valid
+    uint block = get_block_at(target);
+    if (!can_infest(block)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Move toward hide block
+    vec3 target_pos = vec3(target) + vec3(0.5, 0.0, 0.5);
+    float dist = distance(mob.position, target_pos);
+
+    if (dist < 0.5) {
+        // Close enough - burrow into block
+        set_block_at(target, BLOCK_MONSTER_EGG);
+        mob.ai_state = AI_STATE_DEAD; // Remove this silverfish
+        mob.health = 0.0;
+        return;
+    }
+
+    move_toward(mob, target_pos, SILVERFISH_SPEED);
+
+    // Timeout
+    if (mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.state_timer = 0;
+    }
+
+    // Interrupt if player detected
+    float player_dist;
+    uint target_entity = find_nearest_entity(mob.position, SILVERFISH_DETECTION_RANGE, player_dist);
+    if (target_entity != 0xFFFFFFFF) {
+        mob.target_entity_id = target_entity;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    // Only process silverfish
+    if (mob.mob_type != MOB_TYPE_SILVERFISH) return;
+    if (mob.ai_state == AI_STATE_DEAD || (mob.flags & MOB_FLAG_NO_AI) != 0) return;
+
+    uint seed = mob.random_seed ^ pc.random_seed ^ idx;
+    float dt = pc.delta_time;
+
+    // Timers
+    mob.hurt_time = max(mob.hurt_time - 1, 0);
+    mob.no_damage_time = max(mob.no_damage_time - 1, 0);
+    mob.attack_cooldown = max(mob.attack_cooldown - 1, 0);
+    mob.ai_tick_cooldown = max(mob.ai_tick_cooldown - 1, 0);
+
+    // Check if we were just hit - trigger swarm call
+    if (mob.hurt_time == 9 && mob.type_data[TD_WAS_HIT] == 0) {
+        // Just took damage this tick
+        mob.type_data[TD_WAS_HIT] = 1;
+        mob.type_data[TD_CALL_TIMER] = 0;
+        mob.ai_state = AI_STATE_CALL_SWARM;
+    }
+
+    // AI
+    if (mob.ai_tick_cooldown == 0) {
+        mob.ai_tick_cooldown = 2; // AI runs every 2 ticks
+
+        switch (mob.ai_state) {
+            case AI_STATE_IDLE:
+                silverfish_idle(mob, seed);
+                break;
+            case AI_STATE_WANDER:
+                silverfish_wander(mob, seed);
+                break;
+            case AI_STATE_CHASE:
+                silverfish_chase(mob, seed);
+                break;
+            case AI_STATE_ATTACK:
+                silverfish_attack(mob, seed);
+                break;
+            case AI_STATE_CALL_SWARM:
+                silverfish_call_swarm(mob, seed);
+                break;
+            case AI_STATE_HIDE:
+                silverfish_hide(mob, seed);
+                break;
+        }
+    }
+
+    // Physics
+    apply_physics(mob, dt);
+
+    // Death
+    if (mob.health <= 0.0) {
+        mob.ai_state = AI_STATE_DEAD;
+    }
+
+    mob.random_seed = seed;
+    mobs[idx] = mob;
+}
+
+// ============================================================================
+// Monster Egg Block Break Handler
+// Called by block_breaking.comp when an infested block is broken
+// Spawns a silverfish at that location
+// ============================================================================
+
+void spawn_from_infested_block(ivec3 block_pos, uint breaker_entity) {
+    // Queue silverfish spawn
+    uint spawn_idx = atomicAdd(spawn_count, 1);
+    if (spawn_idx < 16) {
+        spawns[spawn_idx].position = vec3(block_pos) + vec3(0.5, 0.0, 0.5);
+        spawns[spawn_idx].source_mob_id = breaker_entity; // Track who broke the block
+    }
+}

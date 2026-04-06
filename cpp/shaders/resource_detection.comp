@@ -1,0 +1,423 @@
+#version 450
+
+// resource_detection.comp - GPU-accelerated resource detection
+// Stage 2 survival mode: detect trees, stone, caves, and ores
+// Uses raycast cone sampling around player's look direction
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint num_envs;
+    uint seed;
+    uint tick;
+    uint reserved;
+} pc;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Block IDs (MC 1.8.9)
+const int AIR = 0;
+const int STONE = 1;
+const int GRASS = 2;
+const int DIRT = 3;
+const int COBBLESTONE = 4;
+const int OAK_LOG = 17;
+const int OAK_LEAVES = 18;
+const int COAL_ORE = 16;
+const int IRON_ORE = 15;
+const int GOLD_ORE = 14;
+const int DIAMOND_ORE = 56;
+const int WATER = 9;
+const int LAVA = 11;
+
+// Detection parameters
+const float MAX_DETECTION_RANGE = 64.0;
+const float CONE_HALF_ANGLE = 0.7854;  // 45 degrees
+const int CONE_RAYS = 8;               // Rays per horizontal sweep
+const int VERTICAL_RAYS = 4;           // Vertical divisions
+const float RAY_STEP = 0.5;            // Step size for raycast
+const float TREE_Y_THRESHOLD = 70.0;
+const float CAVE_DARKNESS_THRESHOLD = 7.0;
+const float IRON_ORE_MAX_Y = 64.0;
+const float NEARBY_THRESHOLD = 0.25;   // 16/64 blocks normalized
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    float hunger;
+    float saturation;
+    float exhaustion;
+    uint flags;
+    uint invincibility_timer;
+    uint attack_cooldown;
+    uint weapon_slot;
+    float arrow_charge;
+    uint arrows;
+    uint reserved[2];
+};
+
+// Resource detection output (16 floats)
+struct ResourceObservation {
+    float nearest_tree_distance;
+    float nearest_tree_dir_x;
+    float nearest_tree_dir_z;
+    float nearest_exposed_stone;
+    float stone_dir_x;
+    float stone_dir_z;
+    float nearest_cave_entrance;
+    float cave_dir_x;
+    float cave_dir_z;
+    float nearest_iron_ore;
+    float iron_dir_x;
+    float iron_dir_z;
+    float nearest_coal;
+    float coal_dir_x;
+    float coal_dir_z;
+    float any_resource_nearby;
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer PlayerBuffer {
+    Player players[];
+};
+
+// Chunk data for world queries (simplified procedural for now)
+layout(set = 0, binding = 1) buffer ChunkBuffer {
+    int chunks[];  // Flat array of block IDs
+};
+
+// Resource observations output
+layout(set = 0, binding = 2) buffer ResourceBuffer {
+    ResourceObservation resources[];
+};
+
+// ============================================================================
+// NOISE FUNCTIONS (Procedural world generation)
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+uint hash3(int x, int y, int z, uint seed) {
+    uint h = seed;
+    h ^= uint(x) * 374761393u;
+    h ^= uint(y) * 668265263u;
+    h ^= uint(z) * 2654435761u;
+    return hash(h);
+}
+
+float noise(int x, int y, int z, uint seed) {
+    return float(hash3(x, y, z, seed) & 0xFFFFu) / 65535.0;
+}
+
+// ============================================================================
+// PROCEDURAL WORLD QUERY
+// ============================================================================
+
+// Check if position is in a cave
+bool is_cave(int x, int y, int z, uint seed) {
+    float n = noise(x / 8, y / 4, z / 8, seed);
+    return n > 0.7 && y > 5 && y < 60;
+}
+
+// Get ore type at position
+int get_ore(int x, int y, int z, uint seed) {
+    float n = noise(x, y, z, seed + 1000u);
+
+    if (y <= 16 && n > 0.995) return DIAMOND_ORE;
+    if (y <= 32 && n > 0.98) return GOLD_ORE;
+    if (y <= 64 && n > 0.94) return IRON_ORE;
+    if (y <= 128 && n > 0.90) return COAL_ORE;
+
+    return STONE;
+}
+
+// Check if position is a tree trunk
+bool is_tree_trunk(int x, int z, uint seed) {
+    int gx = (x + 8) / 16;
+    int gz = (z + 8) / 16;
+    float n = noise(gx * 1000, 0, gz * 1000, seed);
+    if (n < 0.3) return false;
+
+    int tx = gx * 16 + int(noise(gx, 1, gz, seed) * 8.0);
+    int tz = gz * 16 + int(noise(gx, 2, gz, seed) * 8.0);
+
+    return x == tx && z == tz;
+}
+
+// Check if position is in tree canopy
+bool is_tree_canopy(int x, int y, int z, uint seed) {
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dz = -2; dz <= 2; dz++) {
+            if (is_tree_trunk(x + dx, z + dz, seed)) {
+                int dist = abs(dx) + abs(dz);
+                int height = y - 65;
+                int max_dist = 3 - height;
+                if (dist <= max_dist && max_dist > 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Get block at world position (procedural)
+int get_block(int x, int y, int z, uint seed) {
+    if (y < 0) return STONE;
+    if (y == 0) return STONE;
+
+    // Underground
+    if (y < 64) {
+        if (is_cave(x, y, z, seed)) return AIR;
+        int ore = get_ore(x, y, z, seed);
+        if (ore != STONE) return ore;
+        return STONE;
+    }
+
+    // Surface
+    if (y == 64) return GRASS;
+    if (y == 65) {
+        if (is_tree_trunk(x, z, seed)) return OAK_LOG;
+    }
+    if (y >= 66 && y <= 70) {
+        if (is_tree_canopy(x, y, z, seed)) return OAK_LEAVES;
+    }
+
+    return AIR;
+}
+
+// Get light level (simplified)
+int get_light(int x, int y, int z, uint seed) {
+    if (y >= 64) return 15;
+    if (is_cave(x, y, z, seed)) return 0;
+    return 0;
+}
+
+// Check if block is air
+bool is_air_block(int x, int y, int z, uint seed) {
+    return get_block(x, y, z, seed) == AIR;
+}
+
+// ============================================================================
+// RAYCAST
+// ============================================================================
+
+struct RayHit {
+    bool hit;
+    float distance;
+    int block_id;
+    int x, y, z;
+};
+
+RayHit raycast(vec3 origin, vec3 dir, float max_dist, uint seed) {
+    RayHit result;
+    result.hit = false;
+    result.distance = max_dist;
+    result.block_id = AIR;
+    result.x = 0;
+    result.y = 0;
+    result.z = 0;
+
+    float len = length(dir);
+    if (len < 0.0001) return result;
+    dir /= len;
+
+    float t = 0.0;
+    while (t < max_dist) {
+        int bx = int(floor(origin.x + dir.x * t));
+        int by = int(floor(origin.y + dir.y * t));
+        int bz = int(floor(origin.z + dir.z * t));
+
+        if (!is_air_block(bx, by, bz, seed)) {
+            result.hit = true;
+            result.distance = t;
+            result.block_id = get_block(bx, by, bz, seed);
+            result.x = bx;
+            result.y = by;
+            result.z = bz;
+            return result;
+        }
+
+        t += RAY_STEP;
+    }
+
+    return result;
+}
+
+// ============================================================================
+// RESOURCE DETECTION
+// ============================================================================
+
+bool is_wood_log(int block_id) {
+    return block_id == OAK_LOG;
+}
+
+bool is_exposed_stone(int block_id) {
+    return block_id == STONE || block_id == COBBLESTONE;
+}
+
+bool is_iron_ore_block(int block_id) {
+    return block_id == IRON_ORE;
+}
+
+bool is_coal_ore_block(int block_id) {
+    return block_id == COAL_ORE;
+}
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+    if (env_id >= pc.num_envs) return;
+
+    Player p = players[env_id];
+    uint seed = pc.seed + env_id;
+
+    // Initialize result
+    ResourceObservation obs;
+    obs.nearest_tree_distance = 1.0;
+    obs.nearest_tree_dir_x = 0.0;
+    obs.nearest_tree_dir_z = 0.0;
+    obs.nearest_exposed_stone = 1.0;
+    obs.stone_dir_x = 0.0;
+    obs.stone_dir_z = 0.0;
+    obs.nearest_cave_entrance = 1.0;
+    obs.cave_dir_x = 0.0;
+    obs.cave_dir_z = 0.0;
+    obs.nearest_iron_ore = 1.0;
+    obs.iron_dir_x = 0.0;
+    obs.iron_dir_z = 0.0;
+    obs.nearest_coal = 1.0;
+    obs.coal_dir_x = 0.0;
+    obs.coal_dir_z = 0.0;
+    obs.any_resource_nearby = 0.0;
+
+    // Eye position
+    vec3 eye = p.position + vec3(0.0, 1.62, 0.0);
+
+    // Look direction
+    float yaw_rad = radians(p.yaw);
+    float pitch_rad = radians(p.pitch);
+
+    vec3 look_dir = vec3(
+        -sin(yaw_rad) * cos(pitch_rad),
+        -sin(pitch_rad),
+        cos(yaw_rad) * cos(pitch_rad)
+    );
+
+    // Cone raycast sampling
+    for (int v = 0; v < VERTICAL_RAYS; v++) {
+        float v_angle = -CONE_HALF_ANGLE + (2.0 * CONE_HALF_ANGLE * float(v)) / float(VERTICAL_RAYS - 1);
+
+        for (int h = 0; h < CONE_RAYS; h++) {
+            float h_angle = (2.0 * 3.14159 * float(h)) / float(CONE_RAYS);
+
+            // Compute ray direction with cone offset
+            float ray_yaw = yaw_rad + cos(h_angle) * CONE_HALF_ANGLE;
+            float ray_pitch = pitch_rad + v_angle + sin(h_angle) * CONE_HALF_ANGLE * 0.5;
+
+            vec3 ray_dir = vec3(
+                -sin(ray_yaw) * cos(ray_pitch),
+                -sin(ray_pitch),
+                cos(ray_yaw) * cos(ray_pitch)
+            );
+
+            // Cast ray
+            RayHit hit = raycast(eye, ray_dir, MAX_DETECTION_RANGE, seed);
+
+            if (!hit.hit) continue;
+
+            float norm_dist = hit.distance / MAX_DETECTION_RANGE;
+
+            // Direction to hit
+            vec2 to_hit = vec2(float(hit.x) - p.position.x, float(hit.z) - p.position.z);
+            float to_len = length(to_hit);
+            if (to_len > 0.001) {
+                to_hit /= to_len;
+            }
+
+            // Check for trees
+            if (is_wood_log(hit.block_id) && hit.y > 64 && float(hit.y) < TREE_Y_THRESHOLD) {
+                if (norm_dist < obs.nearest_tree_distance) {
+                    obs.nearest_tree_distance = norm_dist;
+                    obs.nearest_tree_dir_x = to_hit.x;
+                    obs.nearest_tree_dir_z = to_hit.y;
+                }
+            }
+
+            // Check for exposed stone
+            if (is_exposed_stone(hit.block_id)) {
+                bool is_shallow = hit.y > 50;
+                bool is_cave_stone = hit.y < 60 && get_light(hit.x, hit.y + 1, hit.z, seed) < int(CAVE_DARKNESS_THRESHOLD);
+
+                if (is_shallow || is_cave_stone) {
+                    if (norm_dist < obs.nearest_exposed_stone) {
+                        obs.nearest_exposed_stone = norm_dist;
+                        obs.stone_dir_x = to_hit.x;
+                        obs.stone_dir_z = to_hit.y;
+                    }
+                }
+            }
+
+            // Check for cave entrances
+            if (hit.block_id == AIR || hit.block_id == STONE) {
+                int light = get_light(hit.x, hit.y, hit.z, seed);
+                bool is_dark = light < int(CAVE_DARKNESS_THRESHOLD);
+                bool is_underground = hit.y < 60;
+
+                if (is_dark && is_underground) {
+                    if (norm_dist < obs.nearest_cave_entrance) {
+                        obs.nearest_cave_entrance = norm_dist;
+                        obs.cave_dir_x = to_hit.x;
+                        obs.cave_dir_z = to_hit.y;
+                    }
+                }
+            }
+
+            // Check for iron ore
+            if (is_iron_ore_block(hit.block_id) && float(hit.y) < IRON_ORE_MAX_Y) {
+                if (norm_dist < obs.nearest_iron_ore) {
+                    obs.nearest_iron_ore = norm_dist;
+                    obs.iron_dir_x = to_hit.x;
+                    obs.iron_dir_z = to_hit.y;
+                }
+            }
+
+            // Check for coal ore
+            if (is_coal_ore_block(hit.block_id)) {
+                if (norm_dist < obs.nearest_coal) {
+                    obs.nearest_coal = norm_dist;
+                    obs.coal_dir_x = to_hit.x;
+                    obs.coal_dir_z = to_hit.y;
+                }
+            }
+        }
+    }
+
+    // Calculate aggregate flag
+    if (obs.nearest_tree_distance < NEARBY_THRESHOLD ||
+        obs.nearest_exposed_stone < NEARBY_THRESHOLD ||
+        obs.nearest_cave_entrance < NEARBY_THRESHOLD ||
+        obs.nearest_iron_ore < NEARBY_THRESHOLD ||
+        obs.nearest_coal < NEARBY_THRESHOLD) {
+        obs.any_resource_nearby = 1.0;
+    }
+
+    resources[env_id] = obs;
+}

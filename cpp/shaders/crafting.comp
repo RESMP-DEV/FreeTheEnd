@@ -1,0 +1,509 @@
+#version 450
+
+/*
+ * crafting.comp - Vulkan compute shader for Minecraft 1.8.9 crafting operations
+ *
+ * Performs parallel crafting validation and inventory transformation.
+ * Recipe lookup via uniform buffer containing recipe table.
+ *
+ * Input: inventory state, recipe_id
+ * Output: new inventory state, success flag
+ *
+ * Recipe table format (per recipe):
+ *   uint16 recipe_id
+ *   uint16 output_item_id
+ *   uint8  output_count
+ *   uint8  grid_width      (1-3)
+ *   uint8  grid_height     (1-3)
+ *   uint8  shapeless       (0 = shaped, 1 = shapeless)
+ *   uint16 ingredients[9]  (item_ids for 3x3 grid, 0 = empty)
+ *   uint8  ingredient_counts[9]
+ *   uint16 output_damage
+ *   uint8  padding[1]
+ *
+ * Recipe entry size: 32 bytes (for alignment)
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Crafting modes
+const uint CRAFT_MODE_VALIDATE = 0;    // Check if can craft, don't modify
+const uint CRAFT_MODE_CRAFT_ONE = 1;   // Craft single item
+const uint CRAFT_MODE_CRAFT_ALL = 2;   // Craft max possible
+const uint CRAFT_MODE_FIND_RECIPE = 3; // Find matching recipe for grid contents
+
+// Slot indices (same as inventory_ops.comp)
+const uint CRAFT_OUTPUT = 0;
+const uint CRAFT_INPUT_START = 1;
+const uint CRAFT_INPUT_END = 4;
+const uint MAIN_INV_START = 9;
+const uint MAIN_INV_END = 35;
+const uint HOTBAR_START = 36;
+const uint HOTBAR_END = 44;
+
+const uint INV_SIZE = 46;
+const uint INV_STRIDE = 232;
+const uint RECIPE_STRIDE = 8;  // 32 bytes / 4 = 8 uints
+const uint MAX_RECIPES = 1024;
+
+// Inventory buffer (SSBO) - shared with inventory_ops.comp
+layout(set = 0, binding = 0) buffer InventoryBuffer {
+    uint data[];
+} inventories;
+
+// Recipe table (UBO for read-only access)
+layout(set = 0, binding = 1) uniform RecipeTable {
+    uint recipes[MAX_RECIPES * RECIPE_STRIDE];
+} recipe_table;
+
+// Crafting requests
+layout(set = 0, binding = 2) buffer CraftingRequests {
+    uint requests[];  // agent_id, recipe_id, mode, reserved
+} craft_requests;
+
+// Crafting results
+layout(set = 0, binding = 3) buffer CraftingResults {
+    uint results[];  // success, crafted_count, output_item, output_damage
+} craft_results;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint num_agents;
+    uint num_requests;
+    uint num_recipes;
+    uint use_crafting_table;  // 0 = 2x2 grid, 1 = 3x3 grid
+} push;
+
+// Inventory access helpers (same as inventory_ops.comp)
+uint getInventoryOffset(uint agent_id) {
+    return agent_id * (INV_STRIDE / 4);
+}
+
+uint readItemId(uint base_offset, uint slot) {
+    uint word_offset = base_offset + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return uint((slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16));
+}
+
+void writeItemId(uint base_offset, uint slot, uint item_id) {
+    uint word_offset = base_offset + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | uint(item_id);
+    } else {
+        word = (word & 0x0000FFFF) | (uint(item_id) << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+uint readCount(uint base_offset, uint slot) {
+    uint count_base = base_offset + 23;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    return uint((word >> shift) & 0xFF);
+}
+
+void writeCount(uint base_offset, uint slot, uint count) {
+    uint count_base = base_offset + 23;
+    uint word_offset = count_base + (slot / 4);
+    uint word = inventories.data[word_offset];
+    uint shift = (slot & 3) * 8;
+    word = (word & ~(0xFF << shift)) | (uint(count) << shift);
+    inventories.data[word_offset] = word;
+}
+
+uint readDamage(uint base_offset, uint slot) {
+    uint damage_base = base_offset + 35;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    return uint((slot & 1) == 0 ? (word & 0xFFFF) : (word >> 16));
+}
+
+void writeDamage(uint base_offset, uint slot, uint damage) {
+    uint damage_base = base_offset + 35;
+    uint word_offset = damage_base + (slot / 2);
+    uint word = inventories.data[word_offset];
+    if ((slot & 1) == 0) {
+        word = (word & 0xFFFF0000) | uint(damage);
+    } else {
+        word = (word & 0x0000FFFF) | (uint(damage) << 16);
+    }
+    inventories.data[word_offset] = word;
+}
+
+void clearSlot(uint base_offset, uint slot) {
+    writeItemId(base_offset, slot, 0);
+    writeCount(base_offset, slot, 0);
+    writeDamage(base_offset, slot, 0);
+}
+
+// Recipe access helpers
+struct Recipe {
+    uint recipe_id;
+    uint output_item_id;
+    uint output_count;
+    uint grid_width;
+    uint grid_height;
+    uint shapeless;
+    uint ingredients[9];
+    uint ingredient_counts[9];
+    uint output_damage;
+};
+
+Recipe loadRecipe(uint recipe_idx) {
+    Recipe r;
+    uint base = recipe_idx * RECIPE_STRIDE;
+
+    // Word 0: recipe_id | output_item_id
+    uint w0 = recipe_table.recipes[base];
+    r.recipe_id = uint(w0 & 0xFFFF);
+    r.output_item_id = uint(w0 >> 16);
+
+    // Word 1: output_count | grid_width | grid_height | shapeless
+    uint w1 = recipe_table.recipes[base + 1];
+    r.output_count = uint(w1 & 0xFF);
+    r.grid_width = uint((w1 >> 8) & 0xFF);
+    r.grid_height = uint((w1 >> 16) & 0xFF);
+    r.shapeless = uint((w1 >> 24) & 0xFF);
+
+    // Words 2-5: ingredients[0-7] (2 per word)
+    for (uint i = 0; i < 4; i++) {
+        uint w = recipe_table.recipes[base + 2 + i];
+        r.ingredients[i * 2] = uint(w & 0xFFFF);
+        r.ingredients[i * 2 + 1] = uint(w >> 16);
+    }
+
+    // Word 6: ingredients[8] | ingredient_counts[0-1]
+    uint w6 = recipe_table.recipes[base + 6];
+    r.ingredients[8] = uint(w6 & 0xFFFF);
+    r.ingredient_counts[0] = uint((w6 >> 16) & 0xFF);
+    r.ingredient_counts[1] = uint((w6 >> 24) & 0xFF);
+
+    // Word 7: ingredient_counts[2-5]
+    uint w7 = recipe_table.recipes[base + 7];
+    r.ingredient_counts[2] = uint(w7 & 0xFF);
+    r.ingredient_counts[3] = uint((w7 >> 8) & 0xFF);
+    r.ingredient_counts[4] = uint((w7 >> 16) & 0xFF);
+    r.ingredient_counts[5] = uint((w7 >> 24) & 0xFF);
+
+    // Remaining counts and output_damage encoded in earlier unused bits
+    // For simplicity, default remaining counts to 1
+    for (uint i = 6; i < 9; i++) {
+        r.ingredient_counts[i] = 1;
+    }
+    r.output_damage = 0;
+
+    return r;
+}
+
+// Map grid position to inventory slot
+uint gridToSlot(uint grid_x, uint grid_y, bool use_table) {
+    if (use_table) {
+        // 3x3 crafting table grid - would need different slot mapping
+        // For player inventory, only 2x2 is available
+        return CRAFT_INPUT_START + grid_y * 2 + grid_x;
+    }
+    // 2x2 player inventory crafting grid
+    if (grid_x >= 2 || grid_y >= 2) return 0xFFFFFFFF;
+    return CRAFT_INPUT_START + grid_y * 2 + grid_x;
+}
+
+// Check if inventory has required ingredients for recipe
+bool canCraft(uint inv_offset, Recipe recipe, bool use_table) {
+    uint max_width = use_table ? 3 : 2;
+    uint max_height = use_table ? 3 : 2;
+
+    if (recipe.grid_width > max_width || recipe.grid_height > max_height) {
+        return false;
+    }
+
+    if (recipe.shapeless != 0) {
+        // Shapeless: check if all ingredients exist anywhere in crafting grid
+        bool ingredient_found[9];
+        for (uint i = 0; i < 9; i++) {
+            ingredient_found[i] = (recipe.ingredients[i] == 0);
+        }
+
+        // Scan crafting slots for matches
+        uint grid_size = use_table ? 9 : 4;
+        for (uint slot_idx = 0; slot_idx < grid_size; slot_idx++) {
+            uint slot = CRAFT_INPUT_START + slot_idx;
+            uint item = readItemId(inv_offset, slot);
+            uint count = readCount(inv_offset, slot);
+
+            if (item == 0) continue;
+
+            bool matched = false;
+            for (uint i = 0; i < 9; i++) {
+                if (!ingredient_found[i] &&
+                    recipe.ingredients[i] == item &&
+                    count >= recipe.ingredient_counts[i]) {
+                    ingredient_found[i] = true;
+                    matched = true;
+                    break;
+                }
+            }
+
+            // If item in grid doesn't match any ingredient, fail
+            if (!matched && item != 0) return false;
+        }
+
+        // Check all required ingredients found
+        for (uint i = 0; i < 9; i++) {
+            if (!ingredient_found[i]) return false;
+        }
+        return true;
+    } else {
+        // Shaped: ingredients must be in exact positions
+        for (uint gy = 0; gy < recipe.grid_height; gy++) {
+            for (uint gx = 0; gx < recipe.grid_width; gx++) {
+                uint recipe_idx = gy * 3 + gx;  // Recipe always uses 3-wide indexing
+                uint slot = gridToSlot(gx, gy, use_table);
+
+                if (slot == 0xFFFFFFFF) return false;
+
+                uint required_item = recipe.ingredients[recipe_idx];
+                uint required_count = recipe.ingredient_counts[recipe_idx];
+
+                uint slot_item = readItemId(inv_offset, slot);
+                uint slot_count = readCount(inv_offset, slot);
+
+                if (required_item == 0) {
+                    if (slot_item != 0) return false;  // Slot should be empty
+                } else {
+                    if (slot_item != required_item) return false;
+                    if (slot_count < required_count) return false;
+                }
+            }
+        }
+
+        // Check remaining slots are empty (outside recipe area)
+        for (uint gy = 0; gy < max_height; gy++) {
+            for (uint gx = 0; gx < max_width; gx++) {
+                if (gx >= recipe.grid_width || gy >= recipe.grid_height) {
+                    uint slot = gridToSlot(gx, gy, use_table);
+                    if (slot != 0xFFFFFFFF && readItemId(inv_offset, slot) != 0) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+}
+
+// Consume ingredients and place output
+void executeCraft(uint inv_offset, Recipe recipe, bool use_table) {
+    if (recipe.shapeless != 0) {
+        // Shapeless: consume from wherever ingredients are
+        bool consumed[9];
+        for (uint i = 0; i < 9; i++) {
+            consumed[i] = (recipe.ingredients[i] == 0);
+        }
+
+        uint grid_size = use_table ? 9 : 4;
+        for (uint slot_idx = 0; slot_idx < grid_size; slot_idx++) {
+            uint slot = CRAFT_INPUT_START + slot_idx;
+            uint item = readItemId(inv_offset, slot);
+            uint count = readCount(inv_offset, slot);
+
+            if (item == 0) continue;
+
+            for (uint i = 0; i < 9; i++) {
+                if (!consumed[i] && recipe.ingredients[i] == item) {
+                    uint to_consume = recipe.ingredient_counts[i];
+                    if (count > to_consume) {
+                        writeCount(inv_offset, slot, count - to_consume);
+                    } else {
+                        clearSlot(inv_offset, slot);
+                    }
+                    consumed[i] = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        // Shaped: consume from exact positions
+        for (uint gy = 0; gy < recipe.grid_height; gy++) {
+            for (uint gx = 0; gx < recipe.grid_width; gx++) {
+                uint recipe_idx = gy * 3 + gx;
+                uint slot = gridToSlot(gx, gy, use_table);
+
+                uint required_item = recipe.ingredients[recipe_idx];
+                uint required_count = recipe.ingredient_counts[recipe_idx];
+
+                if (required_item != 0 && slot != 0xFFFFFFFF) {
+                    uint current = readCount(inv_offset, slot);
+                    if (current > required_count) {
+                        writeCount(inv_offset, slot, current - required_count);
+                    } else {
+                        clearSlot(inv_offset, slot);
+                    }
+                }
+            }
+        }
+    }
+
+    // Place output in crafting output slot
+    writeItemId(inv_offset, CRAFT_OUTPUT, recipe.output_item_id);
+    writeCount(inv_offset, CRAFT_OUTPUT, recipe.output_count);
+    writeDamage(inv_offset, CRAFT_OUTPUT, recipe.output_damage);
+}
+
+// Find recipe matching current crafting grid contents
+uint findMatchingRecipe(uint inv_offset, bool use_table) {
+    for (uint i = 0; i < push.num_recipes; i++) {
+        Recipe r = loadRecipe(i);
+        if (canCraft(inv_offset, r, use_table)) {
+            return r.recipe_id;
+        }
+    }
+    return 0;  // No matching recipe
+}
+
+// Calculate max number of times recipe can be crafted
+uint maxCraftCount(uint inv_offset, Recipe recipe, bool use_table) {
+    if (!canCraft(inv_offset, recipe, use_table)) return 0;
+
+    uint max_crafts = 0xFFFFFFFF;
+
+    // For each ingredient, find minimum (available / required)
+    if (recipe.shapeless != 0) {
+        for (uint i = 0; i < 9; i++) {
+            if (recipe.ingredients[i] == 0) continue;
+
+            uint total_available = 0;
+            uint grid_size = use_table ? 9 : 4;
+            for (uint slot_idx = 0; slot_idx < grid_size; slot_idx++) {
+                uint slot = CRAFT_INPUT_START + slot_idx;
+                if (readItemId(inv_offset, slot) == recipe.ingredients[i]) {
+                    total_available += uint(readCount(inv_offset, slot));
+                }
+            }
+
+            uint crafts = total_available / uint(recipe.ingredient_counts[i]);
+            max_crafts = min(max_crafts, crafts);
+        }
+    } else {
+        for (uint gy = 0; gy < recipe.grid_height; gy++) {
+            for (uint gx = 0; gx < recipe.grid_width; gx++) {
+                uint recipe_idx = gy * 3 + gx;
+                uint required_item = recipe.ingredients[recipe_idx];
+                uint required_count = recipe.ingredient_counts[recipe_idx];
+
+                if (required_item == 0) continue;
+
+                uint slot = gridToSlot(gx, gy, use_table);
+                if (slot == 0xFFFFFFFF) {
+                    max_crafts = 0;
+                    continue;
+                }
+
+                uint available = uint(readCount(inv_offset, slot));
+                uint crafts = available / uint(required_count);
+                max_crafts = min(max_crafts, crafts);
+            }
+        }
+    }
+
+    return max_crafts;
+}
+
+void main() {
+    uint req_idx = gl_GlobalInvocationID.x;
+
+    if (req_idx >= push.num_requests) return;
+
+    // Request format: agent_id, recipe_id, mode, reserved
+    uint base = req_idx * 4;
+    uint agent_id = craft_requests.requests[base];
+    uint recipe_id = craft_requests.requests[base + 1];
+    uint mode = craft_requests.requests[base + 2];
+
+    if (agent_id >= push.num_agents) {
+        craft_results.results[req_idx * 4] = 0;
+        return;
+    }
+
+    uint inv_offset = getInventoryOffset(agent_id);
+    bool use_table = push.use_crafting_table != 0;
+
+    uint result_base = req_idx * 4;
+
+    if (mode == CRAFT_MODE_FIND_RECIPE) {
+        uint found_recipe = findMatchingRecipe(inv_offset, use_table);
+        craft_results.results[result_base] = (found_recipe != 0) ? 1 : 0;
+        craft_results.results[result_base + 1] = 0;
+        craft_results.results[result_base + 2] = found_recipe;
+        craft_results.results[result_base + 3] = 0;
+        return;
+    }
+
+    // Find recipe by ID
+    Recipe recipe;
+    bool recipe_found = false;
+    for (uint i = 0; i < push.num_recipes; i++) {
+        recipe = loadRecipe(i);
+        if (recipe.recipe_id == recipe_id) {
+            recipe_found = true;
+            break;
+        }
+    }
+
+    if (!recipe_found) {
+        craft_results.results[result_base] = 0;
+        craft_results.results[result_base + 1] = 0;
+        craft_results.results[result_base + 2] = 0;
+        craft_results.results[result_base + 3] = 0;
+        return;
+    }
+
+    switch (mode) {
+        case CRAFT_MODE_VALIDATE: {
+            bool valid = canCraft(inv_offset, recipe, use_table);
+            craft_results.results[result_base] = valid ? 1 : 0;
+            craft_results.results[result_base + 1] = valid ? maxCraftCount(inv_offset, recipe, use_table) : 0;
+            craft_results.results[result_base + 2] = recipe.output_item_id;
+            craft_results.results[result_base + 3] = recipe.output_damage;
+            break;
+        }
+
+        case CRAFT_MODE_CRAFT_ONE: {
+            if (canCraft(inv_offset, recipe, use_table)) {
+                executeCraft(inv_offset, recipe, use_table);
+                craft_results.results[result_base] = 1;
+                craft_results.results[result_base + 1] = 1;
+                craft_results.results[result_base + 2] = recipe.output_item_id;
+                craft_results.results[result_base + 3] = recipe.output_damage;
+            } else {
+                craft_results.results[result_base] = 0;
+                craft_results.results[result_base + 1] = 0;
+                craft_results.results[result_base + 2] = 0;
+                craft_results.results[result_base + 3] = 0;
+            }
+            break;
+        }
+
+        case CRAFT_MODE_CRAFT_ALL: {
+            uint count = maxCraftCount(inv_offset, recipe, use_table);
+            for (uint i = 0; i < count; i++) {
+                if (!canCraft(inv_offset, recipe, use_table)) break;
+                executeCraft(inv_offset, recipe, use_table);
+            }
+            craft_results.results[result_base] = (count > 0) ? 1 : 0;
+            craft_results.results[result_base + 1] = count;
+            craft_results.results[result_base + 2] = recipe.output_item_id;
+            craft_results.results[result_base + 3] = recipe.output_damage;
+            break;
+        }
+
+        default:
+            craft_results.results[result_base] = 0;
+            craft_results.results[result_base + 1] = 0;
+            craft_results.results[result_base + 2] = 0;
+            craft_results.results[result_base + 3] = 0;
+            break;
+    }
+}

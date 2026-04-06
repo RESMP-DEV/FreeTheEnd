@@ -1,0 +1,120 @@
+#version 450
+
+// Minecraft 1.8.9 experience orb collection and level calculation
+// XP orbs are collected, total XP tracked, levels computed
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer ExperienceBuffer {
+    uint experience[];  // Total lifetime XP points
+} xp_buf;
+
+layout(std430, set = 0, binding = 1) buffer LevelBuffer {
+    uint level[];       // Current level (0-based)
+} level_buf;
+
+layout(std430, set = 0, binding = 2) buffer XPProgressBuffer {
+    float xp_progress[];  // Progress to next level (0.0 - 1.0)
+} progress_buf;
+
+// XP orbs pending collection this tick
+// Format: count of orbs, then [orb_value, ...] for each pending orb
+// We process up to 16 orbs per player per tick
+layout(std430, set = 0, binding = 3) buffer PendingOrbsBuffer {
+    uint pending_orb_counts[];  // [player_count] - number of orbs per player
+} orb_counts_buf;
+
+layout(std430, set = 0, binding = 4) buffer OrbValuesBuffer {
+    uint orb_values[];  // [player_count * 16] - XP value per orb
+} orb_values_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint player_count;
+} pc;
+
+const uint MAX_ORBS_PER_TICK = 16;
+
+// MC 1.8.9 XP level thresholds:
+// Levels 0-16: XP_for_level = level * 17
+// Levels 17-31: XP_for_level = 1.5 * level^2 - 29.5 * level + 360
+// Levels 32+: XP_for_level = 3.5 * level^2 - 151.5 * level + 2220
+
+// Calculate total XP needed to reach a given level (from 0)
+uint xp_for_level(uint level) {
+    if (level == 0) return 0;
+
+    if (level <= 16) {
+        // 0-16: linear, 17 XP per level average
+        // Total XP = sum(7 + 2*i) for i=0 to level-1 = 7*level + level*(level-1)
+        return 7 * level + level * (level - 1);
+    } else if (level <= 31) {
+        // 17-31: quadratic growth
+        // XP to reach level 17 = 315
+        // Then additional: sum of (37 + 5*(i-17)) for i=17 to level-1
+        uint base = 315;
+        uint extra_levels = level - 17;
+        // Sum = 37*n + 5*n*(n-1)/2 where n = extra_levels
+        return base + 37 * extra_levels + 5 * extra_levels * (extra_levels - 1) / 2;
+    } else {
+        // 32+: higher quadratic
+        // XP to reach level 31 = 887
+        // Then additional: sum of (107 + 9*(i-31)) for i=31 to level-1
+        uint base = 887;
+        uint extra_levels = level - 31;
+        return base + 107 * extra_levels + 9 * extra_levels * (extra_levels - 1) / 2;
+    }
+}
+
+// XP needed for just the next level (from current level)
+uint xp_for_next_level(uint level) {
+    if (level <= 15) {
+        return 7 + 2 * level;
+    } else if (level <= 30) {
+        return 37 + 5 * (level - 17);
+    } else {
+        return 107 + 9 * (level - 31);
+    }
+}
+
+// Calculate level from total XP
+uint level_from_xp(uint total_xp) {
+    // Binary search or iterative approach
+    // For efficiency, we iterate since levels are usually < 100
+    uint level = 0;
+    while (xp_for_level(level + 1) <= total_xp) {
+        level++;
+        if (level > 21863) break;  // Sanity cap (MC max level)
+    }
+    return level;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.player_count) return;
+
+    uint total_xp = xp_buf.experience[idx];
+    uint orb_count = min(orb_counts_buf.pending_orb_counts[idx], MAX_ORBS_PER_TICK);
+    uint orb_base = idx * MAX_ORBS_PER_TICK;
+
+    // Collect all pending orbs
+    for (uint i = 0; i < orb_count; i++) {
+        total_xp += orb_values_buf.orb_values[orb_base + i];
+    }
+
+    // Clear processed orbs
+    orb_counts_buf.pending_orb_counts[idx] = 0;
+
+    // Calculate current level
+    uint current_level = level_from_xp(total_xp);
+
+    // Calculate progress to next level
+    uint xp_at_current = xp_for_level(current_level);
+    uint xp_for_next = xp_for_next_level(current_level);
+    uint xp_into_level = total_xp - xp_at_current;
+    float progress = (xp_for_next > 0) ? float(xp_into_level) / float(xp_for_next) : 0.0;
+
+    // Write results
+    xp_buf.experience[idx] = total_xp;
+    level_buf.level[idx] = current_level;
+    progress_buf.xp_progress[idx] = clamp(progress, 0.0, 1.0);
+}

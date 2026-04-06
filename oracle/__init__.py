@@ -1,0 +1,35 @@
+"""Oracle module - authoritative MC 1.8.9 constants and reference implementations."""
+
+from .mc189_constants import (
+    DRAG_AIR,
+    DRAG_GROUND,
+    GRAVITY,
+    JUMP_VELOCITY,
+    PLAYER_EYE_HEIGHT,
+    PLAYER_HEIGHT,
+    PLAYER_WIDTH,
+    SLIPPERINESS_DEFAULT,
+    SLIPPERINESS_ICE,
+    SLIPPERINESS_PACKED_ICE,
+    SLIPPERINESS_SLIME,
+    SNEAK_MULTIPLIER,
+    SPRINT_MULTIPLIER,
+    WALK_SPEED,
+)
+
+__all__ = [
+    "GRAVITY",
+    "DRAG_AIR",
+    "DRAG_GROUND",
+    "JUMP_VELOCITY",
+    "SPRINT_MULTIPLIER",
+    "SNEAK_MULTIPLIER",
+    "WALK_SPEED",
+    "SLIPPERINESS_DEFAULT",
+    "SLIPPERINESS_ICE",
+    "SLIPPERINESS_PACKED_ICE",
+    "SLIPPERINESS_SLIME",
+    "PLAYER_WIDTH",
+    "PLAYER_HEIGHT",
+    "PLAYER_EYE_HEIGHT",
+]

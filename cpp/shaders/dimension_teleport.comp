@@ -1,0 +1,340 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 Dimension Teleport Shader
+// Executes dimension changes triggered by portal_tick.comp
+// Handles coordinate scaling, portal linking, and position updates
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Dimension IDs
+const uint DIM_NETHER = 0;
+const uint DIM_OVERWORLD = 1;
+const uint DIM_END = 2;
+
+// Portal types
+const uint PORTAL_NETHER = 1;
+const uint PORTAL_END = 2;
+
+// Coordinate scaling (overworld <-> nether)
+const float NETHER_SCALE = 8.0;
+const float NETHER_SCALE_INV = 0.125;
+
+// World bounds
+const int WORLD_HEIGHT = 256;
+const int NETHER_CEILING = 127;
+
+// End spawn platform location (1.8.9)
+const float END_SPAWN_X = 100.0;
+const float END_SPAWN_Y = 49.0;
+const float END_SPAWN_Z = 0.0;
+
+// Overworld spawn (return from end)
+const float OVERWORLD_SPAWN_X = 0.0;
+const float OVERWORLD_SPAWN_Y = 64.0;
+const float OVERWORLD_SPAWN_Z = 0.0;
+
+// Portal search radius
+const int PORTAL_SEARCH_RADIUS = 128;
+
+// Block IDs
+const uint BLOCK_AIR = 0;
+const uint BLOCK_NETHER_PORTAL = 90;
+const uint BLOCK_OBSIDIAN = 49;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint triggerCount;    // Number of teleport triggers to process
+    float gameTime;       // Current game time for events
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+// Teleport triggers from portal_tick.comp: uvec4(agentIdx, fromDim, toDim, portalType)
+layout(std430, set = 0, binding = 0) readonly buffer TeleportTriggers {
+    uvec4 triggers[];
+};
+
+// Agent positions: vec4(x, y, z, yaw) - read/write
+layout(std430, set = 0, binding = 1) buffer AgentPositions {
+    vec4 agentPos[];
+};
+
+// Agent dimensions: uvec4(dimension(u8), pad...) - read/write
+layout(std430, set = 0, binding = 2) buffer AgentDimensions {
+    uvec4 agentDim[];
+};
+
+// Portal state (to update last portal position)
+layout(std430, set = 0, binding = 3) buffer PortalStateBuffer {
+    uvec4 portalState[];
+};
+
+// Portal links: header followed by PortalLink entries
+// Header: uvec4(overworldCount, netherCount, totalCapacity, pad)
+// Link: ivec4(srcX, srcY, srcZ, srcDim|valid<<8), ivec4(dstX, dstY, dstZ, dstDim)
+layout(std430, set = 0, binding = 4) readonly buffer PortalLinks {
+    uvec4 linkHeader;
+    uvec4 links[];  // 2 uvec4 per link
+};
+
+// Dimension extents
+layout(std430, set = 0, binding = 5) readonly buffer DimensionExtents {
+    ivec4 extentsOverworld[2];
+    ivec4 extentsNether[2];
+    ivec4 extentsEnd[2];
+};
+
+// Voxel buffers for portal searching (same format as portal_tick.comp)
+layout(std430, set = 0, binding = 6) readonly buffer OverworldVoxels {
+    uint overworldBlocks[];
+};
+
+layout(std430, set = 0, binding = 7) readonly buffer NetherVoxels {
+    uint netherBlocks[];
+};
+
+// Output events: DimensionEvent structure
+// vec4(agentIdx|fromDim<<16|toDim<<24, destX), vec4(destY, destZ, timestamp, eventType)
+layout(std430, set = 0, binding = 8) writeonly buffer DimensionEvents {
+    vec4 events[];
+};
+
+layout(std430, set = 0, binding = 9) buffer EventCount {
+    uint eventCount;
+};
+
+// Scale coordinates between dimensions
+vec3 scaleCoordinates(vec3 pos, uint fromDim, uint toDim) {
+    if (fromDim == DIM_OVERWORLD && toDim == DIM_NETHER) {
+        return vec3(pos.x * NETHER_SCALE_INV, pos.y, pos.z * NETHER_SCALE_INV);
+    } else if (fromDim == DIM_NETHER && toDim == DIM_OVERWORLD) {
+        return vec3(pos.x * NETHER_SCALE, pos.y, pos.z * NETHER_SCALE);
+    }
+    return pos;
+}
+
+// Get dimension extents
+void getDimensionExtents(uint dim, out ivec4 ext0, out ivec4 ext1) {
+    if (dim == DIM_OVERWORLD) {
+        ext0 = extentsOverworld[0];
+        ext1 = extentsOverworld[1];
+    } else if (dim == DIM_NETHER) {
+        ext0 = extentsNether[0];
+        ext1 = extentsNether[1];
+    } else {
+        ext0 = extentsEnd[0];
+        ext1 = extentsEnd[1];
+    }
+}
+
+// Sample block at position (same logic as portal_tick.comp)
+uint sampleBlock(uint dimension, ivec3 worldPos) {
+    ivec4 ext0, ext1;
+    getDimensionExtents(dimension, ext0, ext1);
+
+    if (worldPos.x < ext0.x || worldPos.x >= ext0.z ||
+        worldPos.z < ext0.y || worldPos.z >= ext0.w ||
+        worldPos.y < 0 || worldPos.y >= ext1.x) {
+        return BLOCK_AIR;
+    }
+
+    int localX = worldPos.x - ext0.x;
+    int localZ = worldPos.z - ext0.y;
+    uint linearIdx = uint(worldPos.y) * uint(ext1.y) * uint(ext1.z) + uint(localX) * uint(ext1.z) + uint(localZ);
+
+    uint packedIdx = linearIdx / 2;
+    uint packed;
+    if (dimension == DIM_OVERWORLD) {
+        packed = overworldBlocks[packedIdx];
+    } else if (dimension == DIM_NETHER) {
+        packed = netherBlocks[packedIdx];
+    }
+
+    if ((linearIdx & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    } else {
+        return packed >> 16;
+    }
+}
+
+// Search for a linked portal in the portal links table
+// Returns true if found, with destPos containing the destination
+bool findLinkedPortal(ivec3 srcPos, uint srcDim, uint dstDim, out vec3 destPos) {
+    uint overworldCount = linkHeader.x;
+    uint netherCount = linkHeader.y;
+
+    // Determine which links to search based on source dimension
+    uint startIdx = (srcDim == DIM_OVERWORLD) ? 0u : overworldCount;
+    uint endIdx = (srcDim == DIM_OVERWORLD) ? overworldCount : (overworldCount + netherCount);
+
+    for (uint i = startIdx; i < endIdx; i++) {
+        uvec4 link0 = links[i * 2];
+        uvec4 link1 = links[i * 2 + 1];
+
+        int linkSrcX = int(link0.x);
+        int linkSrcY = int(link0.y);
+        int linkSrcZ = int(link0.z);
+        uint linkSrcDim = link0.w & 0xFFu;
+        uint linkValid = (link0.w >> 8) & 0xFFu;
+
+        // Check if this link matches our source position (within 8 blocks tolerance)
+        if (linkValid == 1u && linkSrcDim == srcDim) {
+            int dx = abs(linkSrcX - srcPos.x);
+            int dy = abs(linkSrcY - srcPos.y);
+            int dz = abs(linkSrcZ - srcPos.z);
+
+            if (dx <= 8 && dy <= 8 && dz <= 8) {
+                // Found matching link
+                destPos = vec3(float(link1.x) + 0.5, float(link1.y), float(link1.z) + 0.5);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// Search for nearest portal block in destination dimension
+// Spiral search pattern from scaled coordinates
+bool searchNearbyPortal(vec3 scaledPos, uint destDim, out vec3 portalPos) {
+    ivec3 center = ivec3(floor(scaledPos));
+    ivec4 ext0, ext1;
+    getDimensionExtents(destDim, ext0, ext1);
+
+    // Spiral search up to PORTAL_SEARCH_RADIUS
+    for (int radius = 0; radius <= PORTAL_SEARCH_RADIUS; radius++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                // Only check perimeter for radius > 0
+                if (radius > 0 && abs(dx) != radius && abs(dz) != radius) {
+                    continue;
+                }
+
+                int searchX = center.x + dx;
+                int searchZ = center.z + dz;
+
+                // Check multiple Y levels
+                int maxY = (destDim == DIM_NETHER) ? NETHER_CEILING : WORLD_HEIGHT;
+                for (int y = 1; y < maxY - 1; y++) {
+                    ivec3 checkPos = ivec3(searchX, y, searchZ);
+                    uint blockId = sampleBlock(destDim, checkPos);
+
+                    if (blockId == BLOCK_NETHER_PORTAL) {
+                        // Found portal, position agent inside it
+                        portalPos = vec3(float(searchX) + 0.5, float(y), float(searchZ) + 0.5);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+// Find safe spawn position if no portal found
+vec3 findSafeSpawnPosition(vec3 scaledPos, uint destDim) {
+    ivec3 center = ivec3(floor(scaledPos));
+    ivec4 ext0, ext1;
+    getDimensionExtents(destDim, ext0, ext1);
+
+    // Clamp to world bounds
+    int maxY = (destDim == DIM_NETHER) ? NETHER_CEILING - 2 : WORLD_HEIGHT - 2;
+
+    // Start from scaled Y, search for air space
+    int startY = clamp(center.y, 1, maxY);
+
+    for (int y = startY; y < maxY; y++) {
+        ivec3 feet = ivec3(center.x, y, center.z);
+        ivec3 head = ivec3(center.x, y + 1, center.z);
+
+        uint feetBlock = sampleBlock(destDim, feet);
+        uint headBlock = sampleBlock(destDim, head);
+
+        if (feetBlock == BLOCK_AIR && headBlock == BLOCK_AIR) {
+            // Found air space, check ground below
+            ivec3 ground = ivec3(center.x, y - 1, center.z);
+            uint groundBlock = sampleBlock(destDim, ground);
+
+            if (groundBlock != BLOCK_AIR) {
+                return vec3(float(center.x) + 0.5, float(y), float(center.z) + 0.5);
+            }
+        }
+    }
+
+    // Fallback: just use scaled position at reasonable Y
+    return vec3(scaledPos.x, float(startY), scaledPos.z);
+}
+
+// Write dimension event
+void writeDimensionEvent(uint agentIdx, uint fromDim, uint toDim, vec3 destPos, uint eventType) {
+    uint eventIdx = atomicAdd(eventCount, 1u);
+    uint maxEvents = 1024u;  // Should come from push constants ideally
+
+    if (eventIdx < maxEvents) {
+        uint packed0 = agentIdx | (fromDim << 16) | (toDim << 24);
+        events[eventIdx * 2] = vec4(uintBitsToFloat(packed0), destPos.x, 0.0, 0.0);
+        events[eventIdx * 2 + 1] = vec4(destPos.y, destPos.z, pc.gameTime, uintBitsToFloat(eventType));
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.triggerCount) {
+        return;
+    }
+
+    uvec4 trigger = triggers[idx];
+    uint agentIdx = trigger.x;
+    uint fromDim = trigger.y;
+    uint toDim = trigger.z;
+    uint portalType = trigger.w;
+
+    // Get current position
+    vec4 currentPos = agentPos[agentIdx];
+    vec3 destPos;
+
+    if (portalType == PORTAL_END) {
+        // End portal teleportation
+        if (fromDim == DIM_OVERWORLD) {
+            // Going to End: spawn on obsidian platform
+            destPos = vec3(END_SPAWN_X, END_SPAWN_Y, END_SPAWN_Z);
+        } else {
+            // Returning from End: go to world spawn (simplified)
+            destPos = vec3(OVERWORLD_SPAWN_X, OVERWORLD_SPAWN_Y, OVERWORLD_SPAWN_Z);
+        }
+    } else {
+        // Nether portal teleportation
+
+        // Get last portal position from portal state
+        uvec4 ps0 = portalState[agentIdx * 2];
+        uvec4 ps1 = portalState[agentIdx * 2 + 1];
+        ivec3 srcPortalPos = ivec3(int(ps0.w), int(ps1.x), int(ps1.y));
+
+        // Scale coordinates
+        vec3 scaledPos = scaleCoordinates(currentPos.xyz, fromDim, toDim);
+
+        // Try to find linked portal first
+        if (findLinkedPortal(srcPortalPos, fromDim, toDim, destPos)) {
+            // Found linked portal
+        } else if (searchNearbyPortal(scaledPos, toDim, destPos)) {
+            // Found portal via search
+        } else {
+            // No portal found, use safe spawn position
+            // In real MC, this would create a portal, but we just find safe ground
+            destPos = findSafeSpawnPosition(scaledPos, toDim);
+        }
+    }
+
+    // Update agent position
+    agentPos[agentIdx] = vec4(destPos, currentPos.w);  // Preserve yaw
+
+    // Update agent dimension
+    uvec4 dim = agentDim[agentIdx];
+    dim.x = (dim.x & 0xFFFFFF00u) | (toDim & 0xFFu);
+    agentDim[agentIdx] = dim;
+
+    // Write dimension event
+    writeDimensionEvent(agentIdx, fromDim, toDim, destPos, 0u);
+}

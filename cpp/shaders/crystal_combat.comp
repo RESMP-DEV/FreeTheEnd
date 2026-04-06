@@ -1,0 +1,504 @@
+#version 450
+
+// Crystal Combat - End crystal tactical mechanics for RL training
+// MC 1.8.9 End crystal destruction and observation extraction
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint stage;        // 0=update, 1=damage, 2=observations
+    uint num_envs;
+    uint tick;
+    uint random_seed;
+} pc;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const uint NUM_CRYSTALS = 10;
+const uint NUM_CAGED = 2;               // 2 crystals in iron bar cages
+
+// Crystal positions on obsidian towers (MC 1.8.9 layout)
+// Arranged in ring around central fountain
+const float TOWER_ANGLES[10] = float[10](
+    0.0, 0.628318, 1.256637, 1.884955, 2.513274,
+    3.141592, 3.769911, 4.398229, 5.026548, 5.654866
+);
+const float TOWER_DISTANCES[10] = float[10](
+    42.0, 29.0, 42.0, 29.0, 42.0,
+    29.0, 42.0, 29.0, 42.0, 29.0
+);
+const float TOWER_HEIGHTS[10] = float[10](
+    76.0, 79.0, 73.0, 100.0, 70.0,
+    85.0, 88.0, 94.0, 82.0, 91.0
+);
+// Crystals 3 and 9 are caged (tallest towers)
+const uint CAGED_INDICES[2] = uint[2](3, 9);
+
+// Combat constants
+const float HEAL_RANGE = 32.0;          // Dragon heals within 32 blocks
+const float HEAL_RATE = 1.0;            // HP per tick when healing
+const float EXPLOSION_POWER = 6.0;      // Crystal explosion is power 6
+const float EXPLOSION_RADIUS = 10.0;    // ~16 blocks at power 6
+const float MELEE_RANGE = 3.0;          // Melee attack reach
+const float BOW_RANGE = 64.0;           // Practical bow accuracy
+const float PROJECTILE_HITBOX = 1.0;    // Crystal hitbox radius
+
+// Iron bar properties
+const float CAGE_BREAK_TIME = 4.0;      // Seconds to mine iron bars (hand)
+const float CAGE_BREAK_PICKAXE = 0.75;  // Seconds with iron pickaxe
+const uint CAGE_GAP_HEIGHT = 2;         // Can attack through gap if pillared
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct Crystal {
+    vec3 position;
+    float rotation;
+    float health;           // >0 = alive
+    float cage_health;      // >0 = cage intact
+    uint flags;             // bit0=caged, bit1=healing_dragon
+    uint reserved;
+};
+
+struct Player {
+    vec3 position;
+    float yaw;
+    vec3 velocity;
+    float pitch;
+    float health;
+    uint flags;
+    uint weapon_slot;       // 0=hand, 1=sword, 2=bow, 3=pickaxe
+    uint held_item;         // 0=nothing, 1=snowball, 2=egg, 3=bed
+    uint arrows;
+    uint reserved[2];
+};
+
+struct Dragon {
+    vec3 position;
+    float health;
+    uint phase;
+    uint reserved[3];
+};
+
+// Combat observation output - what the RL agent sees about crystals
+struct CrystalObservation {
+    // Per-crystal data (10 crystals * 4 floats = 40 floats)
+    vec4 crystal_data[NUM_CRYSTALS];  // xyz=relative_pos, w=alive
+
+    // Aggregate data
+    float crystals_alive;
+    float crystals_caged_alive;
+    float dragon_healing;
+    float healing_crystal_idx;
+
+    // Nearest crystal info
+    float nearest_dist;
+    float nearest_dir_x;
+    float nearest_dir_z;
+    float nearest_caged;
+
+    // Tactical info
+    float nearest_caged_dist;
+    float nearest_uncaged_dist;
+    float can_melee_crystal;
+    float can_bow_crystal;
+
+    // Reserved
+    float reserved[4];
+};
+
+// Attack event for crystal targeting
+struct CrystalAttack {
+    vec3 origin;
+    float damage;
+    vec3 direction;
+    uint attack_type;       // 0=melee, 1=bow, 2=projectile, 3=explosion
+    uint target_crystal;    // 0xFF = auto-target nearest
+    uint player_id;
+    uint reserved[2];
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer CrystalBuffer {
+    Crystal crystals[];  // NUM_CRYSTALS per env
+};
+
+layout(set = 0, binding = 1) buffer PlayerBuffer {
+    Player players[];
+};
+
+layout(set = 0, binding = 2) buffer DragonBuffer {
+    Dragon dragons[];
+};
+
+layout(set = 0, binding = 3) buffer AttackBuffer {
+    CrystalAttack attacks[];
+    uint attack_count;
+    uint pad[3];
+};
+
+layout(set = 0, binding = 4) buffer CrystalObsBuffer {
+    CrystalObservation crystal_obs[];
+};
+
+layout(set = 0, binding = 5) buffer DamageOutput {
+    uint explosion_count;
+    uint crystals_destroyed_mask;
+    uint damage_pad[2];
+    vec4 player_damage[512];      // xyz=knockback, w=damage (max 512 envs)
+    vec4 explosion_events[8192];  // xyz=position, w=radius (max 512 envs * 16)
+} damage_output;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+vec3 get_crystal_spawn_position(uint idx) {
+    float angle = TOWER_ANGLES[idx];
+    float dist = TOWER_DISTANCES[idx];
+    float height = TOWER_HEIGHTS[idx];
+    return vec3(cos(angle) * dist, height + 1.0, sin(angle) * dist);
+}
+
+bool is_crystal_caged(uint idx) {
+    return idx == CAGED_INDICES[0] || idx == CAGED_INDICES[1];
+}
+
+// Calculate explosion falloff damage
+float explosion_damage(float distance, float power) {
+    if (distance > power * 2.0) return 0.0;
+    float exposure = 1.0 - (distance / (power * 2.0));
+    return floor(exposure * exposure * 7.0 * power + 1.0);
+}
+
+// ============================================================================
+// STAGE 0: Crystal State Update
+// ============================================================================
+
+void stage_update(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    uint base = env_id * NUM_CRYSTALS;
+    Dragon d = dragons[env_id];
+
+    // Track if any crystal is healing dragon
+    bool any_healing = false;
+    uint healing_idx = NUM_CRYSTALS;
+
+    for (uint i = 0; i < NUM_CRYSTALS; i++) {
+        Crystal c = crystals[base + i];
+        if (c.health <= 0.0) continue;  // Dead crystal
+
+        // Initialize position if zero (first tick)
+        if (length(c.position) < 0.1) {
+            c.position = get_crystal_spawn_position(i);
+            c.rotation = 0.0;
+            c.health = 1.0;
+            c.cage_health = is_crystal_caged(i) ? 1.0 : 0.0;
+            c.flags = is_crystal_caged(i) ? 1u : 0u;
+        }
+
+        // Rotation animation
+        c.rotation = mod(c.rotation + 0.05, 6.283185);
+
+        // Check healing (dragon within 32 blocks and alive)
+        if (d.health > 0.0 && d.health < 200.0) {
+            float dist = distance(c.position, d.position);
+            if (dist < HEAL_RANGE) {
+                c.flags |= 2u;  // Mark as healing
+                if (!any_healing) {
+                    any_healing = true;
+                    healing_idx = i;
+                    // First crystal in range heals (others just beam)
+                    d.health = min(d.health + HEAL_RATE * 0.05, 200.0);
+                }
+            } else {
+                c.flags &= ~2u;
+            }
+        }
+
+        crystals[base + i] = c;
+    }
+
+    dragons[env_id] = d;
+}
+
+// ============================================================================
+// STAGE 1: Crystal Damage Processing
+// ============================================================================
+
+void process_crystal_destruction(uint env_id, uint crystal_idx, vec3 attacker_pos) {
+    uint base = env_id * NUM_CRYSTALS;
+    Crystal c = crystals[base + crystal_idx];
+
+    // Already dead
+    if (c.health <= 0.0) return;
+
+    // Destroy crystal
+    c.health = 0.0;
+    c.flags = 0u;
+    crystals[base + crystal_idx] = c;
+
+    // Mark destroyed
+    atomicOr(damage_output.crystals_destroyed_mask, 1u << crystal_idx);
+
+    // Create explosion event
+    uint exp_idx = atomicAdd(damage_output.explosion_count, 1u);
+    if (exp_idx < 16) {  // Max 16 explosions per tick
+        damage_output.explosion_events[env_id * 16 + exp_idx] = vec4(c.position, EXPLOSION_POWER);
+    }
+
+    // Damage nearby players from explosion
+    Player p = players[env_id];
+    float dist = distance(p.position, c.position);
+    float dmg = explosion_damage(dist, EXPLOSION_POWER);
+
+    if (dmg > 0.0) {
+        // Knockback away from crystal
+        vec3 knockback = normalize(p.position - c.position) * (dmg * 0.5);
+        knockback.y += 0.5;
+
+        damage_output.player_damage[env_id].xyz += knockback;
+        damage_output.player_damage[env_id].w += dmg;
+    }
+}
+
+void stage_damage(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    uint base = env_id * NUM_CRYSTALS;
+    Player p = players[env_id];
+
+    // Process pending attacks
+    // In real use, this would iterate attack buffer
+    // For simplicity, check player attack state directly
+
+    vec3 look_dir = vec3(
+        -sin(radians(p.yaw)) * cos(radians(p.pitch)),
+        -sin(radians(p.pitch)),
+        cos(radians(p.yaw)) * cos(radians(p.pitch))
+    );
+
+    // Find targetable crystal
+    for (uint i = 0; i < NUM_CRYSTALS; i++) {
+        Crystal c = crystals[base + i];
+        if (c.health <= 0.0) continue;
+
+        vec3 to_crystal = c.position - p.position;
+        float dist = length(to_crystal);
+        vec3 dir = to_crystal / max(dist, 0.001);
+
+        bool is_caged = (c.flags & 1u) != 0u;
+        bool cage_intact = c.cage_health > 0.0;
+
+        // Melee attack (sword/hand)
+        if (p.weapon_slot <= 1) {
+            float reach = (p.weapon_slot == 1) ? 4.5 : MELEE_RANGE;
+
+            if (dist <= reach && dot(dir, look_dir) > 0.5) {
+                if (is_caged && cage_intact) {
+                    // Hit cage instead - damage iron bars
+                    c.cage_health -= 0.1;  // Slow progress
+                    if (c.cage_health <= 0.0) {
+                        c.flags &= ~1u;  // Remove caged flag
+                    }
+                    crystals[base + i] = c;
+                } else {
+                    // Destroy crystal (dangerous - melee range explosion)
+                    process_crystal_destruction(env_id, i, p.position);
+                }
+                break;
+            }
+        }
+
+        // Bow attack
+        if (p.weapon_slot == 2) {
+            // Raycast check
+            if (dist <= BOW_RANGE && dot(dir, look_dir) > 0.9) {
+                if (is_caged && cage_intact) {
+                    // Arrow blocked by cage
+                    continue;
+                }
+                process_crystal_destruction(env_id, i, p.position);
+                break;
+            }
+        }
+
+        // Projectile attack (snowball/egg) - can destroy through gaps
+        if (p.held_item == 1 || p.held_item == 2) {
+            if (dist <= 48.0 && dot(dir, look_dir) > 0.85) {
+                // Projectiles can hit through cage gaps
+                process_crystal_destruction(env_id, i, p.position);
+                break;
+            }
+        }
+
+        // Bed explosion (chain reaction potential)
+        if (p.held_item == 3) {
+            // Bed use in End = explosion
+            // Check if crystal in blast radius
+            if (dist <= 5.0) {
+                // Bed destroys nearby crystal
+                process_crystal_destruction(env_id, i, p.position);
+                // Bed explosion also damages player
+                damage_output.player_damage[env_id].w += 10.0;
+            }
+        }
+
+        // Pickaxe breaks cage faster
+        if (p.weapon_slot == 3 && is_caged && cage_intact) {
+            if (dist <= MELEE_RANGE && dot(dir, look_dir) > 0.5) {
+                c.cage_health -= 0.5;  // Much faster with pickaxe
+                if (c.cage_health <= 0.0) {
+                    c.flags &= ~1u;
+                }
+                crystals[base + i] = c;
+                break;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 2: Observation Extraction
+// ============================================================================
+
+void stage_observations(uint env_id) {
+    if (env_id >= pc.num_envs) return;
+
+    uint base = env_id * NUM_CRYSTALS;
+    Player p = players[env_id];
+    Dragon d = dragons[env_id];
+
+    CrystalObservation obs;
+
+    // Initialize
+    uint alive_count = 0;
+    uint caged_alive_count = 0;
+    bool dragon_healing = false;
+    uint healing_idx = NUM_CRYSTALS;
+
+    float nearest_dist = 1000.0;
+    float nearest_caged_dist = 1000.0;
+    float nearest_uncaged_dist = 1000.0;
+    vec3 nearest_dir = vec3(0);
+    bool nearest_is_caged = false;
+    uint nearest_idx = NUM_CRYSTALS;
+
+    // Per-crystal data
+    for (uint i = 0; i < NUM_CRYSTALS; i++) {
+        Crystal c = crystals[base + i];
+        vec3 rel_pos = c.position - p.position;
+        float dist = length(rel_pos);
+
+        float alive = c.health > 0.0 ? 1.0 : 0.0;
+        bool is_caged = (c.flags & 1u) != 0u && c.cage_health > 0.0;
+        bool is_healing = (c.flags & 2u) != 0u;
+
+        // Pack: xyz = relative position (normalized), w = alive + caged*2 + healing*4
+        obs.crystal_data[i] = vec4(
+            rel_pos / max(dist, 1.0),
+            alive + (is_caged ? 2.0 : 0.0) + (is_healing ? 4.0 : 0.0)
+        );
+
+        if (c.health > 0.0) {
+            alive_count++;
+
+            if (is_caged) {
+                caged_alive_count++;
+                if (dist < nearest_caged_dist) {
+                    nearest_caged_dist = dist;
+                }
+            } else {
+                if (dist < nearest_uncaged_dist) {
+                    nearest_uncaged_dist = dist;
+                }
+            }
+
+            if (dist < nearest_dist) {
+                nearest_dist = dist;
+                nearest_dir = rel_pos / max(dist, 0.001);
+                nearest_is_caged = is_caged;
+                nearest_idx = i;
+            }
+
+            if (is_healing) {
+                dragon_healing = true;
+                healing_idx = i;
+            }
+        }
+    }
+
+    // Aggregate data (normalized 0-1)
+    obs.crystals_alive = float(alive_count) / float(NUM_CRYSTALS);
+    obs.crystals_caged_alive = float(caged_alive_count) / float(NUM_CAGED);
+    obs.dragon_healing = dragon_healing ? 1.0 : 0.0;
+    obs.healing_crystal_idx = float(healing_idx) / float(NUM_CRYSTALS);
+
+    // Nearest crystal info
+    obs.nearest_dist = clamp(nearest_dist / 100.0, 0.0, 1.0);
+    obs.nearest_dir_x = nearest_dir.x;
+    obs.nearest_dir_z = nearest_dir.z;
+    obs.nearest_caged = nearest_is_caged ? 1.0 : 0.0;
+
+    // Tactical distances
+    obs.nearest_caged_dist = clamp(nearest_caged_dist / 100.0, 0.0, 1.0);
+    obs.nearest_uncaged_dist = clamp(nearest_uncaged_dist / 100.0, 0.0, 1.0);
+
+    // Can attack flags
+    vec3 look_dir = vec3(
+        -sin(radians(p.yaw)) * cos(radians(p.pitch)),
+        -sin(radians(p.pitch)),
+        cos(radians(p.yaw)) * cos(radians(p.pitch))
+    );
+
+    bool can_melee = false;
+    bool can_bow = false;
+
+    if (nearest_idx < NUM_CRYSTALS) {
+        Crystal c = crystals[base + nearest_idx];
+        vec3 to_crystal = c.position - p.position;
+        float dist = length(to_crystal);
+        vec3 dir = to_crystal / max(dist, 0.001);
+        float alignment = dot(dir, look_dir);
+
+        bool cage_blocks = nearest_is_caged && c.cage_health > 0.0;
+
+        can_melee = dist <= MELEE_RANGE && alignment > 0.5 && !cage_blocks;
+        can_bow = dist <= BOW_RANGE && alignment > 0.9 && !cage_blocks;
+    }
+
+    obs.can_melee_crystal = can_melee ? 1.0 : 0.0;
+    obs.can_bow_crystal = can_bow ? 1.0 : 0.0;
+
+    crystal_obs[env_id] = obs;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint env_id = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0u: stage_update(env_id); break;
+        case 1u: stage_damage(env_id); break;
+        case 2u: stage_observations(env_id); break;
+    }
+}

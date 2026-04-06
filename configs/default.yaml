@@ -1,0 +1,64 @@
+# Default training configuration for Minecraft speedrun AI
+# See training_config.py for all available options
+
+run_name: free_the_end
+
+env:
+  num_envs: 64
+  start_stage: 1
+  curriculum: true
+  max_episode_steps: 36000
+  seed: null
+
+curriculum:
+  enabled: true
+  min_episodes_per_stage: 20
+  advancement_threshold: 0.7
+  allow_regression: false
+  regression_threshold: 0.2
+  max_episodes_per_stage: 1000
+
+ppo:
+  learning_rate: 0.0003
+  n_steps: 256
+  batch_size: 256
+  n_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+
+network:
+  policy_layers: [256, 256]
+  value_layers: [256, 256]
+  activation: relu
+  ortho_init: true
+  shared_encoder: false
+  use_lstm: false
+  lstm_hidden_size: 256
+
+logging:
+  log_interval: 1
+  verbose: 1
+  save_replay_buffer: false
+  wandb_project: null
+  wandb_entity: null
+  tensorboard: true
+
+total_timesteps: 100000000
+checkpoint_freq: 100000
+eval_freq: 50000
+n_eval_episodes: 10
+
+log_dir: logs
+checkpoint_dir: checkpoints
+tensorboard_log: tensorboard
+
+normalize_obs: true
+normalize_reward: true
+clip_obs: 10.0
+clip_reward: 10.0
+
+device: auto

@@ -1,0 +1,1228 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Overworld Hostile Mob AI
+// Handles Zombie, Skeleton, Spider, Creeper behavior with MC 1.8.9 rules
+// ============================================================================
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Mob types
+const uint MOB_TYPE_ZOMBIE = 0;
+const uint MOB_TYPE_SKELETON = 1;
+const uint MOB_TYPE_SPIDER = 5;
+const uint MOB_TYPE_CREEPER = 6;
+
+// AI states
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;
+const uint AI_STATE_FLEE = 4;
+const uint AI_STATE_CLIMB = 10;      // Spider climbing
+const uint AI_STATE_BOW_DRAW = 11;   // Skeleton aiming
+const uint AI_STATE_FUSE = 12;       // Creeper priming
+const uint AI_STATE_DEAD = 9;
+
+// Mob flags
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_IN_WATER = 1 << 1;
+const uint MOB_FLAG_IN_LAVA = 1 << 2;
+const uint MOB_FLAG_NO_AI = 1 << 3;
+const uint MOB_FLAG_BURNING = 1 << 6;
+const uint MOB_FLAG_CAN_DESPAWN = 1 << 9;
+const uint MOB_FLAG_NEUTRAL_DAY = 1 << 10;
+
+// Zombie constants
+const float ZOMBIE_DETECTION_RANGE = 64.0;  // Increased for aggressive pursuit
+const float ZOMBIE_ATTACK_RANGE = 2.0;
+const float ZOMBIE_SPEED = 0.23;
+const float ZOMBIE_DAMAGE = 3.0;
+const uint ZOMBIE_ATTACK_COOLDOWN = 20;
+
+// Skeleton constants
+const float SKELETON_DETECTION_RANGE = 64.0;  // Increased for aggressive pursuit
+const float SKELETON_ATTACK_RANGE = 15.0;
+const float SKELETON_PREFERRED_DISTANCE = 10.0;
+const float SKELETON_MIN_DISTANCE = 4.0;
+const float SKELETON_SPEED = 0.25;
+const float SKELETON_STRAFE_SPEED = 0.15;
+const uint SKELETON_BOW_DRAW_TIME = 20;
+const uint SKELETON_SHOOT_COOLDOWN = 40;
+
+// Spider constants
+const float SPIDER_DETECTION_RANGE = 64.0;  // Increased for aggressive pursuit
+const float SPIDER_ATTACK_RANGE = 2.0;
+const float SPIDER_SPEED = 0.3;
+const float SPIDER_CLIMB_SPEED = 0.2;
+const float SPIDER_DAMAGE = 2.0;
+const uint SPIDER_ATTACK_COOLDOWN = 15;
+const float SPIDER_POUNCE_RANGE = 4.0;
+const float SPIDER_POUNCE_VELOCITY = 0.5;
+
+// Creeper constants
+const float CREEPER_DETECTION_RANGE = 64.0;  // Increased for aggressive pursuit
+const float CREEPER_FUSE_RANGE = 3.0;
+const float CREEPER_SPEED = 0.25;
+const float CREEPER_FUSE_TIME = 30.0;  // 1.5 sec at 20 tps
+const float CREEPER_EXPLOSION_RADIUS = 3.0;
+const float CREEPER_DEFUSE_RANGE = 7.0;
+
+// Type data indices
+// Zombie
+const uint TD_ZOMBIE_IS_BABY = 0;
+const uint TD_ZOMBIE_IS_VILLAGER = 1;
+
+// Skeleton
+const uint TD_SKELETON_BOW_TIMER = 0;
+const uint TD_SKELETON_STRAFE_DIR = 1;
+const uint TD_SKELETON_PREFERRED_DIST = 2;
+
+// Spider
+const uint TD_SPIDER_CLIMBING = 0;
+const uint TD_SPIDER_WALL_DIR_X = 1;
+const uint TD_SPIDER_WALL_DIR_Z = 2;
+const uint TD_SPIDER_POUNCE_COOLDOWN = 3;
+
+// Creeper
+const uint TD_CREEPER_FUSE_TIMER = 0;
+const uint TD_CREEPER_CHARGED = 1;
+const uint TD_CREEPER_EXPLOSION_RADIUS = 2;
+const uint TD_CREEPER_MAX_FUSE = 3;
+const uint TD_CREEPER_IGNITED = 4;
+
+// Physics
+const float GRAVITY = 0.08;
+const float TERMINAL_VELOCITY = 3.92;
+const float JUMP_VELOCITY = 0.42;
+const float DRAG_AIR = 0.02;
+const float DRAG_WATER = 0.2;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+};
+
+// Arrow spawn request for skeleton
+struct ArrowSpawn {
+    vec3 position;
+    vec3 direction;
+    float damage;
+    uint source_entity;
+};
+
+// Explosion request for creeper
+struct ExplosionRequest {
+    vec3 position;
+    float radius;
+    float damage;
+    uint source_entity;
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer ArrowBuffer {
+    uint arrow_count;
+    ArrowSpawn arrows[];
+};
+
+layout(set = 0, binding = 4) buffer ExplosionBuffer {
+    uint explosion_count;
+    ExplosionRequest explosions[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+} pc;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+uint pcg_hash(uint in_val) {
+    uint state = in_val * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float random_float(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+vec3 random_direction(inout uint seed) {
+    float theta = random_float(seed) * 6.28318530718;
+    float phi = acos(2.0 * random_float(seed) - 1.0);
+    return vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+}
+
+vec2 random_horizontal(inout uint seed) {
+    float angle = random_float(seed) * 6.28318530718;
+    return vec2(cos(angle), sin(angle));
+}
+
+float distance_squared(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+vec3 normalize_safe(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float angle_to(vec3 from, vec3 to) {
+    vec2 dir = normalize(to.xz - from.xz);
+    return atan(dir.x, dir.y);
+}
+
+float pitch_to(vec3 from, vec3 to) {
+    vec3 diff = to - from;
+    float horiz = length(diff.xz);
+    return atan(diff.y, horiz);
+}
+
+bool is_daytime() {
+    return pc.world_time < 13000.0 || pc.world_time >= 23000.0;
+}
+
+// ============================================================================
+// World queries
+// ============================================================================
+
+ivec3 world_to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint get_block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return 0;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return world_blocks[idx >> 2] >> ((idx & 3) * 8) & 0xFF;
+}
+
+bool is_solid(uint block_id) {
+    return block_id != 0 && block_id != 8 && block_id != 9 &&
+           block_id != 10 && block_id != 11;
+}
+
+bool is_climbable(ivec3 pos) {
+    // Check if there's a solid block adjacent we can climb
+    return is_solid(get_block_at(pos + ivec3(1, 0, 0))) ||
+           is_solid(get_block_at(pos + ivec3(-1, 0, 0))) ||
+           is_solid(get_block_at(pos + ivec3(0, 0, 1))) ||
+           is_solid(get_block_at(pos + ivec3(0, 0, -1)));
+}
+
+bool is_walkable(vec3 pos) {
+    ivec3 block = world_to_block(pos);
+    return !is_solid(get_block_at(block)) &&
+           !is_solid(get_block_at(block + ivec3(0, 1, 0))) &&
+           is_solid(get_block_at(block + ivec3(0, -1, 0)));
+}
+
+bool has_line_of_sight(vec3 from, vec3 to) {
+    vec3 dir = normalize_safe(to - from);
+    float dist = distance(from, to);
+    float step = 0.5;
+
+    for (float d = step; d < dist; d += step) {
+        vec3 check_pos = from + dir * d;
+        if (is_solid(get_block_at(world_to_block(check_pos)))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Entity queries
+// ============================================================================
+
+vec3 get_entity_position(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool entity_exists(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint find_nearest_entity(vec3 pos, float max_range, out float out_distance) {
+    uint nearest = 0xFFFFFFFF;
+    float nearest_dist = max_range * max_range;
+
+    for (uint i = 0; i < pc.entity_count; i++) {
+        float dist_sq = distance_squared(pos, entities[i].position);
+        if (dist_sq < nearest_dist) {
+            nearest_dist = dist_sq;
+            nearest = entities[i].entity_id;
+        }
+    }
+
+    out_distance = sqrt(nearest_dist);
+    return nearest;
+}
+
+// ============================================================================
+// Movement helpers
+// ============================================================================
+
+void move_toward(inout MobState mob, vec3 target, float speed) {
+    vec3 dir = normalize_safe(target - mob.position);
+    dir.y = 0.0;
+    mob.velocity.x = dir.x * speed;
+    mob.velocity.z = dir.z * speed;
+    mob.yaw = angle_to(mob.position, target);
+}
+
+void jump(inout MobState mob) {
+    if ((mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        mob.velocity.y = mob.jump_velocity;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+void check_jump_obstacle(inout MobState mob) {
+    vec3 forward = vec3(sin(mob.yaw), 0.0, cos(mob.yaw));
+    ivec3 front = world_to_block(mob.position + forward * 0.5);
+    if (is_solid(get_block_at(front))) {
+        jump(mob);
+    }
+}
+
+vec3 pathfind_step(vec3 from, vec3 to, inout uint seed) {
+    vec3 dir = normalize_safe(to - from);
+    vec3 step = from + dir * 1.0;
+
+    if (is_walkable(step)) {
+        return step;
+    }
+
+    // Try stepping up
+    if (is_walkable(step + vec3(0.0, 1.0, 0.0))) {
+        return step + vec3(0.0, 1.0, 0.0);
+    }
+
+    // Random offset
+    vec2 offset = random_horizontal(seed);
+    vec3 alt = from + vec3(offset.x, 0.0, offset.y);
+    if (is_walkable(alt)) {
+        return alt;
+    }
+
+    return from;
+}
+
+// ============================================================================
+// Zombie AI
+// ============================================================================
+
+void zombie_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, ZOMBIE_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Random wander
+    if (mob.state_timer > 40 + uint(random_float(seed) * 60.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec2 offset = random_horizontal(seed) * 8.0;
+        mob.path_target = mob.position + vec3(offset.x, 0.0, offset.y);
+        mob.state_timer = 0;
+    }
+
+    mob.velocity.x *= 0.9;
+    mob.velocity.z *= 0.9;
+}
+
+void zombie_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for targets
+    float dist;
+    uint target = find_nearest_entity(mob.position, ZOMBIE_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    float dist_to_target = distance(mob.position.xz, mob.path_target.xz);
+    if (dist_to_target < 1.0 || mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.path_target = pathfind_step(mob.position, mob.path_target, seed);
+    float speed = ZOMBIE_SPEED * 0.6;
+    // Baby zombies are faster
+    if (mob.type_data[TD_ZOMBIE_IS_BABY] == 1) {
+        speed *= 1.5;
+    }
+    move_toward(mob, mob.path_target, speed);
+}
+
+void zombie_chase(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target
+    if (dist > ZOMBIE_DETECTION_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In attack range
+    if (dist < ZOMBIE_ATTACK_RANGE) {
+        mob.ai_state = AI_STATE_ATTACK;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Chase with speed
+    float speed = ZOMBIE_SPEED;
+    if (mob.type_data[TD_ZOMBIE_IS_BABY] == 1) {
+        speed *= 1.5;
+    }
+
+    mob.path_target = pathfind_step(mob.position, target_pos, seed);
+    move_toward(mob, mob.path_target, speed);
+    check_jump_obstacle(mob);
+}
+
+void zombie_attack(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.attack_cooldown = max(mob.attack_cooldown - 1, 0);
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    if (dist > ZOMBIE_ATTACK_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.yaw = angle_to(mob.position, target_pos);
+
+    // Attack on cooldown
+    if (mob.attack_cooldown == 0) {
+        mob.attack_cooldown = ZOMBIE_ATTACK_COOLDOWN;
+        // Damage dealt by CPU side
+    }
+}
+
+void update_zombie(inout MobState mob, float dt, inout uint seed) {
+    // Sunlight burning (not in water, daytime, under sky)
+    if (is_daytime() && (mob.flags & MOB_FLAG_IN_WATER) == 0) {
+        ivec3 pos = world_to_block(mob.position);
+        bool under_sky = true;
+        for (int y = pos.y + 2; y < 256; y++) {
+            if (is_solid(get_block_at(ivec3(pos.x, y, pos.z)))) {
+                under_sky = false;
+                break;
+            }
+        }
+        if (under_sky) {
+            mob.flags |= MOB_FLAG_BURNING;
+            mob.health -= 1.0 * dt;
+        }
+    }
+
+    switch (mob.ai_state) {
+        case AI_STATE_IDLE:
+            zombie_idle(mob, seed);
+            break;
+        case AI_STATE_WANDER:
+            zombie_wander(mob, seed);
+            break;
+        case AI_STATE_CHASE:
+            zombie_chase(mob, seed);
+            break;
+        case AI_STATE_ATTACK:
+            zombie_attack(mob, seed);
+            break;
+    }
+}
+
+// ============================================================================
+// Skeleton AI
+// ============================================================================
+
+void skeleton_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    float dist;
+    uint target = find_nearest_entity(mob.position, SKELETON_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF && has_line_of_sight(mob.position + vec3(0, 1.5, 0),
+            get_entity_position(target) + vec3(0, 1.0, 0))) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    if (mob.state_timer > 40 + uint(random_float(seed) * 60.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec2 offset = random_horizontal(seed) * 8.0;
+        mob.path_target = mob.position + vec3(offset.x, 0.0, offset.y);
+        mob.state_timer = 0;
+    }
+
+    mob.velocity.x *= 0.9;
+    mob.velocity.z *= 0.9;
+}
+
+void skeleton_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    float dist;
+    uint target = find_nearest_entity(mob.position, SKELETON_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    float dist_to_target = distance(mob.position.xz, mob.path_target.xz);
+    if (dist_to_target < 1.0 || mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.path_target = pathfind_step(mob.position, mob.path_target, seed);
+    move_toward(mob, mob.path_target, SKELETON_SPEED * 0.6);
+}
+
+void skeleton_chase(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.attack_cooldown = max(mob.attack_cooldown - 1, 0);
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target
+    if (dist > SKELETON_DETECTION_RANGE * 2.0) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Check line of sight for shooting
+    bool los = has_line_of_sight(mob.position + vec3(0, 1.5, 0),
+                                  target_pos + vec3(0, 1.0, 0));
+
+    // Within attack range and have line of sight
+    if (dist < SKELETON_ATTACK_RANGE && los && mob.attack_cooldown == 0) {
+        mob.ai_state = AI_STATE_BOW_DRAW;
+        mob.type_data[TD_SKELETON_BOW_TIMER] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    float preferred = uintBitsToFloat(mob.type_data[TD_SKELETON_PREFERRED_DIST]);
+
+    // Maintain preferred distance
+    if (dist < SKELETON_MIN_DISTANCE) {
+        // Back up
+        vec3 away = normalize_safe(mob.position - target_pos);
+        away.y = 0.0;
+        mob.velocity.x = away.x * SKELETON_SPEED;
+        mob.velocity.z = away.z * SKELETON_SPEED;
+    } else if (dist > preferred && !los) {
+        // Move closer
+        mob.path_target = pathfind_step(mob.position, target_pos, seed);
+        move_toward(mob, mob.path_target, SKELETON_SPEED);
+        check_jump_obstacle(mob);
+    } else {
+        // Strafe
+        vec3 to_target = normalize_safe(target_pos - mob.position);
+        vec3 strafe = mob.type_data[TD_SKELETON_STRAFE_DIR] == 0 ?
+                      vec3(-to_target.z, 0.0, to_target.x) :
+                      vec3(to_target.z, 0.0, -to_target.x);
+        mob.velocity.x = strafe.x * SKELETON_STRAFE_SPEED;
+        mob.velocity.z = strafe.z * SKELETON_STRAFE_SPEED;
+
+        // Randomly change strafe direction
+        if (random_float(seed) < 0.02) {
+            mob.type_data[TD_SKELETON_STRAFE_DIR] = 1 - mob.type_data[TD_SKELETON_STRAFE_DIR];
+        }
+    }
+
+    mob.yaw = angle_to(mob.position, target_pos);
+    mob.pitch = pitch_to(mob.position, target_pos);
+}
+
+void skeleton_bow_draw(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_SKELETON_BOW_TIMER]++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Face target while drawing
+    mob.yaw = angle_to(mob.position, target_pos);
+    mob.pitch = pitch_to(mob.position, target_pos);
+
+    // Slow down while aiming
+    mob.velocity.x *= 0.5;
+    mob.velocity.z *= 0.5;
+
+    // Out of range - go back to chase
+    if (dist > SKELETON_ATTACK_RANGE * 1.2) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Shoot when fully drawn
+    if (mob.type_data[TD_SKELETON_BOW_TIMER] >= SKELETON_BOW_DRAW_TIME) {
+        // Spawn arrow
+        uint idx = atomicAdd(arrow_count, 1);
+        if (idx < 64) {
+            vec3 aim_pos = target_pos + vec3(0, 1.0, 0);
+            // Add slight inaccuracy
+            aim_pos += vec3(
+                (random_float(seed) - 0.5) * 2.0,
+                (random_float(seed) - 0.5) * 1.0,
+                (random_float(seed) - 0.5) * 2.0
+            );
+
+            arrows[idx].position = mob.position + vec3(0, 1.5, 0);
+            arrows[idx].direction = normalize_safe(aim_pos - mob.position);
+            arrows[idx].damage = 2.0 + random_float(seed) * 3.0;  // 2-5 damage
+            arrows[idx].source_entity = 0;  // Mob id set by CPU
+        }
+
+        mob.attack_cooldown = SKELETON_SHOOT_COOLDOWN;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+}
+
+void update_skeleton(inout MobState mob, float dt, inout uint seed) {
+    // Sunlight burning
+    if (is_daytime() && (mob.flags & MOB_FLAG_IN_WATER) == 0) {
+        ivec3 pos = world_to_block(mob.position);
+        bool under_sky = true;
+        for (int y = pos.y + 2; y < 256; y++) {
+            if (is_solid(get_block_at(ivec3(pos.x, y, pos.z)))) {
+                under_sky = false;
+                break;
+            }
+        }
+        if (under_sky) {
+            mob.flags |= MOB_FLAG_BURNING;
+            mob.health -= 1.0 * dt;
+        }
+    }
+
+    switch (mob.ai_state) {
+        case AI_STATE_IDLE:
+            skeleton_idle(mob, seed);
+            break;
+        case AI_STATE_WANDER:
+            skeleton_wander(mob, seed);
+            break;
+        case AI_STATE_CHASE:
+            skeleton_chase(mob, seed);
+            break;
+        case AI_STATE_BOW_DRAW:
+            skeleton_bow_draw(mob, seed);
+            break;
+    }
+}
+
+// ============================================================================
+// Spider AI
+// ============================================================================
+
+void spider_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Neutral during day unless provoked
+    bool neutral = (mob.flags & MOB_FLAG_NEUTRAL_DAY) != 0 && is_daytime();
+
+    if (!neutral) {
+        float dist;
+        uint target = find_nearest_entity(mob.position, SPIDER_DETECTION_RANGE, dist);
+        if (target != 0xFFFFFFFF) {
+            mob.target_entity_id = target;
+            mob.ai_state = AI_STATE_CHASE;
+            mob.state_timer = 0;
+            return;
+        }
+    }
+
+    if (mob.state_timer > 40 + uint(random_float(seed) * 60.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec2 offset = random_horizontal(seed) * 8.0;
+        mob.path_target = mob.position + vec3(offset.x, 0.0, offset.y);
+        mob.state_timer = 0;
+    }
+
+    mob.velocity.x *= 0.9;
+    mob.velocity.z *= 0.9;
+}
+
+void spider_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    bool neutral = (mob.flags & MOB_FLAG_NEUTRAL_DAY) != 0 && is_daytime();
+
+    if (!neutral) {
+        float dist;
+        uint target = find_nearest_entity(mob.position, SPIDER_DETECTION_RANGE, dist);
+        if (target != 0xFFFFFFFF) {
+            mob.target_entity_id = target;
+            mob.ai_state = AI_STATE_CHASE;
+            mob.state_timer = 0;
+            return;
+        }
+    }
+
+    float dist_to_target = distance(mob.position.xz, mob.path_target.xz);
+    if (dist_to_target < 1.0 || mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.path_target = pathfind_step(mob.position, mob.path_target, seed);
+    move_toward(mob, mob.path_target, SPIDER_SPEED * 0.6);
+}
+
+void spider_chase(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_SPIDER_POUNCE_COOLDOWN] = max(mob.type_data[TD_SPIDER_POUNCE_COOLDOWN] - 1, 0);
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target
+    if (dist > SPIDER_DETECTION_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In attack range
+    if (dist < SPIDER_ATTACK_RANGE) {
+        mob.ai_state = AI_STATE_ATTACK;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Pounce attack when in range
+    if (dist < SPIDER_POUNCE_RANGE && dist > SPIDER_ATTACK_RANGE &&
+        mob.type_data[TD_SPIDER_POUNCE_COOLDOWN] == 0 &&
+        (mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        vec3 dir = normalize_safe(target_pos - mob.position);
+        mob.velocity.x = dir.x * SPIDER_POUNCE_VELOCITY * 20.0;
+        mob.velocity.y = JUMP_VELOCITY * 1.2;
+        mob.velocity.z = dir.z * SPIDER_POUNCE_VELOCITY * 20.0;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+        mob.type_data[TD_SPIDER_POUNCE_COOLDOWN] = 40;
+        return;
+    }
+
+    // Check if we should climb
+    ivec3 block = world_to_block(mob.position);
+    vec3 dir = normalize_safe(target_pos - mob.position);
+    ivec3 front = world_to_block(mob.position + dir * 0.5);
+
+    if (is_solid(get_block_at(front)) && target_pos.y > mob.position.y + 1.0) {
+        // Start climbing
+        mob.type_data[TD_SPIDER_CLIMBING] = 1;
+        mob.type_data[TD_SPIDER_WALL_DIR_X] = floatBitsToUint(dir.x);
+        mob.type_data[TD_SPIDER_WALL_DIR_Z] = floatBitsToUint(dir.z);
+        mob.ai_state = AI_STATE_CLIMB;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.path_target = pathfind_step(mob.position, target_pos, seed);
+    move_toward(mob, mob.path_target, SPIDER_SPEED);
+    check_jump_obstacle(mob);
+}
+
+void spider_climb(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.type_data[TD_SPIDER_CLIMBING] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+
+    // Check if still adjacent to wall
+    vec3 wall_dir = vec3(
+        uintBitsToFloat(mob.type_data[TD_SPIDER_WALL_DIR_X]),
+        0.0,
+        uintBitsToFloat(mob.type_data[TD_SPIDER_WALL_DIR_Z])
+    );
+    ivec3 wall_check = world_to_block(mob.position + wall_dir * 0.6);
+
+    if (!is_solid(get_block_at(wall_check))) {
+        // Lost wall, try to grab ledge
+        mob.velocity.x = wall_dir.x * SPIDER_SPEED * 2.0;
+        mob.velocity.z = wall_dir.z * SPIDER_SPEED * 2.0;
+        mob.type_data[TD_SPIDER_CLIMBING] = 0;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Climb up
+    mob.velocity.y = SPIDER_CLIMB_SPEED;
+    mob.velocity.x = wall_dir.x * 0.05;
+    mob.velocity.z = wall_dir.z * 0.05;
+
+    // Check if we've climbed high enough
+    if (mob.position.y >= target_pos.y) {
+        mob.type_data[TD_SPIDER_CLIMBING] = 0;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+
+    // Timeout
+    if (mob.state_timer > 100) {
+        mob.type_data[TD_SPIDER_CLIMBING] = 0;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+}
+
+void spider_attack(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.attack_cooldown = max(mob.attack_cooldown - 1, 0);
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    if (dist > SPIDER_ATTACK_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.yaw = angle_to(mob.position, target_pos);
+
+    if (mob.attack_cooldown == 0) {
+        mob.attack_cooldown = SPIDER_ATTACK_COOLDOWN;
+        // Damage dealt by CPU
+    }
+}
+
+void update_spider(inout MobState mob, float dt, inout uint seed) {
+    // Update neutral flag based on time
+    if (is_daytime() && mob.target_entity_id == 0xFFFFFFFF) {
+        mob.flags |= MOB_FLAG_NEUTRAL_DAY;
+    } else if (!is_daytime()) {
+        mob.flags &= ~MOB_FLAG_NEUTRAL_DAY;
+    }
+
+    switch (mob.ai_state) {
+        case AI_STATE_IDLE:
+            spider_idle(mob, seed);
+            break;
+        case AI_STATE_WANDER:
+            spider_wander(mob, seed);
+            break;
+        case AI_STATE_CHASE:
+            spider_chase(mob, seed);
+            break;
+        case AI_STATE_CLIMB:
+            spider_climb(mob, seed);
+            break;
+        case AI_STATE_ATTACK:
+            spider_attack(mob, seed);
+            break;
+    }
+}
+
+// ============================================================================
+// Creeper AI
+// ============================================================================
+
+void creeper_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    float dist;
+    uint target = find_nearest_entity(mob.position, CREEPER_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    if (mob.state_timer > 40 + uint(random_float(seed) * 60.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec2 offset = random_horizontal(seed) * 8.0;
+        mob.path_target = mob.position + vec3(offset.x, 0.0, offset.y);
+        mob.state_timer = 0;
+    }
+
+    mob.velocity.x *= 0.9;
+    mob.velocity.z *= 0.9;
+}
+
+void creeper_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    float dist;
+    uint target = find_nearest_entity(mob.position, CREEPER_DETECTION_RANGE, dist);
+    if (target != 0xFFFFFFFF) {
+        mob.target_entity_id = target;
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    float dist_to_target = distance(mob.position.xz, mob.path_target.xz);
+    if (dist_to_target < 1.0 || mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    mob.path_target = pathfind_step(mob.position, mob.path_target, seed);
+    move_toward(mob, mob.path_target, CREEPER_SPEED * 0.6);
+}
+
+void creeper_chase(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target
+    if (dist > CREEPER_DETECTION_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In fuse range - start hissing
+    if (dist < CREEPER_FUSE_RANGE) {
+        mob.ai_state = AI_STATE_FUSE;
+        mob.type_data[TD_CREEPER_FUSE_TIMER] = 0;
+        mob.type_data[TD_CREEPER_IGNITED] = 1;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Chase silently (creepers don't make footstep sounds)
+    mob.path_target = pathfind_step(mob.position, target_pos, seed);
+    move_toward(mob, mob.path_target, CREEPER_SPEED);
+    check_jump_obstacle(mob);
+}
+
+void creeper_fuse(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_CREEPER_FUSE_TIMER]++;
+
+    if (!entity_exists(mob.target_entity_id)) {
+        // Target gone, defuse
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.type_data[TD_CREEPER_FUSE_TIMER] = 0;
+        mob.type_data[TD_CREEPER_IGNITED] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = get_entity_position(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Target moved away - defuse
+    if (dist > CREEPER_DEFUSE_RANGE) {
+        // Fuse decreases when target leaves
+        if (mob.type_data[TD_CREEPER_FUSE_TIMER] > 0) {
+            mob.type_data[TD_CREEPER_FUSE_TIMER]--;
+        }
+        if (mob.type_data[TD_CREEPER_FUSE_TIMER] == 0) {
+            mob.ai_state = AI_STATE_CHASE;
+            mob.type_data[TD_CREEPER_IGNITED] = 0;
+            mob.state_timer = 0;
+        }
+        return;
+    }
+
+    // Face target while fusing
+    mob.yaw = angle_to(mob.position, target_pos);
+
+    // Slow down / stop while fusing
+    mob.velocity.x *= 0.3;
+    mob.velocity.z *= 0.3;
+
+    // EXPLODE
+    float max_fuse = uintBitsToFloat(mob.type_data[TD_CREEPER_MAX_FUSE]);
+    if (max_fuse == 0.0) max_fuse = CREEPER_FUSE_TIME;
+
+    if (float(mob.type_data[TD_CREEPER_FUSE_TIMER]) >= max_fuse) {
+        // Create explosion
+        uint idx = atomicAdd(explosion_count, 1);
+        if (idx < 32) {
+            float radius = uintBitsToFloat(mob.type_data[TD_CREEPER_EXPLOSION_RADIUS]);
+            if (radius == 0.0) radius = CREEPER_EXPLOSION_RADIUS;
+
+            // Charged creepers have double radius
+            if (mob.type_data[TD_CREEPER_CHARGED] == 1) {
+                radius *= 2.0;
+            }
+
+            explosions[idx].position = mob.position;
+            explosions[idx].radius = radius;
+            explosions[idx].damage = radius * 10.0;  // Damage scales with radius
+            explosions[idx].source_entity = 0;
+        }
+
+        // Kill creeper
+        mob.health = 0.0;
+        mob.ai_state = AI_STATE_DEAD;
+    }
+}
+
+void update_creeper(inout MobState mob, float dt, inout uint seed) {
+    switch (mob.ai_state) {
+        case AI_STATE_IDLE:
+            creeper_idle(mob, seed);
+            break;
+        case AI_STATE_WANDER:
+            creeper_wander(mob, seed);
+            break;
+        case AI_STATE_CHASE:
+            creeper_chase(mob, seed);
+            break;
+        case AI_STATE_FUSE:
+            creeper_fuse(mob, seed);
+            break;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    // Only process overworld hostiles
+    bool is_overworld_hostile = (mob.mob_type == MOB_TYPE_ZOMBIE ||
+                                  mob.mob_type == MOB_TYPE_SKELETON ||
+                                  mob.mob_type == MOB_TYPE_SPIDER ||
+                                  mob.mob_type == MOB_TYPE_CREEPER);
+    if (!is_overworld_hostile) return;
+    if (mob.ai_state == AI_STATE_DEAD || (mob.flags & MOB_FLAG_NO_AI) != 0) return;
+
+    uint seed = mob.random_seed ^ pc.random_seed ^ idx;
+    float dt = pc.delta_time;
+
+    // Update timers
+    mob.hurt_time = max(mob.hurt_time - 1, 0);
+    mob.no_damage_time = max(mob.no_damage_time - 1, 0);
+    mob.ai_tick_cooldown = max(mob.ai_tick_cooldown - 1, 0);
+
+    // Despawn check (> 128 blocks from any player)
+    if ((mob.flags & MOB_FLAG_CAN_DESPAWN) != 0) {
+        float player_dist = distance(mob.position, pc.player_pos);
+        if (player_dist > 128.0) {
+            mob.ai_state = AI_STATE_DEAD;
+            mobs[idx] = mob;
+            return;
+        }
+    }
+
+    // AI tick
+    if (mob.ai_tick_cooldown == 0) {
+        mob.ai_tick_cooldown = 2;
+
+        switch (mob.mob_type) {
+            case MOB_TYPE_ZOMBIE:
+                update_zombie(mob, dt, seed);
+                break;
+            case MOB_TYPE_SKELETON:
+                update_skeleton(mob, dt, seed);
+                break;
+            case MOB_TYPE_SPIDER:
+                update_spider(mob, dt, seed);
+                break;
+            case MOB_TYPE_CREEPER:
+                update_creeper(mob, dt, seed);
+                break;
+        }
+    }
+
+    // Physics (except climbing spiders)
+    if (mob.type_data[TD_SPIDER_CLIMBING] != 1 || mob.mob_type != MOB_TYPE_SPIDER) {
+        if ((mob.flags & MOB_FLAG_ON_GROUND) == 0) {
+            mob.velocity.y -= GRAVITY * dt * 20.0;
+            mob.velocity.y = max(mob.velocity.y, -TERMINAL_VELOCITY);
+        }
+    }
+
+    // Drag
+    float drag = ((mob.flags & MOB_FLAG_IN_WATER) != 0) ? DRAG_WATER : DRAG_AIR;
+    mob.velocity *= (1.0 - drag);
+
+    // Apply velocity
+    mob.position += mob.velocity * dt * 20.0;
+
+    // Death check
+    if (mob.health <= 0.0) {
+        mob.ai_state = AI_STATE_DEAD;
+    }
+
+    mob.random_seed = seed;
+    mobs[idx] = mob;
+}

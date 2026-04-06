@@ -1,0 +1,62 @@
+# Hyperparameter sweep configuration for Minecraft simulation RL training
+# Uses Bayesian optimization to maximize evaluation success rate
+
+sweep:
+  method: bayes
+  metric:
+    name: eval/success_rate
+    goal: maximize
+
+  parameters:
+    # Learning rate: log-uniform for orders of magnitude exploration
+    learning_rate:
+      distribution: log_uniform
+      min: 1e-5
+      max: 1e-3
+
+    # Rollout steps per update
+    n_steps:
+      values: [64, 128, 256, 512]
+
+    # Minibatch size
+    batch_size:
+      values: [64, 128, 256, 512]
+
+    # PPO epochs per update
+    n_epochs:
+      values: [3, 4, 5, 10]
+
+    # Discount factor
+    gamma:
+      distribution: uniform
+      min: 0.95
+      max: 0.999
+
+    # GAE lambda for advantage estimation
+    gae_lambda:
+      distribution: uniform
+      min: 0.9
+      max: 0.99
+
+    # Entropy coefficient for exploration
+    ent_coef:
+      distribution: log_uniform
+      min: 1e-4
+      max: 1e-1
+
+    # PPO clip range
+    clip_range:
+      values: [0.1, 0.2, 0.3]
+
+  # Early termination for poor runs
+  early_terminate:
+    type: hyperband
+    min_iter: 10
+    eta: 3
+
+# Default values for non-swept parameters
+defaults:
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  normalize_advantage: true
+  target_kl: null

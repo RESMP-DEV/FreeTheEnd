@@ -1,0 +1,118 @@
+id: 1
+name: Basic Survival
+description: >-
+  Learn fundamental Minecraft survival skills. Spawn in plains biome during
+  daytime. Master movement, combat against basic mobs, and craft your first
+  wooden tools.
+objectives:
+  - Kill 3 zombies
+  - Kill 3 skeletons
+  - Mine 10 wood logs
+  - Craft wooden pickaxe
+  - Craft wooden sword
+  - Survive for 5 in-game minutes
+spawn:
+  biome: plains
+  time_of_day: 0
+  weather: clear
+  random_position: true
+  position: null
+  inventory: {}
+  health: 20.0
+  hunger: 20.0
+rewards:
+  sparse_reward: 10.0
+  dense_rewards:
+    distance_traveled: 0.001
+    new_chunk_explored: 0.1
+    damage_dealt: 0.05
+    zombie_killed: 0.5
+    skeleton_killed: 0.5
+    spider_killed: 0.3
+    wood_mined: 0.1
+    planks_crafted: 0.05
+    stick_crafted: 0.02
+    crafting_table_crafted: 0.3
+    wooden_pickaxe_crafted: 0.5
+    wooden_sword_crafted: 0.5
+    wooden_axe_crafted: 0.3
+    food_eaten: 0.1
+    health_restored: 0.02
+  penalty_per_death: -1.0
+  penalty_per_tick: -0.0001
+  exploration_bonus: 0.01
+termination:
+  max_ticks: 24000
+  max_deaths: 10
+  success_conditions:
+    - objective:kill_zombies >= 3
+    - objective:kill_skeletons >= 3
+    - objective:mine_wood >= 10
+    - inventory:wooden_pickaxe >= 1
+    - inventory:wooden_sword >= 1
+  failure_conditions:
+    - deaths >= max_deaths
+    - ticks >= max_ticks
+prerequisites: []
+difficulty: 1
+expected_episodes: 500
+action_space:
+  - move_forward
+  - move_backward
+  - move_left
+  - move_right
+  - jump
+  - sprint
+  - sneak
+  - camera_pitch
+  - camera_yaw
+  - attack
+  - use
+  - hotbar_1
+  - hotbar_2
+  - hotbar_3
+  - hotbar_4
+  - hotbar_5
+  - hotbar_6
+  - hotbar_7
+  - hotbar_8
+  - hotbar_9
+  - open_inventory
+  - craft
+observation_space:
+  - position
+  - velocity
+  - health
+  - hunger
+  - inventory
+  - nearby_entities
+  - nearby_blocks
+  - time_of_day
+  - is_day
+  - equipped_item
+  - damage_source
+  - wood_logs_mined
+  - cobblestone_mined
+  - zombies_killed
+  - skeletons_killed
+  - spiders_killed
+  - total_damage_dealt
+curriculum_threshold: 0.7
+shader_set:
+  - overworld_gen
+  - block_breaking
+  - resource_detection
+metadata:
+  spawn_protection_ticks: 100
+  mob_spawn_rate: normal
+  difficulty: easy
+  target_completion_time: 12000
+  progress_keys:
+    wood_logs_mined: "Wood Logs Mined"
+    cobblestone_mined: "Cobblestone Mined"
+    zombies_killed: "Zombies Killed"
+    skeletons_killed: "Skeletons Killed"
+    spiders_killed: "Spiders Killed"
+    wooden_pickaxe_crafted: "Wooden Pickaxe Crafted"
+    wooden_sword_crafted: "Wooden Sword Crafted"
+    survival_ticks: "Survival Time (ticks)"

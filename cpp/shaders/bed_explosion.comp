@@ -1,0 +1,614 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Bed Explosion Compute Shader - MC 1.8.9 Speed Kill Mechanics
+// Beds explode when used (right-clicked) in End or Nether dimensions
+// Explosion power 5 (massive damage, comparable to charged creeper)
+// Critical for one-cycle dragon kill strategy
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Include damage utilities
+#include "damage.glsl"
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Dimension IDs
+const uint DIM_OVERWORLD = 0u;
+const uint DIM_NETHER = 1u;
+const uint DIM_END = 2u;
+
+// Block IDs
+const uint BLOCK_AIR = 0u;
+const uint BLOCK_BED = 26u;
+const uint BLOCK_FIRE = 51u;
+const uint BLOCK_OBSIDIAN = 49u;
+const uint BLOCK_BEDROCK = 7u;
+const uint BLOCK_END_STONE = 121u;
+
+// Bed explosion constants - MC 1.8.9 exact values
+const float BED_EXPLOSION_POWER = 5.0;          // Power 5 explosion
+const float BED_MAX_RADIUS = 10.0;              // 2 * power = max block damage radius
+const float BED_ENTITY_RADIUS = 12.5;           // 2.5 * power = max entity damage radius
+const float BED_EXPLOSION_DAMAGE_BASE = 50.0;   // Base damage at center
+const float BED_FIRE_CHANCE = 0.25;             // 25% chance to set fire per block
+
+// Dragon-specific damage
+const float DRAGON_HEAD_MULTIPLIER = 4.0;       // Head takes 4x damage
+const float DRAGON_HEAD_RADIUS = 3.0;
+const float DRAGON_BODY_MULTIPLIER = 1.0;
+
+// Bed block metadata
+// Bits 0-1: Direction (0=south, 1=west, 2=north, 3=east)
+// Bit 2: Is head part (0=foot, 1=head)
+// Bit 3: Is occupied
+
+// Direction offsets for bed head relative to foot
+const ivec3 BED_HEAD_OFFSETS[4] = ivec3[4](
+    ivec3(0, 0, 1),   // South (foot at north, head toward south)
+    ivec3(-1, 0, 0),  // West
+    ivec3(0, 0, -1),  // North
+    ivec3(1, 0, 0)    // East
+);
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+
+struct BedPlaceInput {
+    vec3 player_position;      // Player eye position
+    float player_yaw;
+    vec3 look_direction;       // Where player is looking
+    float pad0;
+    ivec3 target_block;        // Block being clicked
+    uint target_face;          // Face being clicked (0-5)
+    uint dimension;            // Current dimension
+    uint has_bed;              // Player has bed in inventory
+    uint action;               // 0=place, 1=use (right-click)
+    uint pad1;
+};
+
+struct BedPlaceResult {
+    uint success;              // 1 if action succeeded
+    uint exploded;             // 1 if bed exploded
+    ivec3 bed_foot_pos;        // Foot position of placed bed
+    ivec3 bed_head_pos;        // Head position of placed bed
+    uint bed_direction;        // 0-3 direction
+    uint failure_reason;       // 0=success, 1=no_space, 2=no_support, 3=blocked
+};
+
+struct ExplosionEvent {
+    vec3 center;               // Explosion center (bed head position + 0.5)
+    float power;               // Explosion power (5.0 for beds)
+    uint source_type;          // 0=bed, 1=tnt, 2=creeper, 3=crystal
+    uint dimension;
+    uint env_id;
+    uint is_active;            // 1 if this explosion should be processed
+};
+
+struct EntityDamage {
+    uint entity_id;
+    uint entity_type;          // 0=player, 1=dragon, 2=mob
+    float damage;
+    vec3 knockback;
+    uint hit_part;             // For dragon: 0=body, 1=head, 2=tail
+    float pad;
+};
+
+struct BlockChange {
+    ivec3 position;
+    uint new_block_id;
+    uint new_metadata;
+    uint change_type;          // 0=destroy, 1=set_fire
+    uint pad;
+};
+
+// ============================================================================
+// BUFFERS
+// ============================================================================
+
+// Per-agent bed placement input
+layout(set = 0, binding = 0, std430) readonly buffer BedInputBuffer {
+    BedPlaceInput bed_inputs[];
+};
+
+// Per-agent placement result
+layout(set = 0, binding = 1, std430) writeonly buffer BedResultBuffer {
+    BedPlaceResult bed_results[];
+};
+
+// Explosion events to process
+layout(set = 0, binding = 2, std430) buffer ExplosionBuffer {
+    uint explosion_count;
+    uint _pad_exp[3];
+    ExplosionEvent explosions[];
+};
+
+// Entity damage output
+layout(set = 0, binding = 3, std430) buffer EntityDamageBuffer {
+    uint damage_count;
+    uint _pad_dmg[3];
+    EntityDamage damages[];
+};
+
+// Block changes output
+layout(set = 0, binding = 4, std430) buffer BlockChangeBuffer {
+    uint change_count;
+    uint max_changes;
+    uint _pad_blk[2];
+    BlockChange changes[];
+};
+
+// Voxel grid for world state
+layout(set = 0, binding = 5, std430) readonly buffer VoxelBuffer {
+    uvec2 grid_size;
+    uint grid_height;
+    uint _pad_vox;
+    uint voxels[];  // Block ID + metadata packed
+};
+
+// Dragon state (for hit detection)
+layout(set = 0, binding = 6, std430) buffer DragonBuffer {
+    vec3 dragon_position;
+    float dragon_health;
+    vec3 dragon_velocity;
+    uint dragon_phase;
+    mat4 dragon_body_transform;
+    vec3 dragon_head_world;     // Pre-computed head position
+    float _pad_drg;
+};
+
+// Player states
+layout(set = 0, binding = 7, std430) buffer PlayerBuffer {
+    vec4 player_positions[];    // xyz=pos, w=health
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_agents;
+    uint tick;
+    uint random_seed;
+    uint stage;                 // 0=placement, 1=explosion
+} pc;
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+// Get block at world position
+uint getBlock(ivec3 pos) {
+    if (pos.x < 0 || pos.y < 0 || pos.z < 0) return BLOCK_AIR;
+    if (pos.x >= int(grid_size.x) || pos.y >= int(grid_height) || pos.z >= int(grid_size.y)) {
+        return BLOCK_AIR;
+    }
+    uint index = pos.y * grid_size.x * grid_size.y + pos.z * grid_size.x + pos.x;
+    return voxels[index] & 0xFFu;
+}
+
+// Check if block is solid (can support bed)
+bool isSolid(uint block_id) {
+    if (block_id == BLOCK_AIR) return false;
+    if (block_id == BLOCK_FIRE) return false;
+    // Add more non-solid blocks as needed
+    return true;
+}
+
+// Check if block can be destroyed by explosion
+bool isBlastResistant(uint block_id) {
+    return block_id == BLOCK_OBSIDIAN ||
+           block_id == BLOCK_BEDROCK;
+}
+
+// Check if block can catch fire
+bool isFlammable(uint block_id) {
+    // Wood, leaves, wool, etc.
+    if (block_id >= 17 && block_id <= 18) return true;  // Wood, leaves
+    if (block_id >= 35 && block_id <= 35) return true;  // Wool
+    if (block_id == 5) return true;  // Planks
+    return false;
+}
+
+// Get direction from player yaw (opposite of look direction)
+uint getPlaceDirection(float yaw) {
+    // Player faces the foot, head is behind
+    // Normalize yaw to 0-360
+    float normalized = mod(yaw + 360.0, 360.0);
+
+    // Map to 4 directions (bed head is opposite player facing)
+    if (normalized >= 315.0 || normalized < 45.0) return 0u;   // South (facing north)
+    if (normalized >= 45.0 && normalized < 135.0) return 1u;   // West (facing east)
+    if (normalized >= 135.0 && normalized < 225.0) return 2u;  // North (facing south)
+    return 3u;  // East (facing west)
+}
+
+// ============================================================================
+// STAGE 0: BED PLACEMENT
+// ============================================================================
+
+void stage_bed_placement(uint agent_id) {
+    if (agent_id >= pc.num_agents) return;
+
+    BedPlaceInput bed_input = bed_inputs[agent_id];
+    BedPlaceResult result;
+    result.success = 0u;
+    result.exploded = 0u;
+    result.bed_foot_pos = ivec3(0);
+    result.bed_head_pos = ivec3(0);
+    result.bed_direction = 0u;
+    result.failure_reason = 0u;
+
+    // Only process place actions with bed in inventory
+    if (bed_input.action != 0u || bed_input.has_bed == 0u) {
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // Calculate foot position (on the clicked face)
+    ivec3 foot_pos = bed_input.target_block;
+
+    // Adjust based on face clicked
+    const ivec3 FACE_OFFSETS[6] = ivec3[6](
+        ivec3(0, -1, 0),  // DOWN
+        ivec3(0, 1, 0),   // UP
+        ivec3(0, 0, -1),  // NORTH
+        ivec3(0, 0, 1),   // SOUTH
+        ivec3(-1, 0, 0),  // WEST
+        ivec3(1, 0, 0)    // EAST
+    );
+    foot_pos += FACE_OFFSETS[bed_input.target_face];
+
+    // Get bed direction and head position
+    uint direction = getPlaceDirection(bed_input.player_yaw);
+    ivec3 head_offset = BED_HEAD_OFFSETS[direction];
+    ivec3 head_pos = foot_pos + head_offset;
+
+    // Validation checks
+    // 1. Check foot position is air
+    if (getBlock(foot_pos) != BLOCK_AIR) {
+        result.failure_reason = 1u;  // No space
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // 2. Check head position is air
+    if (getBlock(head_pos) != BLOCK_AIR) {
+        result.failure_reason = 1u;  // No space
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // 3. Check solid block below foot
+    if (!isSolid(getBlock(foot_pos + ivec3(0, -1, 0)))) {
+        result.failure_reason = 2u;  // No support
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // 4. Check solid block below head
+    if (!isSolid(getBlock(head_pos + ivec3(0, -1, 0)))) {
+        result.failure_reason = 2u;  // No support
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // Placement valid
+    result.success = 1u;
+    result.bed_foot_pos = foot_pos;
+    result.bed_head_pos = head_pos;
+    result.bed_direction = direction;
+
+    // Queue block changes for foot and head
+    uint foot_idx = atomicAdd(change_count, 1u);
+    if (foot_idx < max_changes) {
+        BlockChange foot_change;
+        foot_change.position = foot_pos;
+        foot_change.new_block_id = BLOCK_BED;
+        foot_change.new_metadata = direction;  // Foot part, direction encoded
+        foot_change.change_type = 1u;  // Place
+        foot_change.pad = 0u;
+        changes[foot_idx] = foot_change;
+    }
+
+    uint head_idx = atomicAdd(change_count, 1u);
+    if (head_idx < max_changes) {
+        BlockChange head_change;
+        head_change.position = head_pos;
+        head_change.new_block_id = BLOCK_BED;
+        head_change.new_metadata = direction | 4u;  // Head part (bit 2 set)
+        head_change.change_type = 1u;  // Place
+        head_change.pad = 0u;
+        changes[head_idx] = head_change;
+    }
+
+    bed_results[agent_id] = result;
+}
+
+// ============================================================================
+// STAGE 1: BED USE (SLEEP OR EXPLODE)
+// ============================================================================
+
+void stage_bed_use(uint agent_id) {
+    if (agent_id >= pc.num_agents) return;
+
+    BedPlaceInput bed_input = bed_inputs[agent_id];
+    BedPlaceResult result;
+    result.success = 0u;
+    result.exploded = 0u;
+    result.bed_foot_pos = ivec3(0);
+    result.bed_head_pos = ivec3(0);
+    result.bed_direction = 0u;
+    result.failure_reason = 0u;
+
+    // Only process use actions
+    if (bed_input.action != 1u) {
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // Check if target is a bed
+    uint target_block = getBlock(bed_input.target_block);
+    if (target_block != BLOCK_BED) {
+        result.failure_reason = 3u;  // Not a bed
+        bed_results[agent_id] = result;
+        return;
+    }
+
+    // CRITICAL: In End or Nether, beds explode!
+    if (bed_input.dimension == DIM_END || bed_input.dimension == DIM_NETHER) {
+        // Queue explosion at bed position
+        uint exp_idx = atomicAdd(explosion_count, 1u);
+
+        ExplosionEvent explosion;
+        explosion.center = vec3(bed_input.target_block) + vec3(0.5);  // Center of block
+        explosion.power = BED_EXPLOSION_POWER;
+        explosion.source_type = 0u;  // Bed
+        explosion.dimension = bed_input.dimension;
+        explosion.env_id = agent_id;
+        explosion.is_active = 1u;
+        explosions[exp_idx] = explosion;
+
+        result.success = 1u;
+        result.exploded = 1u;
+        result.bed_foot_pos = bed_input.target_block;
+
+        // Remove the bed blocks
+        uint remove_idx = atomicAdd(change_count, 1u);
+        if (remove_idx < max_changes) {
+            BlockChange remove_change;
+            remove_change.position = bed_input.target_block;
+            remove_change.new_block_id = BLOCK_AIR;
+            remove_change.new_metadata = 0u;
+            remove_change.change_type = 0u;  // Destroy
+            remove_change.pad = 0u;
+            changes[remove_idx] = remove_change;
+        }
+    } else {
+        // In Overworld, would initiate sleep (not implemented here)
+        result.success = 1u;
+        result.exploded = 0u;
+    }
+
+    bed_results[agent_id] = result;
+}
+
+// ============================================================================
+// STAGE 2: EXPLOSION PROCESSING
+// ============================================================================
+
+// Shared memory for explosion calculation
+shared float shared_dragon_damage;
+shared uint shared_damage_count;
+
+void stage_explosion_process(uint thread_id) {
+    // Initialize shared memory
+    if (gl_LocalInvocationID.x == 0u) {
+        shared_dragon_damage = 0.0;
+        shared_damage_count = 0u;
+    }
+    barrier();
+
+    // Each workgroup processes one explosion
+    uint exp_idx = gl_WorkGroupID.x;
+    if (exp_idx >= explosion_count) return;
+
+    ExplosionEvent explosion = explosions[exp_idx];
+    if (explosion.is_active == 0u) return;
+
+    vec3 center = explosion.center;
+    float power = explosion.power;
+    uint seed = hash(pc.random_seed ^ pc.tick ^ exp_idx ^ thread_id);
+
+    // =========================================================================
+    // DRAGON DAMAGE (critical for one-cycle kills)
+    // =========================================================================
+
+    // Check dragon hit - this is the key speedrun mechanic
+    vec3 to_dragon_head = dragon_head_world - center;
+    float head_dist = length(to_dragon_head);
+
+    vec3 to_dragon_body = dragon_position - center;
+    float body_dist = length(to_dragon_body);
+
+    // Calculate explosion damage using inverse square law
+    // MC formula: damage = (power * 2) * (1 - distance / radius) * 7
+    // For bed (power 5): max damage = 10 * 7 = 70 at center
+
+    float head_damage = 0.0;
+    float body_damage = 0.0;
+
+    if (head_dist < BED_ENTITY_RADIUS && dragon_health > 0.0) {
+        float falloff = 1.0 - (head_dist / BED_ENTITY_RADIUS);
+        head_damage = BED_EXPLOSION_DAMAGE_BASE * falloff * DRAGON_HEAD_MULTIPLIER;
+
+        // Critical: Being right next to dragon head = massive damage
+        // ~100 damage per bed is achievable with perfect positioning
+        if (head_dist < DRAGON_HEAD_RADIUS) {
+            head_damage *= 1.5;  // Point blank bonus
+        }
+    }
+
+    if (body_dist < BED_ENTITY_RADIUS && dragon_health > 0.0) {
+        float falloff = 1.0 - (body_dist / BED_ENTITY_RADIUS);
+        body_damage = BED_EXPLOSION_DAMAGE_BASE * falloff * DRAGON_BODY_MULTIPLIER;
+    }
+
+    // Take the higher damage (can't hit both head and body with same explosion)
+    float dragon_total = max(head_damage, body_damage);
+
+    if (dragon_total > 0.0 && thread_id == 0u) {
+        shared_dragon_damage += dragon_total;
+
+        // Queue dragon damage
+        uint dmg_idx = atomicAdd(damage_count, 1u);
+        EntityDamage dmg;
+        dmg.entity_id = 0u;  // Dragon
+        dmg.entity_type = 1u;  // Dragon type
+        dmg.damage = dragon_total;
+        dmg.knockback = normalize(to_dragon_body) * min(power * 0.5, 2.0);
+        dmg.hit_part = (head_damage > body_damage) ? 1u : 0u;
+        dmg.pad = 0.0;
+        damages[dmg_idx] = dmg;
+    }
+
+    // =========================================================================
+    // PLAYER DAMAGE (the user takes damage too!)
+    // =========================================================================
+
+    // Player who triggered the explosion
+    vec4 player_data = player_positions[explosion.env_id];
+    vec3 player_pos = player_data.xyz;
+    float player_health = player_data.w;
+
+    if (player_health > 0.0) {
+        float player_dist = length(player_pos - center);
+
+        if (player_dist < BED_ENTITY_RADIUS) {
+            float falloff = 1.0 - (player_dist / BED_ENTITY_RADIUS);
+            float raw_damage = BED_EXPLOSION_DAMAGE_BASE * falloff;
+
+            // Apply blast protection if available (not implemented - would need equipment data)
+            float player_damage = raw_damage;
+
+            if (thread_id == 0u) {
+                uint dmg_idx = atomicAdd(damage_count, 1u);
+                EntityDamage dmg;
+                dmg.entity_id = explosion.env_id;
+                dmg.entity_type = 0u;  // Player type
+                dmg.damage = player_damage;
+                dmg.knockback = normalize(player_pos - center) * min(power, 3.0);
+                dmg.knockback.y += 1.0;  // Upward component
+                dmg.hit_part = 0u;
+                dmg.pad = 0.0;
+                damages[dmg_idx] = dmg;
+            }
+        }
+    }
+
+    // =========================================================================
+    // BLOCK DESTRUCTION AND FIRE
+    // =========================================================================
+
+    // Divide block processing among threads
+    // Iterate through blocks in explosion radius
+    int radius_int = int(ceil(BED_MAX_RADIUS));
+    uint blocks_per_thread = uint(radius_int * 2 + 1);
+    uint total_blocks = blocks_per_thread * blocks_per_thread * blocks_per_thread;
+
+    // Each thread handles a slice of blocks
+    for (uint i = thread_id; i < total_blocks; i += 64u) {
+        int local_x = int(i % blocks_per_thread) - radius_int;
+        int local_y = int((i / blocks_per_thread) % blocks_per_thread) - radius_int;
+        int local_z = int(i / (blocks_per_thread * blocks_per_thread)) - radius_int;
+
+        ivec3 block_pos = ivec3(center) + ivec3(local_x, local_y, local_z);
+        float dist = length(vec3(block_pos) + vec3(0.5) - center);
+
+        if (dist > BED_MAX_RADIUS) continue;
+
+        uint block_id = getBlock(block_pos);
+        if (block_id == BLOCK_AIR) continue;
+        if (isBlastResistant(block_id)) continue;
+
+        // Calculate block destruction probability
+        float falloff = 1.0 - (dist / BED_MAX_RADIUS);
+        float destroy_chance = falloff * (power / 5.0);
+
+        if (rand(seed) < destroy_chance) {
+            uint change_idx = atomicAdd(change_count, 1u);
+            if (change_idx < max_changes) {
+                BlockChange change;
+                change.position = block_pos;
+                change.new_block_id = BLOCK_AIR;
+                change.new_metadata = 0u;
+                change.change_type = 0u;  // Destroy
+                change.pad = 0u;
+                changes[change_idx] = change;
+            }
+        }
+
+        // Fire spread chance
+        if (rand(seed) < BED_FIRE_CHANCE) {
+            // Check if adjacent block is air (for fire placement)
+            ivec3 fire_pos = block_pos + ivec3(0, 1, 0);
+            if (getBlock(fire_pos) == BLOCK_AIR) {
+                uint fire_idx = atomicAdd(change_count, 1u);
+                if (fire_idx < max_changes) {
+                    BlockChange fire_change;
+                    fire_change.position = fire_pos;
+                    fire_change.new_block_id = BLOCK_FIRE;
+                    fire_change.new_metadata = 0u;
+                    fire_change.change_type = 1u;  // Set fire
+                    fire_change.pad = 0u;
+                    changes[fire_idx] = fire_change;
+                }
+            }
+        }
+    }
+
+    barrier();
+
+    // Apply dragon damage (single thread)
+    if (thread_id == 0u && shared_dragon_damage > 0.0) {
+        dragon_health = max(0.0, dragon_health - shared_dragon_damage);
+    }
+
+    // Mark explosion as processed
+    if (thread_id == 0u) {
+        explosions[exp_idx].is_active = 0u;
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+void main() {
+    uint thread_id = gl_GlobalInvocationID.x;
+
+    switch (pc.stage) {
+        case 0u:
+            stage_bed_placement(thread_id);
+            break;
+        case 1u:
+            stage_bed_use(thread_id);
+            break;
+        case 2u:
+            stage_explosion_process(thread_id);
+            break;
+    }
+}

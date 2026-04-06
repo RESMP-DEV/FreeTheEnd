@@ -1,0 +1,940 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// ENDERMAN FULL AI - Minecraft 1.8.9 Accurate Implementation
+// ============================================================================
+//
+// Stats:
+//   - 40 HP (20 hearts)
+//   - Attack: 7 damage (3.5 hearts) on Easy, 7 on Normal, 10.5 on Hard
+//   - Drops: 0-1 Ender Pearl + held block
+//   - Height: 2.9 blocks, Width: 0.6 blocks
+//
+// Behavior:
+//   1. Passive: Wanders, picks up blocks (grass, dirt, sand, gravel, etc.)
+//   2. Aggro trigger: Player crosshair within enderman face hitbox at <64 blocks
+//   3. Aggro state: Shake, open mouth, freeze, then attack
+//   4. Attack: Teleport combos, fast melee, can teleport behind player
+//   5. Flee: Teleport away from water, rain, projectiles
+//
+// Teleportation:
+//   - Range: 32 blocks
+//   - Min distance: 16 blocks (for random TP), can be closer for chase
+//   - Cooldown: 10 ticks (0.5 seconds)
+//   - Cannot teleport into water or onto non-full blocks
+//   - Prefers positions behind the player when attacking
+//
+// ============================================================================
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const uint MOB_TYPE_ENDERMAN = 2;
+
+// AI States
+const uint AI_STATE_IDLE = 0;
+const uint AI_STATE_WANDER = 1;
+const uint AI_STATE_CHASE = 2;
+const uint AI_STATE_ATTACK = 3;
+const uint AI_STATE_FLEE = 4;
+const uint AI_STATE_TELEPORT = 5;
+const uint AI_STATE_STARE = 6;      // Angry stare before attack
+const uint AI_STATE_SCREAMING = 7;  // Shaking/screaming animation
+const uint AI_STATE_DEAD = 9;
+
+// Mob Flags
+const uint MOB_FLAG_ON_GROUND = 1 << 0;
+const uint MOB_FLAG_IN_WATER = 1 << 1;
+const uint MOB_FLAG_IN_LAVA = 1 << 2;
+const uint MOB_FLAG_NO_AI = 1 << 3;
+const uint MOB_FLAG_PERSISTENT = 1 << 4;
+const uint MOB_FLAG_LEASHED = 1 << 5;
+const uint MOB_FLAG_BURNING = 1 << 6;
+const uint MOB_FLAG_INVISIBLE = 1 << 7;
+const uint MOB_FLAG_WAS_HIT = 1 << 10;       // Just took damage this tick
+const uint MOB_FLAG_HIT_BY_PROJ = 1 << 11;   // Hit by projectile
+
+// Enderman Constants
+const float ENDERMAN_MAX_HEALTH = 40.0;
+const float ENDERMAN_HEIGHT = 2.9;
+const float ENDERMAN_WIDTH = 0.6;
+const float ENDERMAN_EYE_HEIGHT = 2.55;      // Head center ~2.55 blocks up
+
+// Teleportation
+const float TP_RANGE_MAX = 32.0;
+const float TP_RANGE_MIN = 16.0;
+const float TP_RANGE_CHASE_MIN = 4.0;        // Can TP closer when chasing
+const uint TP_COOLDOWN_TICKS = 10;           // 0.5 seconds at 20 TPS
+
+// Detection and Combat
+const float STARE_DETECTION_RANGE = 64.0;    // Max range for stare detection
+const float STARE_ANGLE_THRESHOLD = 0.02;    // ~1.15 degrees, very precise
+const float FACE_HITBOX_WIDTH = 0.3;         // Head hitbox width/2
+const float FACE_HITBOX_HEIGHT = 0.3;        // Head hitbox height/2
+const float ATTACK_RANGE = 2.5;
+const float ATTACK_DAMAGE = 7.0;             // Normal difficulty
+const float AGGRO_RANGE = 64.0;
+const float DEAGGRO_RANGE = 40.0;            // Stops chasing if >40 blocks away
+
+// Movement Speeds
+const float SPEED_PASSIVE = 0.3;
+const float SPEED_AGGRO = 0.65;              // Very fast when angry
+
+// Water damage
+const float WATER_DAMAGE_PER_TICK = 1.0;
+
+// Block picking (can pick up these block IDs)
+const uint PICKABLE_BLOCK_GRASS = 2;
+const uint PICKABLE_BLOCK_DIRT = 3;
+const uint PICKABLE_BLOCK_SAND = 12;
+const uint PICKABLE_BLOCK_GRAVEL = 13;
+const uint PICKABLE_BLOCK_CLAY = 82;
+const uint PICKABLE_BLOCK_PUMPKIN = 86;
+const uint PICKABLE_BLOCK_MELON = 103;
+const uint PICKABLE_BLOCK_MYCELIUM = 110;
+const uint PICKABLE_BLOCK_NETHERRACK = 87;
+const uint PICKABLE_BLOCK_TNT = 46;
+const uint PICKABLE_BLOCK_CACTUS = 81;
+
+// Type-specific data indices (stored in type_data[6])
+const uint TD_HELD_BLOCK = 0;           // Block ID being held
+const uint TD_TP_COOLDOWN = 1;          // Teleport cooldown ticks
+const uint TD_SCREAMING = 2;            // Is screaming (angry animation)
+const uint TD_STARE_TIME = 3;           // Ticks since player started staring
+const uint TD_LAST_DAMAGE_TICK = 4;     // Tick when last damaged
+const uint TD_AGGRO_SOURCE = 5;         // Entity that provoked aggro
+
+// Block types
+const uint BLOCK_AIR = 0;
+const uint BLOCK_WATER = 8;
+const uint BLOCK_WATER_FLOW = 9;
+const uint BLOCK_LAVA = 10;
+const uint BLOCK_LAVA_FLOW = 11;
+const uint BLOCK_SLAB = 44;             // Half slabs
+const uint BLOCK_STAIR = 53;            // Stairs (various IDs actually)
+const uint BLOCK_SOUL_SAND = 88;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+struct MobState {
+    vec3 position;
+    float _pad0;
+    vec3 velocity;
+    float _pad1;
+    uint mob_type;
+    uint ai_state;
+    uint target_entity_id;
+    uint flags;
+    float health;
+    float max_health;
+    uint hurt_time;
+    uint no_damage_time;
+    float yaw;
+    float pitch;
+    float move_speed;
+    float jump_velocity;
+    uint ai_tick_cooldown;
+    uint attack_cooldown;
+    uint state_timer;
+    uint random_seed;
+    vec3 path_target;
+    uint path_state;
+    uint type_data[6];
+};
+
+struct EntityRef {
+    vec3 position;
+    uint entity_id;
+    vec3 look_dir;      // Normalized look direction
+    uint entity_flags;  // Bit 0: has pumpkin helmet
+};
+
+// ============================================================================
+// Buffers
+// ============================================================================
+
+layout(set = 0, binding = 0) buffer MobBuffer {
+    MobState mobs[];
+};
+
+layout(set = 0, binding = 1) buffer readonly EntityBuffer {
+    EntityRef entities[];
+};
+
+layout(set = 0, binding = 2) buffer readonly WorldBuffer {
+    uint world_blocks[];
+};
+
+layout(set = 0, binding = 3) buffer DropBuffer {
+    uint drops[];  // Format: [count, entity_type, x, y, z, item_id, ...]
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mob_count;
+    uint entity_count;
+    float delta_time;
+    uint tick;
+    float world_time;
+    uint random_seed;
+    vec3 player_pos;
+    vec3 player_look_dir;
+    uint player_flags;   // Bit 0: wearing pumpkin
+} pc;
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rand(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+int rand_int(inout uint seed, int min_val, int max_val) {
+    return min_val + int(rand(seed) * float(max_val - min_val + 1));
+}
+
+vec3 rand_dir(inout uint seed) {
+    float theta = rand(seed) * 6.28318530718;
+    float phi = acos(2.0 * rand(seed) - 1.0);
+    return vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+}
+
+vec3 rand_horizontal_dir(inout uint seed) {
+    float theta = rand(seed) * 6.28318530718;
+    return vec3(cos(theta), 0.0, sin(theta));
+}
+
+// ============================================================================
+// Vector Utilities
+// ============================================================================
+
+float dist_sq(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return dot(d, d);
+}
+
+float horiz_dist(vec3 a, vec3 b) {
+    vec2 d = a.xz - b.xz;
+    return length(d);
+}
+
+vec3 safe_normalize(vec3 v) {
+    float len = length(v);
+    return len > 0.001 ? v / len : vec3(0.0);
+}
+
+float yaw_to(vec3 from, vec3 to) {
+    vec2 dir = normalize(to.xz - from.xz);
+    return atan(dir.x, dir.y);
+}
+
+// ============================================================================
+// World Queries
+// ============================================================================
+
+ivec3 to_block(vec3 pos) {
+    return ivec3(floor(pos));
+}
+
+uint block_at(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(256)))) {
+        return BLOCK_AIR;
+    }
+    uint idx = pos.y * 256 * 256 + pos.z * 256 + pos.x;
+    return (world_blocks[idx >> 2] >> ((idx & 3) * 8)) & 0xFF;
+}
+
+bool is_solid(uint block) {
+    return block != BLOCK_AIR &&
+           block != BLOCK_WATER && block != BLOCK_WATER_FLOW &&
+           block != BLOCK_LAVA && block != BLOCK_LAVA_FLOW;
+}
+
+bool is_water(uint block) {
+    return block == BLOCK_WATER || block == BLOCK_WATER_FLOW;
+}
+
+bool is_full_block(uint block) {
+    // Slabs, stairs, soul sand are not full blocks
+    // In real MC this is more complex but we approximate
+    if (block == BLOCK_AIR) return false;
+    if (block == BLOCK_SLAB) return false;
+    if (block >= 53 && block <= 156 && ((block - 53) % 4) == 0) return false; // Various stairs
+    if (block == BLOCK_SOUL_SAND) return false;
+    return true;
+}
+
+bool is_pickable_block(uint block) {
+    return block == PICKABLE_BLOCK_GRASS ||
+           block == PICKABLE_BLOCK_DIRT ||
+           block == PICKABLE_BLOCK_SAND ||
+           block == PICKABLE_BLOCK_GRAVEL ||
+           block == PICKABLE_BLOCK_CLAY ||
+           block == PICKABLE_BLOCK_PUMPKIN ||
+           block == PICKABLE_BLOCK_MELON ||
+           block == PICKABLE_BLOCK_MYCELIUM ||
+           block == PICKABLE_BLOCK_NETHERRACK ||
+           block == PICKABLE_BLOCK_TNT ||
+           block == PICKABLE_BLOCK_CACTUS;
+}
+
+// Check if position is valid for enderman teleport
+// Requirements: solid full block below, 3 blocks of air above (enderman is 2.9 tall)
+// No water at destination
+bool is_valid_tp_dest(vec3 pos) {
+    ivec3 bp = to_block(pos);
+
+    // Check block below - must be solid full block
+    uint below = block_at(bp + ivec3(0, -1, 0));
+    if (!is_solid(below) || !is_full_block(below)) return false;
+
+    // Check 3 blocks of clearance (enderman is 2.9 blocks tall)
+    for (int y = 0; y < 3; y++) {
+        uint b = block_at(bp + ivec3(0, y, 0));
+        if (is_solid(b)) return false;
+        if (is_water(b)) return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Entity Queries
+// ============================================================================
+
+vec3 get_entity_pos(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].position;
+        }
+    }
+    return vec3(0.0);
+}
+
+bool entity_exists(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+vec3 get_entity_look_dir(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return entities[i].look_dir;
+        }
+    }
+    return vec3(0.0, 0.0, 1.0);
+}
+
+bool entity_has_pumpkin(uint entity_id) {
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == entity_id) {
+            return (entities[i].entity_flags & 1u) != 0;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Stare Detection - The Core Enderman Mechanic
+// ============================================================================
+
+// Check if a ray from player's eyes intersects the enderman's face hitbox
+// Enderman face is at eye height (~2.55 blocks up from feet)
+// Face hitbox is approximately 0.3 x 0.3 blocks centered on eye position
+bool is_looking_at_face(vec3 enderman_pos, vec3 player_pos, vec3 player_look) {
+    // Enderman eye/face position
+    vec3 face_center = enderman_pos + vec3(0.0, ENDERMAN_EYE_HEIGHT, 0.0);
+
+    // Player eye position (assuming 1.62 eye height)
+    vec3 player_eye = player_pos + vec3(0.0, 1.62, 0.0);
+
+    // Vector from player eye to enderman face
+    vec3 to_face = face_center - player_eye;
+    float dist = length(to_face);
+
+    // Too far to detect
+    if (dist > STARE_DETECTION_RANGE) return false;
+
+    // Normalize direction to face
+    vec3 to_face_dir = to_face / dist;
+
+    // Check if player is looking roughly toward enderman
+    float dot_prod = dot(player_look, to_face_dir);
+    if (dot_prod < 0.5) return false; // Not facing enderman at all
+
+    // Ray-box intersection for face hitbox
+    // Project player look ray to distance of face
+    float t = dot(to_face, player_look) / dot(player_look, player_look);
+    if (t < 0.0) return false; // Looking away
+
+    vec3 closest_point = player_eye + player_look * t;
+    vec3 diff = closest_point - face_center;
+
+    // Check if within face hitbox (expand based on distance for realism)
+    float hitbox_scale = 1.0 + dist * 0.005; // Slightly larger hitbox at distance
+    float hbw = FACE_HITBOX_WIDTH * hitbox_scale;
+    float hbh = FACE_HITBOX_HEIGHT * hitbox_scale;
+
+    return abs(diff.x) < hbw && abs(diff.y) < hbh && abs(diff.z) < hbw;
+}
+
+// Full stare check including pumpkin helmet protection
+bool check_player_staring(vec3 enderman_pos, out uint starer_id) {
+    starer_id = 0xFFFFFFFF;
+
+    // Check main player first
+    float dist = distance(enderman_pos, pc.player_pos);
+    if (dist < STARE_DETECTION_RANGE) {
+        // Pumpkin helmet protects against aggro
+        if ((pc.player_flags & 1u) != 0) {
+            // Player wearing pumpkin - no aggro
+        } else if (is_looking_at_face(enderman_pos, pc.player_pos, pc.player_look_dir)) {
+            starer_id = 0; // Player ID
+            return true;
+        }
+    }
+
+    // Check other entities (multiplayer/mods)
+    for (uint i = 0; i < pc.entity_count; i++) {
+        if (entities[i].entity_id == 0) continue; // Skip main player
+
+        float d = distance(enderman_pos, entities[i].position);
+        if (d >= STARE_DETECTION_RANGE) continue;
+
+        // Check for pumpkin
+        if ((entities[i].entity_flags & 1u) != 0) continue;
+
+        if (is_looking_at_face(enderman_pos, entities[i].position, entities[i].look_dir)) {
+            starer_id = entities[i].entity_id;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Teleportation
+// ============================================================================
+
+// Random teleport (passive/escape)
+bool teleport_random(inout MobState mob, inout uint seed) {
+    if (mob.type_data[TD_TP_COOLDOWN] > 0) return false;
+
+    for (uint attempt = 0; attempt < 20; attempt++) {
+        vec3 offset = rand_dir(seed);
+        float dist = TP_RANGE_MIN + rand(seed) * (TP_RANGE_MAX - TP_RANGE_MIN);
+        vec3 target = mob.position + offset * dist;
+
+        // Clamp Y to valid range
+        target.y = clamp(target.y, 1.0, 250.0);
+
+        if (is_valid_tp_dest(target)) {
+            mob.position = target;
+            mob.velocity = vec3(0.0);
+            mob.type_data[TD_TP_COOLDOWN] = TP_COOLDOWN_TICKS;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Teleport away from a threat (water, projectile, damage source)
+bool teleport_away(inout MobState mob, vec3 threat_pos, inout uint seed) {
+    if (mob.type_data[TD_TP_COOLDOWN] > 0) return false;
+
+    vec3 away = safe_normalize(mob.position - threat_pos);
+
+    for (uint attempt = 0; attempt < 25; attempt++) {
+        // Bias toward away direction but add randomness
+        vec3 offset = safe_normalize(away + rand_dir(seed) * 0.5);
+        float dist = TP_RANGE_MIN + rand(seed) * (TP_RANGE_MAX - TP_RANGE_MIN);
+        vec3 target = mob.position + offset * dist;
+        target.y = clamp(target.y, 1.0, 250.0);
+
+        if (is_valid_tp_dest(target)) {
+            mob.position = target;
+            mob.velocity = vec3(0.0);
+            mob.type_data[TD_TP_COOLDOWN] = TP_COOLDOWN_TICKS;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Teleport toward target (chase/attack) - can teleport behind player
+bool teleport_toward(inout MobState mob, vec3 target_pos, vec3 target_look, inout uint seed) {
+    if (mob.type_data[TD_TP_COOLDOWN] > 0) return false;
+
+    // Calculate position behind target
+    vec3 behind_target = target_pos - target_look * 3.0;
+
+    for (uint attempt = 0; attempt < 20; attempt++) {
+        vec3 target;
+
+        if (attempt < 10 && rand(seed) < 0.6) {
+            // Try to teleport behind the player (60% of first 10 attempts)
+            vec3 offset = rand_dir(seed) * 2.0;
+            offset.y = 0.0;
+            target = behind_target + offset;
+        } else {
+            // Teleport toward target with some randomness
+            vec3 toward = safe_normalize(target_pos - mob.position);
+            vec3 offset = safe_normalize(toward + rand_dir(seed) * 0.3);
+            float dist = min(distance(mob.position, target_pos) - 2.0, TP_RANGE_MAX);
+            dist = max(dist, TP_RANGE_CHASE_MIN);
+            target = mob.position + offset * dist;
+        }
+
+        target.y = clamp(target.y, 1.0, 250.0);
+
+        if (is_valid_tp_dest(target)) {
+            mob.position = target;
+            mob.velocity = vec3(0.0);
+            mob.type_data[TD_TP_COOLDOWN] = TP_COOLDOWN_TICKS;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Block Picking
+// ============================================================================
+
+void try_pick_block(inout MobState mob, inout uint seed) {
+    if (mob.type_data[TD_HELD_BLOCK] != 0) return; // Already holding something
+    if (rand(seed) > 0.001) return; // Very rare
+
+    // Look for nearby pickable block
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ivec3 offset = ivec3(
+            rand_int(seed, -2, 2),
+            rand_int(seed, -1, 2),
+            rand_int(seed, -2, 2)
+        );
+        ivec3 block_pos = to_block(mob.position) + offset;
+        uint block = block_at(block_pos);
+
+        if (is_pickable_block(block)) {
+            mob.type_data[TD_HELD_BLOCK] = block;
+            // Note: actual block removal handled by CPU
+            return;
+        }
+    }
+}
+
+// ============================================================================
+// AI State Functions
+// ============================================================================
+
+void ai_idle(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_SCREAMING] = 0;
+
+    // Check for staring players
+    uint starer;
+    if (check_player_staring(mob.position, starer)) {
+        mob.target_entity_id = starer;
+        mob.ai_state = AI_STATE_STARE;
+        mob.type_data[TD_STARE_TIME] = 0;
+        mob.type_data[TD_SCREAMING] = 1;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Random passive teleport
+    if (mob.state_timer > 200 && rand(seed) < 0.005) {
+        teleport_random(mob, seed);
+    }
+
+    // Try picking up blocks
+    try_pick_block(mob, seed);
+
+    // Transition to wander
+    if (mob.state_timer > 60 + uint(rand(seed) * 100.0)) {
+        mob.ai_state = AI_STATE_WANDER;
+        vec3 offset = rand_horizontal_dir(seed) * (4.0 + rand(seed) * 8.0);
+        mob.path_target = mob.position + offset;
+        mob.state_timer = 0;
+    }
+
+    // Stop moving
+    mob.velocity.x = 0.0;
+    mob.velocity.z = 0.0;
+}
+
+void ai_wander(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Check for staring players
+    uint starer;
+    if (check_player_staring(mob.position, starer)) {
+        mob.target_entity_id = starer;
+        mob.ai_state = AI_STATE_STARE;
+        mob.type_data[TD_STARE_TIME] = 0;
+        mob.type_data[TD_SCREAMING] = 1;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Try picking up blocks while wandering
+    try_pick_block(mob, seed);
+
+    // Check if reached target or timeout
+    float dist = horiz_dist(mob.position, mob.path_target);
+    if (dist < 1.0 || mob.state_timer > 200) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Move toward target
+    vec3 dir = safe_normalize(mob.path_target - mob.position);
+    dir.y = 0.0;
+    mob.velocity.x = dir.x * SPEED_PASSIVE;
+    mob.velocity.z = dir.z * SPEED_PASSIVE;
+    mob.yaw = yaw_to(mob.position, mob.path_target);
+
+    // Jump over obstacles
+    ivec3 front = to_block(mob.position + dir * 0.6);
+    if (is_solid(block_at(front)) && (mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        mob.velocity.y = 0.42;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+void ai_stare(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_SCREAMING] = 1;
+    mob.type_data[TD_STARE_TIME]++;
+
+    // Stop moving while staring
+    mob.velocity.x = 0.0;
+    mob.velocity.z = 0.0;
+
+    // Face the target
+    vec3 target_pos;
+    if (mob.target_entity_id == 0) {
+        target_pos = pc.player_pos;
+    } else {
+        target_pos = get_entity_pos(mob.target_entity_id);
+    }
+    mob.yaw = yaw_to(mob.position, target_pos);
+
+    // Check if player stopped looking
+    uint starer;
+    if (!check_player_staring(mob.position, starer)) {
+        // Player looked away - but we remember
+        mob.type_data[TD_STARE_TIME]++;
+    }
+
+    // After staring for ~2 seconds (40 ticks), begin screaming
+    if (mob.state_timer > 40) {
+        mob.ai_state = AI_STATE_SCREAMING;
+        mob.state_timer = 0;
+    }
+}
+
+void ai_screaming(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_SCREAMING] = 1;
+
+    // Shake animation (handled by renderer via SCREAMING flag)
+    mob.velocity.x = 0.0;
+    mob.velocity.z = 0.0;
+
+    // Face target
+    vec3 target_pos = (mob.target_entity_id == 0) ? pc.player_pos : get_entity_pos(mob.target_entity_id);
+    mob.yaw = yaw_to(mob.position, target_pos);
+
+    // Open mouth animation at tick 10 (handled by renderer)
+
+    // After ~1 second of screaming, begin chase
+    if (mob.state_timer > 20) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+    }
+}
+
+void ai_chase(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.type_data[TD_SCREAMING] = 1; // Stay angry
+
+    // Check target validity
+    if (!entity_exists(mob.target_entity_id) && mob.target_entity_id != 0) {
+        // For non-player targets, check entity list
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.type_data[TD_SCREAMING] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    vec3 target_pos = (mob.target_entity_id == 0) ? pc.player_pos : get_entity_pos(mob.target_entity_id);
+    vec3 target_look = (mob.target_entity_id == 0) ? pc.player_look_dir : get_entity_look_dir(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Lost target (too far)
+    if (dist > DEAGGRO_RANGE) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.target_entity_id = 0xFFFFFFFF;
+        mob.type_data[TD_SCREAMING] = 0;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // In attack range
+    if (dist < ATTACK_RANGE) {
+        mob.ai_state = AI_STATE_ATTACK;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Teleport toward target if far
+    if (dist > 10.0 && rand(seed) < 0.1) {
+        teleport_toward(mob, target_pos, target_look, seed);
+        return;
+    }
+
+    // Random teleport during chase for unpredictability
+    if (rand(seed) < 0.02) {
+        teleport_toward(mob, target_pos, target_look, seed);
+        return;
+    }
+
+    // Run toward target
+    vec3 dir = safe_normalize(target_pos - mob.position);
+    dir.y = 0.0;
+    mob.velocity.x = dir.x * SPEED_AGGRO;
+    mob.velocity.z = dir.z * SPEED_AGGRO;
+    mob.yaw = yaw_to(mob.position, target_pos);
+
+    // Jump over obstacles
+    ivec3 front = to_block(mob.position + dir * 0.6);
+    if (is_solid(block_at(front)) && (mob.flags & MOB_FLAG_ON_GROUND) != 0) {
+        mob.velocity.y = 0.42;
+        mob.flags &= ~MOB_FLAG_ON_GROUND;
+    }
+}
+
+void ai_attack(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+    mob.attack_cooldown = max(int(mob.attack_cooldown) - 1, 0);
+
+    vec3 target_pos = (mob.target_entity_id == 0) ? pc.player_pos : get_entity_pos(mob.target_entity_id);
+    vec3 target_look = (mob.target_entity_id == 0) ? pc.player_look_dir : get_entity_look_dir(mob.target_entity_id);
+    float dist = distance(mob.position, target_pos);
+
+    // Target escaped
+    if (dist > ATTACK_RANGE * 1.5) {
+        mob.ai_state = AI_STATE_CHASE;
+        mob.state_timer = 0;
+        return;
+    }
+
+    // Face target
+    mob.yaw = yaw_to(mob.position, target_pos);
+
+    // Slow approach
+    if (dist > ATTACK_RANGE * 0.5) {
+        vec3 dir = safe_normalize(target_pos - mob.position);
+        dir.y = 0.0;
+        mob.velocity.x = dir.x * SPEED_PASSIVE;
+        mob.velocity.z = dir.z * SPEED_PASSIVE;
+    } else {
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+    }
+
+    // Attack on cooldown
+    if (mob.attack_cooldown == 0) {
+        // Damage is dealt by CPU - we just signal the attack
+        mob.attack_cooldown = 20; // 1 second
+        // The ATTACK_DAMAGE (7.0) is communicated to CPU via attack_cooldown reset
+    }
+
+    // Random teleport during combat (intimidation/repositioning)
+    if (rand(seed) < 0.03) {
+        teleport_toward(mob, target_pos, target_look, seed);
+    }
+}
+
+void ai_flee(inout MobState mob, inout uint seed) {
+    mob.state_timer++;
+
+    // Desperately try to teleport away
+    if (teleport_away(mob, mob.position, seed)) {
+        // Check if new position is safe
+        ivec3 bp = to_block(mob.position);
+        if (!is_water(block_at(bp)) && !is_water(block_at(bp + ivec3(0, 1, 0)))) {
+            mob.ai_state = AI_STATE_IDLE;
+            mob.state_timer = 0;
+            return;
+        }
+    }
+
+    // Run in random direction while trying to escape
+    if (mob.state_timer % 10 == 0) {
+        vec3 offset = rand_horizontal_dir(seed) * 6.0;
+        mob.path_target = mob.position + offset;
+    }
+
+    vec3 dir = safe_normalize(mob.path_target - mob.position);
+    dir.y = 0.0;
+    mob.velocity.x = dir.x * SPEED_AGGRO;
+    mob.velocity.z = dir.z * SPEED_AGGRO;
+
+    // Timeout - give up fleeing (probably dead)
+    if (mob.state_timer > 100) {
+        mob.ai_state = AI_STATE_IDLE;
+        mob.state_timer = 0;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.mob_count) return;
+
+    MobState mob = mobs[idx];
+
+    // Only process endermen
+    if (mob.mob_type != MOB_TYPE_ENDERMAN) return;
+    if (mob.ai_state == AI_STATE_DEAD) return;
+    if ((mob.flags & MOB_FLAG_NO_AI) != 0) return;
+
+    uint seed = mob.random_seed ^ pc.random_seed ^ idx ^ pc.tick;
+    float dt = pc.delta_time;
+
+    // Update teleport cooldown
+    mob.type_data[TD_TP_COOLDOWN] = max(int(mob.type_data[TD_TP_COOLDOWN]) - 1, 0);
+
+    // ========================================
+    // Water damage and flee behavior
+    // ========================================
+    if ((mob.flags & MOB_FLAG_IN_WATER) != 0) {
+        mob.health -= WATER_DAMAGE_PER_TICK * dt * 20.0;
+        mob.hurt_time = 10;
+
+        // Immediately try to flee
+        if (mob.ai_state != AI_STATE_FLEE) {
+            mob.ai_state = AI_STATE_FLEE;
+            mob.state_timer = 0;
+        }
+    }
+
+    // ========================================
+    // Damage response - teleport away
+    // ========================================
+    if ((mob.flags & MOB_FLAG_WAS_HIT) != 0) {
+        mob.flags &= ~MOB_FLAG_WAS_HIT;
+
+        // 50% chance to teleport on hit
+        if (rand(seed) < 0.5) {
+            teleport_away(mob, pc.player_pos, seed);
+        }
+
+        // Become aggro if not already
+        if (mob.ai_state == AI_STATE_IDLE || mob.ai_state == AI_STATE_WANDER) {
+            mob.target_entity_id = 0; // Player
+            mob.ai_state = AI_STATE_STARE;
+            mob.type_data[TD_SCREAMING] = 1;
+            mob.state_timer = 0;
+        }
+    }
+
+    // ========================================
+    // Projectile hit - always teleport
+    // ========================================
+    if ((mob.flags & MOB_FLAG_HIT_BY_PROJ) != 0) {
+        mob.flags &= ~MOB_FLAG_HIT_BY_PROJ;
+        teleport_away(mob, pc.player_pos, seed);
+    }
+
+    // ========================================
+    // Update timers
+    // ========================================
+    mob.hurt_time = max(int(mob.hurt_time) - 1, 0);
+    mob.no_damage_time = max(int(mob.no_damage_time) - 1, 0);
+    mob.ai_tick_cooldown = max(int(mob.ai_tick_cooldown) - 1, 0);
+
+    // ========================================
+    // AI State Machine (runs every 2 ticks)
+    // ========================================
+    if (mob.ai_tick_cooldown == 0) {
+        mob.ai_tick_cooldown = 2;
+
+        switch (mob.ai_state) {
+            case AI_STATE_IDLE:
+                ai_idle(mob, seed);
+                break;
+            case AI_STATE_WANDER:
+                ai_wander(mob, seed);
+                break;
+            case AI_STATE_STARE:
+                ai_stare(mob, seed);
+                break;
+            case AI_STATE_SCREAMING:
+                ai_screaming(mob, seed);
+                break;
+            case AI_STATE_CHASE:
+                ai_chase(mob, seed);
+                break;
+            case AI_STATE_ATTACK:
+                ai_attack(mob, seed);
+                break;
+            case AI_STATE_FLEE:
+                ai_flee(mob, seed);
+                break;
+        }
+    }
+
+    // ========================================
+    // Physics
+    // ========================================
+    if ((mob.flags & MOB_FLAG_ON_GROUND) == 0) {
+        mob.velocity.y -= 0.08 * dt * 20.0;
+        mob.velocity.y = max(mob.velocity.y, -3.92);
+    }
+    mob.velocity *= 0.98;
+    mob.position += mob.velocity * dt * 20.0;
+
+    // ========================================
+    // Death check
+    // ========================================
+    if (mob.health <= 0.0) {
+        mob.ai_state = AI_STATE_DEAD;
+
+        // Drop ender pearl (0-1, CPU handles actual drop)
+        // type_data[TD_HELD_BLOCK] already stores held block for dropping
+    }
+
+    // ========================================
+    // Write back
+    // ========================================
+    mob.random_seed = seed;
+    mobs[idx] = mob;
+}

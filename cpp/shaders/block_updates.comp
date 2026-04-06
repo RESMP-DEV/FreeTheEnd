@@ -1,0 +1,381 @@
+#version 450
+
+// Block Updates Compute Shader
+// Applies queued world modifications to the voxel grid
+// Processes breaking, placing, and physics updates between ticks
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Modification types
+const uint MOD_BREAK = 0;
+const uint MOD_PLACE = 1;
+const uint MOD_UPDATE = 2;
+const uint MOD_PHYSICS = 3;
+
+// Block update flags
+const uint UPDATE_NONE = 0;
+const uint UPDATE_NEIGHBORS = 1;     // Notify neighbors of change
+const uint UPDATE_PHYSICS = 2;       // Schedule physics update (sand, gravel)
+const uint UPDATE_LIGHTING = 4;      // Recalculate lighting
+const uint UPDATE_REDSTONE = 8;      // Redstone signal update
+const uint UPDATE_WATER = 16;        // Water flow update
+
+// Face offsets for neighbor updates
+const ivec3 FACE_OFFSETS[6] = ivec3[6](
+    ivec3(0, -1, 0),  // DOWN
+    ivec3(0, 1, 0),   // UP
+    ivec3(0, 0, -1),  // NORTH
+    ivec3(0, 0, 1),   // SOUTH
+    ivec3(-1, 0, 0),  // WEST
+    ivec3(1, 0, 0)    // EAST
+);
+
+// Blocks that need physics updates (falling blocks)
+bool needsPhysicsUpdate(uint block_id) {
+    return block_id == 12  // Sand
+        || block_id == 13  // Gravel
+        || block_id == 122 // Dragon Egg
+        || block_id == 174; // Packed Ice (falls when unsupported in modded)
+}
+
+// Blocks that need support (break without it)
+bool needsSupport(uint block_id) {
+    // Torches
+    if (block_id == 50 || block_id == 75 || block_id == 76) return true;
+    // Rails
+    if (block_id == 27 || block_id == 28 || block_id == 66 || block_id == 157) return true;
+    // Crops
+    if (block_id == 59 || block_id == 141 || block_id == 142 || block_id == 115) return true;
+    // Flowers and plants
+    if (block_id == 6 || block_id == 31 || block_id == 32) return true;
+    if (block_id == 37 || block_id == 38 || block_id == 39 || block_id == 40) return true;
+    // Pressure plates
+    if (block_id == 70 || block_id == 72 || block_id == 147 || block_id == 148) return true;
+    // Redstone components
+    if (block_id == 55 || block_id == 69 || block_id == 77 || block_id == 143) return true;
+    // Signs
+    if (block_id == 63) return true;
+    // Sugar cane
+    if (block_id == 83) return true;
+    // Snow layer
+    if (block_id == 78) return true;
+    // Carpet
+    if (block_id == 171) return true;
+    return false;
+}
+
+// Blocks affected by water flow
+bool affectedByWater(uint block_id) {
+    return needsSupport(block_id)
+        || block_id == 30; // Cobweb
+}
+
+// Blocks that are water sources
+bool isWaterSource(uint block_id) {
+    return block_id == 9;
+}
+
+// Blocks that are lava sources
+bool isLavaSource(uint block_id) {
+    return block_id == 11;
+}
+
+// Get update flags for a block change
+uint getUpdateFlags(uint old_block, uint new_block) {
+    uint flags = UPDATE_NONE;
+
+    // Breaking or placing always notifies neighbors
+    if (old_block != new_block) {
+        flags |= UPDATE_NEIGHBORS;
+    }
+
+    // Lighting updates for transparent blocks or light sources
+    if (old_block == 0 || new_block == 0) {
+        flags |= UPDATE_LIGHTING;
+    }
+    // Glowstone, lamps, torches
+    if (old_block == 89 || new_block == 89 ||
+        old_block == 50 || new_block == 50 ||
+        old_block == 124 || new_block == 124) {
+        flags |= UPDATE_LIGHTING;
+    }
+
+    // Physics for falling blocks
+    if (needsPhysicsUpdate(new_block) || needsPhysicsUpdate(old_block)) {
+        flags |= UPDATE_PHYSICS;
+    }
+
+    // Redstone updates
+    if (old_block == 55 || new_block == 55 ||  // Wire
+        old_block == 76 || new_block == 76 ||  // Torch
+        old_block == 152 || new_block == 152) { // Redstone block
+        flags |= UPDATE_REDSTONE;
+    }
+
+    // Water flow
+    if (old_block == 8 || old_block == 9 ||
+        new_block == 8 || new_block == 9) {
+        flags |= UPDATE_WATER;
+    }
+
+    return flags;
+}
+
+struct WorldModification {
+    ivec3 position;
+    uint new_block_id;
+    uint new_metadata;
+    uint modification_type;
+    uint agent_id;
+    uint _pad;
+};
+
+struct ScheduledUpdate {
+    ivec3 position;
+    uint update_type;      // Type of update (physics, redstone, etc.)
+    uint priority;         // Lower = sooner
+    uint source_agent;
+    uint tick_delay;       // Ticks before executing
+    uint _pad;
+};
+
+struct VoxelData {
+    uint block_id;
+    uint metadata;
+};
+
+// Modification buffer (input)
+layout(set = 0, binding = 0, std430) readonly buffer WorldModBuffer {
+    uint modification_count;
+    uint _pad[3];
+    WorldModification modifications[];
+} world_mods;
+
+// Voxel grid (read/write)
+layout(set = 0, binding = 1, std430) buffer VoxelGridBuffer {
+    uvec2 grid_size;
+    uint grid_height;
+    uint _pad;
+    VoxelData voxels[];
+} voxel_grid;
+
+// Scheduled updates output (for physics, redstone, etc.)
+layout(set = 0, binding = 2, std430) buffer ScheduledUpdateBuffer {
+    uint update_count;
+    uint _pad[3];
+    ScheduledUpdate updates[];
+} scheduled_updates;
+
+// Lighting update queue
+layout(set = 0, binding = 3, std430) buffer LightingUpdateBuffer {
+    uint light_update_count;
+    uint _pad[3];
+    ivec4 light_updates[]; // xyz = position, w = update type
+} lighting_updates;
+
+layout(push_constant) uniform PushConstants {
+    uint max_updates;
+    uint max_light_updates;
+    uint current_tick;
+    uint _pad;
+} pc;
+
+// Convert world position to grid index
+uint posToIndex(ivec3 pos) {
+    return pos.y * voxel_grid.grid_size.x * voxel_grid.grid_size.y +
+           pos.z * voxel_grid.grid_size.x +
+           pos.x;
+}
+
+// Check bounds
+bool inBounds(ivec3 pos) {
+    return pos.x >= 0 && pos.y >= 0 && pos.z >= 0 &&
+           pos.x < int(voxel_grid.grid_size.x) &&
+           pos.y < int(voxel_grid.grid_height) &&
+           pos.z < int(voxel_grid.grid_size.y);
+}
+
+// Get voxel at position
+VoxelData getVoxel(ivec3 pos) {
+    if (!inBounds(pos)) {
+        VoxelData empty;
+        empty.block_id = 0;
+        empty.metadata = 0;
+        return empty;
+    }
+    return voxel_grid.voxels[posToIndex(pos)];
+}
+
+// Set voxel at position
+void setVoxel(ivec3 pos, uint block_id, uint metadata) {
+    if (!inBounds(pos)) return;
+    uint index = posToIndex(pos);
+    voxel_grid.voxels[index].block_id = block_id;
+    voxel_grid.voxels[index].metadata = metadata;
+}
+
+// Schedule a physics update
+void schedulePhysics(ivec3 pos, uint agent_id, uint delay) {
+    uint idx = atomicAdd(scheduled_updates.update_count, 1);
+    if (idx < pc.max_updates) {
+        ScheduledUpdate update;
+        update.position = pos;
+        update.update_type = MOD_PHYSICS;
+        update.priority = 0;
+        update.source_agent = agent_id;
+        update.tick_delay = delay;
+        update._pad = 0;
+        scheduled_updates.updates[idx] = update;
+    }
+}
+
+// Schedule a neighbor update
+void scheduleNeighborUpdate(ivec3 pos, uint agent_id) {
+    uint idx = atomicAdd(scheduled_updates.update_count, 1);
+    if (idx < pc.max_updates) {
+        ScheduledUpdate update;
+        update.position = pos;
+        update.update_type = MOD_UPDATE;
+        update.priority = 1;
+        update.source_agent = agent_id;
+        update.tick_delay = 0;
+        update._pad = 0;
+        scheduled_updates.updates[idx] = update;
+    }
+}
+
+// Queue lighting recalculation
+void queueLightingUpdate(ivec3 pos, uint update_type) {
+    uint idx = atomicAdd(lighting_updates.light_update_count, 1);
+    if (idx < pc.max_light_updates) {
+        lighting_updates.light_updates[idx] = ivec4(pos, int(update_type));
+    }
+}
+
+void main() {
+    uint mod_id = gl_GlobalInvocationID.x;
+    if (mod_id >= world_mods.modification_count) return;
+
+    WorldModification mod = world_mods.modifications[mod_id];
+    ivec3 pos = mod.position;
+
+    if (!inBounds(pos)) return;
+
+    // Get current voxel state
+    VoxelData current = getVoxel(pos);
+    uint old_block = current.block_id;
+    uint new_block = mod.new_block_id;
+    uint new_metadata = mod.new_metadata;
+
+    // Apply the modification
+    setVoxel(pos, new_block, new_metadata);
+
+    // Determine required updates
+    uint flags = getUpdateFlags(old_block, new_block);
+
+    // Process neighbor notifications
+    if ((flags & UPDATE_NEIGHBORS) != 0) {
+        for (int i = 0; i < 6; i++) {
+            ivec3 neighbor_pos = pos + FACE_OFFSETS[i];
+            if (!inBounds(neighbor_pos)) continue;
+
+            VoxelData neighbor = getVoxel(neighbor_pos);
+
+            // Check if neighbor needs support and just lost it
+            if (i == 1 && needsSupport(neighbor.block_id)) {
+                // Block above lost support
+                schedulePhysics(neighbor_pos, mod.agent_id, 1);
+            }
+
+            // Check if falling block above should start falling
+            if (i == 1 && needsPhysicsUpdate(neighbor.block_id) && new_block == 0) {
+                schedulePhysics(neighbor_pos, mod.agent_id, 2);
+            }
+
+            // Schedule neighbor update for redstone propagation
+            if ((flags & UPDATE_REDSTONE) != 0) {
+                scheduleNeighborUpdate(neighbor_pos, mod.agent_id);
+            }
+        }
+    }
+
+    // Schedule physics update for falling blocks placed
+    if ((flags & UPDATE_PHYSICS) != 0) {
+        if (needsPhysicsUpdate(new_block)) {
+            // Check if block below is air
+            VoxelData below = getVoxel(pos + ivec3(0, -1, 0));
+            if (below.block_id == 0 || below.block_id == 8 || below.block_id == 9 ||
+                below.block_id == 10 || below.block_id == 11) {
+                schedulePhysics(pos, mod.agent_id, 2);
+            }
+        }
+    }
+
+    // Queue lighting updates
+    if ((flags & UPDATE_LIGHTING) != 0) {
+        queueLightingUpdate(pos, flags);
+
+        // Also update neighbors for light propagation
+        for (int i = 0; i < 6; i++) {
+            ivec3 neighbor_pos = pos + FACE_OFFSETS[i];
+            if (inBounds(neighbor_pos)) {
+                queueLightingUpdate(neighbor_pos, flags);
+            }
+        }
+    }
+
+    // Handle water flow (simplified - full flow in separate pass)
+    if ((flags & UPDATE_WATER) != 0) {
+        if (new_block == 0 && (old_block == 8 || old_block == 9)) {
+            // Water removed - check if neighbors should flow in
+            for (int i = 0; i < 6; i++) {
+                ivec3 neighbor_pos = pos + FACE_OFFSETS[i];
+                VoxelData neighbor = getVoxel(neighbor_pos);
+                if (neighbor.block_id == 8 || neighbor.block_id == 9) {
+                    scheduleNeighborUpdate(pos, mod.agent_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Special handling for multi-block structures
+    // Doors: if bottom half_val broken, break top half
+    if (old_block == 64 || old_block == 71) {
+        if ((current.metadata & 0x8) == 0) {
+            // This was bottom half, break top
+            ivec3 top_pos = pos + ivec3(0, 1, 0);
+            VoxelData top = getVoxel(top_pos);
+            if (top.block_id == old_block) {
+                setVoxel(top_pos, 0, 0);
+                queueLightingUpdate(top_pos, UPDATE_LIGHTING);
+            }
+        }
+    }
+
+    // Beds: if head broken, break foot and vice versa
+    if (old_block == 26) {
+        uint facing = current.metadata & 0x3;
+        bool is_head = (current.metadata & 0x8) != 0;
+
+        ivec3 other_pos = pos;
+        ivec3 facing_offsets[4] = ivec3[4](
+            ivec3(0, 0, 1),   // South
+            ivec3(-1, 0, 0),  // West
+            ivec3(0, 0, -1),  // North
+            ivec3(1, 0, 0)    // East
+        );
+
+        if (is_head) {
+            other_pos = pos - facing_offsets[facing];
+        } else {
+            other_pos = pos + facing_offsets[facing];
+        }
+
+        VoxelData other = getVoxel(other_pos);
+        if (other.block_id == 26) {
+            setVoxel(other_pos, 0, 0);
+            queueLightingUpdate(other_pos, UPDATE_LIGHTING);
+        }
+    }
+}

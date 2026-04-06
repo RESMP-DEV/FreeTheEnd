@@ -1,0 +1,182 @@
+#version 450
+
+// End Spawn Platform Generation Compute Shader
+// Generates the 5x1x5 obsidian platform at (100, 48, 0) when player enters End
+// Clears 5x3x5 air space above for player safety
+// Handles intersection with existing terrain by replacing blocks
+
+layout(local_size_x = 5, local_size_y = 4, local_size_z = 5) in;  // 5x4x5 = 100 threads
+
+// Spawn platform constants (1.8.9 behavior)
+const int PLATFORM_CENTER_X = 100;
+const int PLATFORM_Y = 48;         // Obsidian layer
+const int PLATFORM_CENTER_Z = 0;
+const int PLATFORM_HALF_SIZE = 2;  // 5x5 = center +/- 2
+
+// Air space above platform
+const int AIR_HEIGHT = 3;          // 3 blocks of air (y=49, 50, 51)
+
+// Block IDs
+const uint BLOCK_AIR = 0u;
+const uint BLOCK_OBSIDIAN = 49u;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint agentIdx;           // Agent triggering the spawn platform
+    uint triggerCount;       // Number of agents entering End this tick
+    float gameTime;          // Current game time
+    uint flags;              // Bit 0: force regenerate even if exists
+} pc;
+
+// World voxel buffer for End dimension
+// Format: 16-bit block IDs, 2 per uint32
+layout(std430, set = 0, binding = 0) buffer EndVoxels {
+    uint blocks[];
+};
+
+// World extents for End dimension
+// ivec4(minX, minZ, maxX, maxZ), ivec4(height, strideX, strideZ, reserved)
+layout(std430, set = 0, binding = 1) readonly buffer WorldExtents {
+    ivec4 bounds;
+    ivec4 dimensions;
+};
+
+// Platform generation events output
+// vec4(agentIdx | flags<<16, centerX, centerY, centerZ)
+layout(std430, set = 0, binding = 2) writeonly buffer PlatformEvents {
+    vec4 events[];
+};
+
+layout(std430, set = 0, binding = 3) buffer EventCounter {
+    uint eventCount;
+};
+
+// Agent teleport triggers: uvec4(agentIdx, fromDim, toDim, timestamp)
+// Only process entries where toDim == DIM_END
+layout(std430, set = 0, binding = 4) readonly buffer TeleportTriggers {
+    uvec4 triggers[];
+};
+
+// Convert world position to linear buffer index
+// Returns ~0u if out of bounds
+uint worldPosToIndex(ivec3 worldPos) {
+    if (worldPos.x < bounds.x || worldPos.x >= bounds.z ||
+        worldPos.z < bounds.y || worldPos.z >= bounds.w ||
+        worldPos.y < 0 || worldPos.y >= dimensions.x) {
+        return ~0u;
+    }
+
+    int localX = worldPos.x - bounds.x;
+    int localZ = worldPos.z - bounds.y;
+
+    return uint(worldPos.y) * uint(dimensions.y) * uint(dimensions.z) +
+           uint(localX) * uint(dimensions.z) +
+           uint(localZ);
+}
+
+// Set block at world position
+// Uses 16-bit packing: 2 blocks per uint32
+void setBlock(ivec3 worldPos, uint blockId) {
+    uint linearIdx = worldPosToIndex(worldPos);
+    if (linearIdx == ~0u) {
+        return;
+    }
+
+    uint packedIdx = linearIdx / 2u;
+    uint isOdd = linearIdx & 1u;
+
+    // Atomic update to handle concurrent writes safely
+    // Clear the 16-bit slot and set new value
+    if (isOdd == 0u) {
+        // Lower 16 bits
+        uint mask = 0xFFFF0000u;
+        uint value = blockId & 0xFFFFu;
+        atomicAnd(blocks[packedIdx], mask);
+        atomicOr(blocks[packedIdx], value);
+    } else {
+        // Upper 16 bits
+        uint mask = 0x0000FFFFu;
+        uint value = (blockId & 0xFFFFu) << 16;
+        atomicAnd(blocks[packedIdx], mask);
+        atomicOr(blocks[packedIdx], value);
+    }
+}
+
+// Read block at world position
+uint getBlock(ivec3 worldPos) {
+    uint linearIdx = worldPosToIndex(worldPos);
+    if (linearIdx == ~0u) {
+        return BLOCK_AIR;
+    }
+
+    uint packedIdx = linearIdx / 2u;
+    uint packed = blocks[packedIdx];
+
+    if ((linearIdx & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    } else {
+        return packed >> 16;
+    }
+}
+
+void main() {
+    // Thread position within the 5x4x5 workgroup
+    // x: 0-4 -> platform x offset (-2 to +2)
+    // y: 0-3 -> y layer (0=obsidian, 1-3=air)
+    // z: 0-4 -> platform z offset (-2 to +2)
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint lz = gl_LocalInvocationID.z;
+
+    // Workgroup ID indicates which trigger we're processing
+    uint triggerIdx = gl_WorkGroupID.x;
+    if (triggerIdx >= pc.triggerCount) {
+        return;
+    }
+
+    // Verify this trigger is for End dimension (toDim == 2)
+    uvec4 trigger = triggers[triggerIdx];
+    uint toDim = trigger.z;
+    const uint DIM_END = 2u;
+
+    if (toDim != DIM_END) {
+        return;
+    }
+
+    // Calculate world position for this thread
+    int worldX = PLATFORM_CENTER_X + int(lx) - PLATFORM_HALF_SIZE;
+    int worldZ = PLATFORM_CENTER_Z + int(lz) - PLATFORM_HALF_SIZE;
+    int worldY = PLATFORM_Y + int(ly);  // y=0 -> 48, y=1-3 -> 49-51
+
+    ivec3 worldPos = ivec3(worldX, worldY, worldZ);
+
+    // Determine block type based on Y layer
+    uint blockId;
+    if (ly == 0u) {
+        // Bottom layer: obsidian platform
+        blockId = BLOCK_OBSIDIAN;
+    } else {
+        // Upper layers: clear to air for player safety
+        blockId = BLOCK_AIR;
+    }
+
+    // Set the block (handles existing terrain by overwriting)
+    setBlock(worldPos, blockId);
+
+    // First thread writes the generation event
+    if (lx == 0u && ly == 0u && lz == 0u) {
+        uint eventIdx = atomicAdd(eventCount, 1u);
+        uint maxEvents = 64u;
+
+        if (eventIdx < maxEvents) {
+            uint agentIdx = trigger.x;
+            uint eventFlags = 1u;  // Platform generated flag
+            events[eventIdx] = vec4(
+                uintBitsToFloat(agentIdx | (eventFlags << 16)),
+                float(PLATFORM_CENTER_X),
+                float(PLATFORM_Y),
+                float(PLATFORM_CENTER_Z)
+            );
+        }
+    }
+}

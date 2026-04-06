@@ -1,0 +1,426 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Minecraft 1.8.9 End Spawn Platform Shader
+// Handles End dimension spawn platform generation and safety mechanics
+//
+// When entering the End dimension:
+// 1. Generate 5x5 obsidian platform at (100, 49, 0)
+// 2. Clear 3 blocks above platform (prevent suffocation)
+// 3. Grant 0.5 seconds of invulnerability
+// 4. Main island is at (0, 64, 0) - ~100 blocks away
+//
+// Navigation options to main island:
+// - Build bridge: slow (~30 seconds), safe
+// - Throw ender pearl: fast (~2 seconds), risky (void fall, damage)
+// - Pearl to pillar: if dragon is attacking, safer cover
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Block IDs
+const uint BLOCK_AIR = 0;
+const uint BLOCK_OBSIDIAN = 49;
+const uint BLOCK_END_STONE = 121;
+
+// Spawn platform constants (1.8.9)
+const int PLATFORM_X = 100;
+const int PLATFORM_Y = 49;
+const int PLATFORM_Z = 0;
+const int PLATFORM_SIZE = 5;  // 5x5 platform
+const int CLEARANCE_HEIGHT = 3;  // Clear 3 blocks above
+
+// Main island location
+const float MAIN_ISLAND_X = 0.0;
+const float MAIN_ISLAND_Y = 64.0;
+const float MAIN_ISLAND_Z = 0.0;
+
+// Invulnerability duration in ticks (0.5 seconds = 10 ticks at 20 TPS)
+const uint INVULN_TICKS = 10;
+
+// Navigation modes
+const uint NAV_NONE = 0;
+const uint NAV_BRIDGE = 1;      // Building bridge
+const uint NAV_PEARL = 2;       // Pearl throw
+const uint NAV_PILLAR_COVER = 3; // Cover behind pillar
+
+// Spawn state flags
+const uint SPAWN_NONE = 0;
+const uint SPAWN_PENDING = 1;   // Teleporting, platform not yet generated
+const uint SPAWN_GENERATED = 2; // Platform generated, in invuln
+const uint SPAWN_READY = 3;     // Invuln expired, ready to move
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint agentCount;       // Number of agents to process
+    float deltaTime;       // Time step in seconds
+    uint gameTimeTicks;    // Current game time in ticks
+    uint mode;             // 0=platform gen, 1=spawn state update, 2=nav assist
+} pc;
+
+// Agent spawn state: uvec4(spawnState(u8), invulnTicks(u16), navMode(u8), ...)
+layout(std430, set = 0, binding = 0) buffer AgentSpawnState {
+    uvec4 spawnState[];
+};
+
+// Agent positions: vec4(x, y, z, yaw)
+layout(std430, set = 0, binding = 1) buffer AgentPositions {
+    vec4 agentPos[];
+};
+
+// Agent dimensions: uvec4(dimension(u8), ...)
+layout(std430, set = 0, binding = 2) buffer AgentDimensions {
+    uvec4 agentDim[];
+};
+
+// Agent health/invuln state: vec4(health, maxHealth, invulnTimer, lastDamageTime)
+layout(std430, set = 0, binding = 3) buffer AgentHealth {
+    vec4 healthState[];
+};
+
+// Dragon state (for nav assist): vec4(x, y, z, phase), vec4(health, isPerching, targetAgent, ...)
+layout(std430, set = 0, binding = 4) readonly buffer DragonState {
+    vec4 dragonPos;
+    vec4 dragonStatus;
+};
+
+// Pillar positions: array of vec4(x, y, z, height) for obsidian pillars
+layout(std430, set = 0, binding = 5) readonly buffer PillarPositions {
+    vec4 pillars[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer PillarCount {
+    uint pillarCount;
+};
+
+// End voxel buffer for block modifications
+layout(std430, set = 0, binding = 7) buffer EndVoxels {
+    uint endBlocks[];
+};
+
+// End dimension extents
+layout(std430, set = 0, binding = 8) readonly buffer EndExtents {
+    ivec4 extents[2];  // [0]: minX, minZ, maxX, maxZ; [1]: height, strideX, strideZ, pad
+};
+
+// Platform modification output (for CPU-side chunk updates)
+// vec4(blockX, blockY, blockZ, newBlockId)
+layout(std430, set = 0, binding = 9) writeonly buffer PlatformMods {
+    vec4 mods[];
+};
+
+layout(std430, set = 0, binding = 10) buffer ModCount {
+    uint modCount;
+};
+
+// Navigation recommendation output: uvec4(agentIdx, navMode, targetX|targetZ, confidence)
+layout(std430, set = 0, binding = 11) writeonly buffer NavRecommendations {
+    uvec4 navRecs[];
+};
+
+layout(std430, set = 0, binding = 12) buffer NavRecCount {
+    uint navRecCount;
+};
+
+// Compute linear index for End voxels
+uint getVoxelIndex(ivec3 worldPos) {
+    ivec4 ext0 = extents[0];
+    ivec4 ext1 = extents[1];
+
+    int localX = worldPos.x - ext0.x;
+    int localZ = worldPos.z - ext0.y;
+    return uint(worldPos.y) * uint(ext1.y) * uint(ext1.z) + uint(localX) * uint(ext1.z) + uint(localZ);
+}
+
+// Check if position is within End bounds
+bool inBounds(ivec3 worldPos) {
+    ivec4 ext0 = extents[0];
+    ivec4 ext1 = extents[1];
+    return worldPos.x >= ext0.x && worldPos.x < ext0.z &&
+           worldPos.z >= ext0.y && worldPos.z < ext0.w &&
+           worldPos.y >= 0 && worldPos.y < ext1.x;
+}
+
+// Read block at position
+uint readBlock(ivec3 worldPos) {
+    if (!inBounds(worldPos)) {
+        return BLOCK_AIR;
+    }
+    uint linearIdx = getVoxelIndex(worldPos);
+    uint packedIdx = linearIdx / 2;
+    uint packed = endBlocks[packedIdx];
+    if ((linearIdx & 1u) == 0u) {
+        return packed & 0xFFFFu;
+    }
+    return packed >> 16;
+}
+
+// Write block at position (with atomics for thread safety)
+void writeBlock(ivec3 worldPos, uint blockId) {
+    if (!inBounds(worldPos)) {
+        return;
+    }
+    uint linearIdx = getVoxelIndex(worldPos);
+    uint packedIdx = linearIdx / 2;
+
+    // Atomic read-modify-write
+    uint oldPacked = endBlocks[packedIdx];
+    uint newPacked;
+    if ((linearIdx & 1u) == 0u) {
+        newPacked = (oldPacked & 0xFFFF0000u) | (blockId & 0xFFFFu);
+    } else {
+        newPacked = (oldPacked & 0x0000FFFFu) | ((blockId & 0xFFFFu) << 16);
+    }
+    // Note: atomicExchange would be safer but may not be available
+    endBlocks[packedIdx] = newPacked;
+}
+
+// Log platform modification for CPU chunk update
+void logMod(ivec3 pos, uint blockId) {
+    uint idx = atomicAdd(modCount, 1u);
+    if (idx < 1024u) {  // Max mods buffer size
+        mods[idx] = vec4(float(pos.x), float(pos.y), float(pos.z), float(blockId));
+    }
+}
+
+// Read agent spawn state
+void readSpawnState(uint agentIdx, out uint state, out uint invulnTicks, out uint navMode) {
+    uvec4 data = spawnState[agentIdx];
+    state = data.x & 0xFFu;
+    invulnTicks = (data.x >> 8) & 0xFFFFu;
+    navMode = (data.x >> 24) & 0xFFu;
+}
+
+// Write agent spawn state
+void writeSpawnState(uint agentIdx, uint state, uint invulnTicks, uint navMode) {
+    uvec4 data = spawnState[agentIdx];
+    data.x = (state & 0xFFu) | ((invulnTicks & 0xFFFFu) << 8) | ((navMode & 0xFFu) << 24);
+    spawnState[agentIdx] = data;
+}
+
+// Generate obsidian platform and clear space above
+void generatePlatform() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Platform is 5x5 = 25 blocks, clearance is 5x5x3 = 75 blocks
+    // Total blocks to process: 25 + 75 = 100
+    if (idx >= 100u) {
+        return;
+    }
+
+    int x, y, z;
+    uint blockId;
+
+    if (idx < 25u) {
+        // Platform blocks (obsidian)
+        x = PLATFORM_X - 2 + int(idx % 5u);
+        y = PLATFORM_Y;
+        z = PLATFORM_Z - 2 + int(idx / 5u);
+        blockId = BLOCK_OBSIDIAN;
+    } else {
+        // Clearance blocks (air)
+        uint clearIdx = idx - 25u;
+        x = PLATFORM_X - 2 + int(clearIdx % 5u);
+        y = PLATFORM_Y + 1 + int(clearIdx / 25u);  // Y = 50, 51, 52
+        z = PLATFORM_Z - 2 + int((clearIdx / 5u) % 5u);
+        blockId = BLOCK_AIR;
+    }
+
+    ivec3 pos = ivec3(x, y, z);
+    uint currentBlock = readBlock(pos);
+
+    // Only modify if different (for obsidian) or if non-air (for clearance)
+    if (idx < 25u) {
+        if (currentBlock != BLOCK_OBSIDIAN) {
+            writeBlock(pos, blockId);
+            logMod(pos, blockId);
+        }
+    } else {
+        // Clear any solid blocks above platform (including obsidian from previous spawns)
+        if (currentBlock != BLOCK_AIR) {
+            writeBlock(pos, BLOCK_AIR);
+            logMod(pos, blockId);
+        }
+    }
+}
+
+// Update spawn state (invulnerability timer, etc.)
+void updateSpawnState() {
+    uint agentIdx = gl_GlobalInvocationID.x;
+    if (agentIdx >= pc.agentCount) {
+        return;
+    }
+
+    // Check if agent is in End dimension
+    uint dimension = agentDim[agentIdx].x & 0xFFu;
+    const uint DIM_END = 2;
+    if (dimension != DIM_END) {
+        return;
+    }
+
+    uint state, invulnTicks, navMode;
+    readSpawnState(agentIdx, state, invulnTicks, navMode);
+
+    if (state == SPAWN_PENDING) {
+        // Platform generation triggered, now spawned
+        vec4 pos = agentPos[agentIdx];
+        // Check if agent is at spawn platform
+        float dx = abs(pos.x - float(PLATFORM_X));
+        float dy = abs(pos.y - float(PLATFORM_Y + 1));  // Standing on platform
+        float dz = abs(pos.z - float(PLATFORM_Z));
+
+        if (dx < 3.0 && dy < 2.0 && dz < 3.0) {
+            // At spawn platform, grant invulnerability
+            state = SPAWN_GENERATED;
+            invulnTicks = INVULN_TICKS;
+
+            // Set invulnerability in health state
+            vec4 health = healthState[agentIdx];
+            health.z = float(INVULN_TICKS) / 20.0;  // Convert to seconds
+            healthState[agentIdx] = health;
+        }
+    } else if (state == SPAWN_GENERATED) {
+        // Count down invulnerability
+        if (invulnTicks > 0u) {
+            invulnTicks--;
+            // Update health state invuln timer
+            vec4 health = healthState[agentIdx];
+            health.z = float(invulnTicks) / 20.0;
+            healthState[agentIdx] = health;
+        }
+        if (invulnTicks == 0u) {
+            state = SPAWN_READY;
+        }
+    }
+
+    writeSpawnState(agentIdx, state, invulnTicks, navMode);
+}
+
+// Calculate distance from spawn to main island
+float distanceToMainIsland(vec3 pos) {
+    float dx = pos.x - MAIN_ISLAND_X;
+    float dz = pos.z - MAIN_ISLAND_Z;
+    return sqrt(dx * dx + dz * dz);
+}
+
+// Find nearest pillar to position
+int findNearestPillar(vec3 pos, out float dist) {
+    int nearest = -1;
+    dist = 1000000.0;
+
+    for (uint i = 0u; i < pillarCount && i < 10u; i++) {
+        vec4 pillar = pillars[i];
+        float dx = pos.x - pillar.x;
+        float dz = pos.z - pillar.z;
+        float d = sqrt(dx * dx + dz * dz);
+        if (d < dist) {
+            dist = d;
+            nearest = int(i);
+        }
+    }
+    return nearest;
+}
+
+// Check if dragon is attacking near position
+bool dragonAttackingNear(vec3 pos) {
+    float dx = pos.x - dragonPos.x;
+    float dy = pos.y - dragonPos.y;
+    float dz = pos.z - dragonPos.z;
+    float dist = sqrt(dx * dx + dy * dy + dz * dz);
+
+    // Dragon attacking if within 32 blocks and in attack phase (phase 6 or 7)
+    uint phase = uint(dragonPos.w);
+    bool attacking = (phase == 6u || phase == 7u);
+    return attacking && dist < 32.0;
+}
+
+// Navigation assistance - recommend best way to reach main island
+void provideNavAssist() {
+    uint agentIdx = gl_GlobalInvocationID.x;
+    if (agentIdx >= pc.agentCount) {
+        return;
+    }
+
+    // Only assist agents in End at spawn platform
+    uint dimension = agentDim[agentIdx].x & 0xFFu;
+    const uint DIM_END = 2;
+    if (dimension != DIM_END) {
+        return;
+    }
+
+    uint state, invulnTicks, navMode;
+    readSpawnState(agentIdx, state, invulnTicks, navMode);
+
+    if (state != SPAWN_READY) {
+        return;  // Not ready for navigation
+    }
+
+    vec3 pos = agentPos[agentIdx].xyz;
+    float distToIsland = distanceToMainIsland(pos);
+
+    // Already on main island?
+    if (distToIsland < 50.0) {
+        return;
+    }
+
+    // Check dragon threat
+    bool dragonThreat = dragonAttackingNear(pos);
+
+    // Calculate recommendations
+    uint recNav = NAV_BRIDGE;
+    uint targetPacked = 0u;
+    uint confidence = 50u;
+
+    if (dragonThreat) {
+        // Dragon attacking - find pillar for cover
+        float pillarDist;
+        int nearestPillar = findNearestPillar(pos, pillarDist);
+
+        if (nearestPillar >= 0 && pillarDist < 60.0) {
+            // Can pearl to pillar for cover
+            recNav = NAV_PILLAR_COVER;
+            vec4 pillar = pillars[nearestPillar];
+            targetPacked = (uint(pillar.x) & 0xFFFFu) | ((uint(pillar.z) & 0xFFFFu) << 16);
+            confidence = 80u;
+        } else {
+            // No pillar nearby, bridge is safer than pearl with dragon
+            recNav = NAV_BRIDGE;
+            confidence = 60u;
+        }
+    } else {
+        // No immediate threat - pearl is fast
+        if (distToIsland > 80.0) {
+            // Far from island, pearl recommended
+            recNav = NAV_PEARL;
+            // Target center of main island
+            targetPacked = (uint(MAIN_ISLAND_X) & 0xFFFFu) | ((uint(MAIN_ISLAND_Z) & 0xFFFFu) << 16);
+            confidence = 75u;
+        } else {
+            // Close enough to bridge
+            recNav = NAV_BRIDGE;
+            confidence = 70u;
+        }
+    }
+
+    // Write recommendation
+    uint recIdx = atomicAdd(navRecCount, 1u);
+    if (recIdx < 256u) {
+        navRecs[recIdx] = uvec4(agentIdx, recNav, targetPacked, confidence);
+    }
+
+    // Update agent's nav mode
+    writeSpawnState(agentIdx, state, invulnTicks, recNav);
+}
+
+void main() {
+    switch (pc.mode) {
+        case 0u:
+            generatePlatform();
+            break;
+        case 1u:
+            updateSpawnState();
+            break;
+        case 2u:
+            provideNavAssist();
+            break;
+    }
+}
