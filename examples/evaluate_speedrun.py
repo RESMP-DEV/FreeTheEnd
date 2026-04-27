@@ -305,6 +305,11 @@ class SpeedrunEvaluator:
             self.env = VecDragonFightEnv(num_envs=self.num_envs)
             self.has_env = True
         except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             self.env = None
             self.has_env = False
             if self.verbose:

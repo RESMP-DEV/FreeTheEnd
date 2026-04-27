@@ -41,6 +41,11 @@ class TestVerifierImports:
             module = importlib.import_module(module_name)
             assert module is not None
         except ImportError as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             pytest.fail(f"Failed to import {module_name}: {e}")
 
 

@@ -62,6 +62,7 @@ if _mc189_core is None:
 
 def _require_backend() -> None:
     """Raise ImportError if mc189_core is not available."""
+    logger.debug("_require_backend called")
     if _mc189_core is None:
         raise ImportError(
             "mc189_core module not found. Build the C++ extension: cd cpp/build && cmake .. && make"
@@ -129,6 +130,7 @@ class BaseStageEnv(gym.Env, ABC):
             shader_dir: Path to shader directory. Uses default if None.
             render_mode: Rendering mode ("human" or None).
         """
+        logger.info("BaseStageEnv.__init__: config=%s, shader_dir=%s, render_mode=%s", config, shader_dir, render_mode)
         super().__init__()
         _require_backend()
 
@@ -191,6 +193,7 @@ class BaseStageEnv(gym.Env, ABC):
         Returns:
             Tuple of (observation, info dict).
         """
+        logger.debug("BaseStageEnv.reset called")
         super().reset(seed=seed)
 
         self._step_count = 0
@@ -224,6 +227,7 @@ class BaseStageEnv(gym.Env, ABC):
         Returns:
             Tuple of (observation, reward, terminated, truncated, info).
         """
+        logger.debug("BaseStageEnv.step: action=%s", action)
         action_int = int(action) if isinstance(action, (int, np.integer)) else int(action.item())
         self._step_count += 1
 
@@ -264,6 +268,7 @@ class BaseStageEnv(gym.Env, ABC):
 
     def close(self) -> None:
         """Clean up resources."""
+        logger.info("BaseStageEnv.close called")
         if hasattr(self, "_sim"):
             self._sim = None
 
@@ -273,10 +278,12 @@ class BaseStageEnv(gym.Env, ABC):
         Subclasses can call this to access cumulative progression data
         across episodes for curriculum-aware reward shaping or logging.
         """
+        logger.debug("BaseStageEnv.get_progress_tracker called")
         return self._progress_tracker
 
     def _get_observation(self) -> NDArray[np.float32]:
         """Get observation from simulator with stage-specific processing."""
+        logger.debug("BaseStageEnv._get_observation called")
         obs = np.array(self._sim.get_observations(), dtype=np.float32).flatten()
 
         # Pad or truncate to expected size
@@ -297,6 +304,7 @@ class BaseStageEnv(gym.Env, ABC):
             Tuple of (terminated, truncated).
         """
         # Natural termination (goal achieved or death)
+        logger.debug("BaseStageEnv._check_termination: raw_done=%s", raw_done)
         terminated = raw_done or self._check_success()
 
         # Truncation (time limit)
@@ -310,6 +318,7 @@ class BaseStageEnv(gym.Env, ABC):
         Converts numpy scalars, sets, and other non-serializable types
         to plain Python values.
         """
+        logger.debug("BaseStageEnv._build_progress_snapshot called")
         snapshot: dict[str, Any] = {}
         for key, value in self._stage_state.items():
             if isinstance(value, set):
@@ -326,6 +335,7 @@ class BaseStageEnv(gym.Env, ABC):
 
     def _update_progress_from_observation(self, obs: NDArray[np.float32]) -> None:
         """Decode observations and update the progress tracker."""
+        logger.debug("BaseStageEnv._update_progress_from_observation: obs=%s", obs)
         vector = np.asarray(obs, dtype=np.float32).flatten()
         if vector.size < 256:
             vector = np.pad(vector, (0, 256 - vector.size))
@@ -339,6 +349,7 @@ class BaseStageEnv(gym.Env, ABC):
 
     def _get_reset_info(self) -> dict[str, Any]:
         """Get info dict for reset."""
+        logger.debug("BaseStageEnv._get_reset_info called")
         return {
             "stage_id": self.STAGE_ID,
             "stage_name": self.STAGE_NAME,
@@ -356,6 +367,7 @@ class BaseStageEnv(gym.Env, ABC):
         truncated: bool,
     ) -> dict[str, Any]:
         """Get info dict for step."""
+        logger.debug("BaseStageEnv._get_step_info: action=%s, reward=%s, terminated=%s, truncated=%s", action, reward, terminated, truncated)
         progress = self._build_progress_snapshot()
 
         info: dict[str, Any] = {
@@ -388,6 +400,7 @@ class BaseStageEnv(gym.Env, ABC):
     @abstractmethod
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize stage-specific state. Override in subclasses."""
+        logger.info("BaseStageEnv._initialize_stage_state called")
         ...
 
     @abstractmethod
@@ -398,11 +411,13 @@ class BaseStageEnv(gym.Env, ABC):
         action: int,
     ) -> float:
         """Apply stage-specific reward shaping. Override in subclasses."""
+        logger.debug("BaseStageEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         ...
 
     @abstractmethod
     def _check_success(self) -> bool:
         """Check if stage goal is achieved. Override in subclasses."""
+        logger.debug("BaseStageEnv._check_success called")
         ...
 
     def _build_criteria_snapshot(self) -> dict[str, Any]:
@@ -412,6 +427,7 @@ class BaseStageEnv(gym.Env, ABC):
         expected by StageCriteria lambdas (inventory sub-dict, flags, etc.).
         Default returns the raw progress snapshot.
         """
+        logger.debug("BaseStageEnv._build_criteria_snapshot called")
         if self._last_decoded_observation is not None:
             return self._last_decoded_observation
         return self._build_progress_snapshot()
@@ -425,6 +441,7 @@ class BaseStageEnv(gym.Env, ABC):
         Returns:
             True if all required criteria are met, False otherwise.
         """
+        logger.debug("BaseStageEnv._evaluate_stage_criteria called")
         criteria = get_stage_criteria(self.STAGE_ID)
         if criteria is None:
             self._last_criteria_success = False
@@ -442,6 +459,7 @@ class BaseStageEnv(gym.Env, ABC):
 
         Override in subclasses that start in a non-Overworld dimension.
         """
+        logger.info("BaseStageEnv._get_initial_dimension called")
         return Dimension.OVERWORLD
 
     def _on_dimension_entered(self, from_dim: Dimension, to_dim: Dimension) -> None:
@@ -455,6 +473,7 @@ class BaseStageEnv(gym.Env, ABC):
             from_dim: Dimension the player just left.
             to_dim: Dimension the player just entered.
         """
+logger.debug("BaseStageEnv._on_dimension_entered: from_dim=%s, to_dim=%s", from_dim, to_dim)
 
     def _detect_dimension_transition(self, obs: NDArray[np.float32]) -> dict[str, Any] | None:
         """Detect dimension changes from observation and update state.
@@ -473,6 +492,7 @@ class BaseStageEnv(gym.Env, ABC):
         Returns:
             Info dict additions if a transition occurred, None otherwise.
         """
+        logger.debug("BaseStageEnv._detect_dimension_transition: obs=%s", obs)
         return None
 
 
@@ -535,6 +555,7 @@ class BasicSurvivalEnv(BaseStageEnv):
 
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize basic survival tracking state."""
+        logger.info("BasicSurvivalEnv._initialize_stage_state called")
         return {
             "zombies_killed": 0,
             "skeletons_killed": 0,
@@ -553,6 +574,7 @@ class BasicSurvivalEnv(BaseStageEnv):
         action: int,
     ) -> float:
         """Apply basic survival reward shaping."""
+        logger.debug("BasicSurvivalEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         reward = base_reward
 
         # Position-based exploration reward
@@ -569,6 +591,7 @@ class BasicSurvivalEnv(BaseStageEnv):
 
     def _check_success(self) -> bool:
         """Check if iron pickaxe has been crafted."""
+        logger.debug("BasicSurvivalEnv._check_success called")
         return self._stage_state.get("has_iron_pickaxe", False)
 
 
@@ -640,6 +663,7 @@ class ResourceGatheringEnv(BaseStageEnv):
 
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize resource gathering tracking state."""
+        logger.info("ResourceGatheringEnv._initialize_stage_state called")
         return {
             "cobblestone_mined": 0,
             "iron_ore_mined": 0,
@@ -658,6 +682,7 @@ class ResourceGatheringEnv(BaseStageEnv):
         action: int,
     ) -> float:
         """Apply resource gathering reward shaping."""
+        logger.debug("ResourceGatheringEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         reward = base_reward
 
         # Y-level based reward for going deeper (where ores are)
@@ -672,6 +697,7 @@ class ResourceGatheringEnv(BaseStageEnv):
 
     def _check_success(self) -> bool:
         """Check if bucket and 10 obsidian obtained."""
+        logger.debug("ResourceGatheringEnv._check_success called")
         return (
             self._stage_state.get("has_bucket", False)
             and self._stage_state.get("obsidian_count", 0) >= 10
@@ -752,12 +778,14 @@ class NetherNavigationEnv(BaseStageEnv):
         options: dict[str, Any] | None = None,
     ) -> tuple[NDArray[np.float32], dict[str, Any]]:
         """Reset environment and instantiate Stage 3 reward shaper."""
+        logger.debug("NetherNavigationEnv.reset called")
         factory = get_reward_shaper_factory(3)
         self._reward_shaper = factory()
         return super().reset(seed=seed, options=options)
 
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize nether navigation tracking state."""
+        logger.info("NetherNavigationEnv._initialize_stage_state called")
         return {
             "in_nether": False,
             "portal_lit": False,
@@ -789,6 +817,7 @@ class NetherNavigationEnv(BaseStageEnv):
         - obs[121]: fire_resistance status
         - obs[132]: portal proximity
         """
+        logger.debug("NetherNavigationEnv._build_snapshot: obs=%s", obs)
         state = self._stage_state
         snapshot: dict[str, Any] = {
             "health": float(obs[6]) if obs.size > 6 else 20.0,
@@ -869,6 +898,7 @@ class NetherNavigationEnv(BaseStageEnv):
         action: int,
     ) -> float:
         """Apply nether navigation reward shaping via Stage 3 reward shaper."""
+        logger.debug("NetherNavigationEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         reward = base_reward
 
         # Check dimension transition for stage state tracking
@@ -897,6 +927,7 @@ class NetherNavigationEnv(BaseStageEnv):
         Returns:
             Info dict if transition occurred, None otherwise.
         """
+        logger.debug("NetherNavigationEnv._detect_dimension_transition: obs=%s", obs)
         if obs.size <= 12:
             return None
 
@@ -950,6 +981,7 @@ class NetherNavigationEnv(BaseStageEnv):
         if this is a fresh entry. On returning to Overworld: preserves
         collected blaze rods.
         """
+        logger.debug("NetherNavigationEnv._on_dimension_entered: from_dim=%s, to_dim=%s", from_dim, to_dim)
         if to_dim == Dimension.NETHER:
             self._stage_state["in_nether"] = True
         elif to_dim == Dimension.OVERWORLD:
@@ -958,6 +990,7 @@ class NetherNavigationEnv(BaseStageEnv):
 
     def _check_success(self) -> bool:
         """Check if 7+ blaze rods collected and fortress found."""
+        logger.debug("NetherNavigationEnv._check_success called")
         fortress_found = self._stage_state.get("fortress_found", False)
         blaze_rods = self._stage_state.get("blaze_rods", 0)
         return bool(fortress_found) and blaze_rods >= 7
@@ -1032,6 +1065,7 @@ class EndermanHuntingEnv(BaseStageEnv):
 
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize enderman hunting tracking state."""
+        logger.info("EndermanHuntingEnv._initialize_stage_state called")
         return {
             "endermen_killed": 0,
             "ender_pearls": 0,
@@ -1048,6 +1082,7 @@ class EndermanHuntingEnv(BaseStageEnv):
         action: int,
     ) -> float:
         """Apply enderman hunting reward shaping."""
+        logger.debug("EndermanHuntingEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         reward = base_reward
 
         # Reward efficiency (pearls per time)
@@ -1061,6 +1096,7 @@ class EndermanHuntingEnv(BaseStageEnv):
 
     def _check_success(self) -> bool:
         """Check if 12+ ender pearls collected."""
+        logger.debug("EndermanHuntingEnv._check_success called")
         return self._stage_state.get("ender_pearls", 0) >= 12
 
 
@@ -1138,6 +1174,7 @@ class StrongholdFindingEnv(BaseStageEnv):
 
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize stronghold finding tracking state."""
+        logger.info("StrongholdFindingEnv._initialize_stage_state called")
         return {
             "eyes_thrown": 0,
             "pearls_thrown": 0,
@@ -1158,6 +1195,7 @@ class StrongholdFindingEnv(BaseStageEnv):
         action: int,
     ) -> float:
         """Apply stronghold finding reward shaping."""
+        logger.debug("StrongholdFindingEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         reward = base_reward
 
         # Reward approaching estimated stronghold position
@@ -1184,6 +1222,7 @@ class StrongholdFindingEnv(BaseStageEnv):
         Returns:
             Info dict if transition occurred, None otherwise.
         """
+        logger.debug("StrongholdFindingEnv._detect_dimension_transition: obs=%s", obs)
         if obs.size <= 12:
             return None
 
@@ -1241,11 +1280,13 @@ class StrongholdFindingEnv(BaseStageEnv):
 
         Entering The End marks the portal as activated (success condition).
         """
+        logger.debug("StrongholdFindingEnv._on_dimension_entered: from_dim=%s, to_dim=%s", from_dim, to_dim)
         if to_dim == Dimension.END:
             self._stage_state["portal_active"] = True
 
     def _check_success(self) -> bool:
         """Check if end portal is activated and entered."""
+        logger.debug("StrongholdFindingEnv._check_success called")
         return self._stage_state.get("portal_active", False)
 
 
@@ -1336,6 +1377,7 @@ class DragonFightEnv(BaseStageEnv):
 
     def _get_initial_dimension(self) -> Dimension:
         """Dragon fight always starts in The End."""
+        logger.info("DragonFightEnv._get_initial_dimension called")
         return Dimension.END
 
     def _detect_dimension_transition(self, obs: NDArray[np.float32]) -> dict[str, Any] | None:
@@ -1351,6 +1393,7 @@ class DragonFightEnv(BaseStageEnv):
         Returns:
             Info dict if dragon killed and portal entered, None otherwise.
         """
+        logger.debug("DragonFightEnv._detect_dimension_transition: obs=%s", obs)
         dim_state = self._dimension_state
 
         # Dragon fight uses a compact 64-float obs. Exit portal detection
@@ -1377,6 +1420,7 @@ class DragonFightEnv(BaseStageEnv):
         Marks the fight as complete when the player returns to Overworld
         via the exit portal.
         """
+        logger.debug("DragonFightEnv._on_dimension_entered: from_dim=%s, to_dim=%s", from_dim, to_dim)
         if from_dim == Dimension.END and to_dim == Dimension.OVERWORLD:
             self._stage_state["dragon_killed"] = True
 
@@ -1395,6 +1439,7 @@ class DragonFightEnv(BaseStageEnv):
             render_mode: Rendering mode.
             enable_one_cycle: Enable bed explosion mechanics for one-cycle.
         """
+        logger.info("DragonFightEnv.__init__: config=%s, shader_dir=%s, render_mode=%s, enable_one_cycle=%s", config, shader_dir, render_mode, enable_one_cycle)
         super().__init__(config, shader_dir, render_mode)
         self.enable_one_cycle = enable_one_cycle
 
@@ -1410,6 +1455,7 @@ class DragonFightEnv(BaseStageEnv):
 
     def _initialize_stage_state(self) -> dict[str, Any]:
         """Initialize dragon fight tracking state."""
+        logger.info("DragonFightEnv._initialize_stage_state called")
         return {
             "on_main_island": False,
             "crystals_destroyed": 0,
@@ -1433,6 +1479,7 @@ class DragonFightEnv(BaseStageEnv):
         action: int,
     ) -> float:
         """Apply dragon fight reward shaping."""
+        logger.debug("DragonFightEnv._shape_reward: base_reward=%s, obs=%s, action=%s", base_reward, obs, action)
         reward = base_reward
         state = self._stage_state
 
@@ -1457,6 +1504,7 @@ class DragonFightEnv(BaseStageEnv):
 
     def _check_success(self) -> bool:
         """Check if dragon is killed."""
+        logger.debug("DragonFightEnv._check_success called")
         return self._stage_state.get("dragon_killed", False)
 
 
@@ -1483,6 +1531,7 @@ def make_stage_env(
     Raises:
         ValueError: If stage number is invalid.
     """
+    logger.debug("make_stage_env: stage=%s, config=%s", stage, config)
     stage_classes: dict[int, type[BaseStageEnv]] = {
         1: BasicSurvivalEnv,
         2: ResourceGatheringEnv,
@@ -1507,6 +1556,7 @@ def get_stage_info(stage: int) -> dict[str, Any]:
     Returns:
         Dictionary with stage metadata.
     """
+    logger.debug("get_stage_info: stage=%s", stage)
     stage_info: dict[int, dict[str, Any]] = {
         1: {
             "name": "Basic Survival",

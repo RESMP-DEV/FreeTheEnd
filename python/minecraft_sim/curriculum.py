@@ -80,6 +80,7 @@ def get_shader_set_for_stage(stage_id: StageID | int) -> list[str]:
     Returns:
         List of shader base names (without .spv extension).
     """
+    logger.debug("get_shader_set_for_stage: stage_id=%s", stage_id)
     if not isinstance(stage_id, StageID):
         stage_id = StageID(stage_id)
     return list(STAGE_SHADER_SETS.get(stage_id, []))
@@ -158,6 +159,7 @@ class Stage:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize stage to dictionary."""
+        logger.debug("Stage.to_dict called")
         return {
             "id": self.id.value,
             "name": self.name,
@@ -199,6 +201,7 @@ class Stage:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Stage:
         """Deserialize stage from dictionary."""
+        logger.debug("Stage.from_dict: data=%s", data)
         return cls(
             id=StageID(data["id"]),
             name=data["name"],
@@ -253,6 +256,7 @@ class StageProgress:
     @property
     def success_rate(self) -> float:
         """Calculate success rate over all episodes."""
+        logger.debug("StageProgress.success_rate called")
         if self.episodes_completed == 0:
             return 0.0
         return self.successes / self.episodes_completed
@@ -260,6 +264,7 @@ class StageProgress:
     @property
     def average_reward(self) -> float:
         """Calculate average reward per episode."""
+        logger.debug("StageProgress.average_reward called")
         if self.episodes_completed == 0:
             return 0.0
         return self.total_reward / self.episodes_completed
@@ -289,6 +294,7 @@ class CurriculumManager:
                        If not provided, uses default stage_configs directory.
                        If explicitly None, no stages are loaded.
         """
+        logger.info("CurriculumManager.__init__: config_dir=%s", config_dir)
         self.stages: dict[StageID, Stage] = {}
         self.progress: dict[StageID, StageProgress] = {}
         self.current_stage: StageID | None = None
@@ -308,6 +314,7 @@ class CurriculumManager:
 
     def _load_stages(self) -> None:
         """Load stage configurations from YAML files."""
+        logger.info("CurriculumManager._load_stages called")
         if not self.config_dir.exists():
             return
 
@@ -336,6 +343,7 @@ class CurriculumManager:
 
     def _initialize_progress(self) -> None:
         """Initialize progress tracking for all stages."""
+        logger.info("CurriculumManager._initialize_progress called")
         for stage_id in self.stages:
             self.progress[stage_id] = StageProgress(stage_id=stage_id)
 
@@ -345,6 +353,7 @@ class CurriculumManager:
         Args:
             stage: Stage configuration to register.
         """
+        logger.info("CurriculumManager.register_stage: stage=%s", stage)
         self.stages[stage.id] = stage
         if stage.id not in self.progress:
             self.progress[stage.id] = StageProgress(stage_id=stage.id)
@@ -361,6 +370,7 @@ class CurriculumManager:
         Raises:
             KeyError: If stage not found.
         """
+        logger.debug("CurriculumManager.get_stage: stage_id=%s", stage_id)
         return self.stages[stage_id]
 
     def start_training(self, stage_id: StageID | None = None) -> Stage:
@@ -372,6 +382,7 @@ class CurriculumManager:
         Returns:
             Stage configuration for training.
         """
+        logger.info("CurriculumManager.start_training: stage_id=%s", stage_id)
         if stage_id is None:
             stage_id = StageID.BASIC_SURVIVAL
 
@@ -400,6 +411,7 @@ class CurriculumManager:
         Returns:
             True if stage was mastered after this episode.
         """
+        logger.debug("CurriculumManager.record_episode: success=%s, reward=%s, ticks=%s, stage_id=%s", success, reward, ticks, stage_id)
         if stage_id is None:
             stage_id = self.current_stage
         if stage_id is None:
@@ -431,6 +443,7 @@ class CurriculumManager:
         Returns:
             True if current stage is mastered and next stage available.
         """
+        logger.debug("CurriculumManager.should_advance called")
         if self.current_stage is None:
             return False
 
@@ -447,6 +460,7 @@ class CurriculumManager:
         Returns:
             Next stage ID or None if at final stage.
         """
+        logger.debug("CurriculumManager._get_next_stage called")
         if self.current_stage is None:
             return StageID.BASIC_SURVIVAL
 
@@ -462,6 +476,7 @@ class CurriculumManager:
         Returns:
             New stage configuration or None if cannot advance.
         """
+        logger.debug("CurriculumManager.advance_stage called")
         next_stage = self._get_next_stage()
         if next_stage is None:
             return None
@@ -495,6 +510,7 @@ class CurriculumManager:
         Returns:
             Stage configuration or None if cannot regress.
         """
+        logger.debug("CurriculumManager.regress_stage: stage_id=%s", stage_id)
         if stage_id is not None:
             if stage_id in self.stages:
                 old_stage = self.current_stage
@@ -529,6 +545,7 @@ class CurriculumManager:
         Args:
             callback: Function called with (old_stage, new_stage).
         """
+        logger.debug("CurriculumManager.on_stage_change: callback=%s", callback)
         self._callbacks.append(callback)
 
     def get_training_summary(self) -> dict[str, Any]:
@@ -537,6 +554,7 @@ class CurriculumManager:
         Returns:
             Dictionary with progress stats for all stages.
         """
+        logger.debug("CurriculumManager.get_training_summary called")
         return {
             "current_stage": self.current_stage.name if self.current_stage else None,
             "stages_mastered": sum(1 for p in self.progress.values() if p.mastered),
@@ -560,6 +578,7 @@ class CurriculumManager:
         Args:
             path: Path to save JSON progress file.
         """
+        logger.debug("CurriculumManager.save_progress: path=%s", path)
         path = Path(path)
         data = {
             "current_stage": self.current_stage.value if self.current_stage else None,
@@ -585,6 +604,7 @@ class CurriculumManager:
         Args:
             path: Path to JSON progress file.
         """
+        logger.info("CurriculumManager.load_progress: path=%s", path)
         path = Path(path)
         with open(path) as f:
             data = json.load(f)
@@ -614,6 +634,7 @@ def create_speedrun_curriculum() -> CurriculumManager:
     Returns:
         CurriculumManager with all 6 stages configured.
     """
+    logger.info("create_speedrun_curriculum called")
     from .stage_configs import (
         STAGE_1_BASIC_SURVIVAL,
         STAGE_2_RESOURCE_GATHERING,
@@ -736,6 +757,7 @@ class AutoCurriculumManager:
         num_envs: int,
         config: CurriculumConfig | None = None,
     ) -> None:
+        logger.info("AutoCurriculumManager.__init__: num_envs=%s, config=%s", num_envs, config)
         self.num_envs = num_envs
         self.config = config or CurriculumConfig()
 
@@ -778,6 +800,7 @@ class AutoCurriculumManager:
         Returns:
             True if environment was advanced or regressed to a different stage.
         """
+        logger.debug("AutoCurriculumManager.update: env_id=%s, success=%s, episode_length=%s, episode_reward=%s", env_id, success, episode_length, episode_reward)
         stage = int(self.env_stages[env_id])
         success_val = 1.0 if success else 0.0
 
@@ -823,6 +846,7 @@ class AutoCurriculumManager:
         Returns:
             Boolean array indicating which environments changed stages.
         """
+        logger.debug("AutoCurriculumManager.update_batch: env_ids=%s, successes=%s, episode_lengths=%s, episode_rewards=%s", env_ids, successes, episode_lengths, episode_rewards)
         n = len(env_ids)
         if episode_lengths is None:
             episode_lengths = np.zeros(n, dtype=np.int32)
@@ -848,6 +872,7 @@ class AutoCurriculumManager:
         Returns:
             Current stage ID (1 to max_stage).
         """
+        logger.debug("AutoCurriculumManager.get_stage: env_id=%s", env_id)
         return int(self.env_stages[env_id])
 
     def get_stages(self) -> NDArray[np.int32]:
@@ -856,6 +881,7 @@ class AutoCurriculumManager:
         Returns:
             Array of stage IDs, shape (num_envs,).
         """
+        logger.debug("AutoCurriculumManager.get_stages called")
         return self.env_stages.copy()
 
     def get_shader_set(self, env_id: int) -> list[str]:
@@ -867,6 +893,7 @@ class AutoCurriculumManager:
         Returns:
             List of shader names required for the environment's current stage.
         """
+        logger.debug("AutoCurriculumManager.get_shader_set: env_id=%s", env_id)
         stage = int(self.env_stages[env_id])
         return get_shader_set_for_stage(stage)
 
@@ -877,6 +904,7 @@ class AutoCurriculumManager:
             env_id: Environment index.
             stage: Stage to set (clamped to valid range).
         """
+        logger.debug("AutoCurriculumManager.set_stage: env_id=%s, stage=%s", env_id, stage)
         stage = max(self.config.min_stage, min(stage, self.config.max_stage))
         self.env_stages[env_id] = stage
         self.env_episode_counts[env_id] = 0
@@ -888,6 +916,7 @@ class AutoCurriculumManager:
         Args:
             stage: Stage to set (clamped to valid range).
         """
+        logger.debug("AutoCurriculumManager.set_all_stages: stage=%s", stage)
         stage = max(self.config.min_stage, min(stage, self.config.max_stage))
         self.env_stages.fill(stage)
         self.env_episode_counts.fill(0)
@@ -903,6 +932,7 @@ class AutoCurriculumManager:
         Returns:
             Success rate (0.0 to 1.0), or 0.0 if no episodes recorded.
         """
+        logger.debug("AutoCurriculumManager.get_success_rate: stage=%s", stage)
         history = self.stage_successes.get(stage)
         if history is None or len(history) == 0:
             return 0.0
@@ -917,6 +947,7 @@ class AutoCurriculumManager:
         Returns:
             Success rate over recent episodes.
         """
+        logger.debug("AutoCurriculumManager.get_env_success_rate: env_id=%s", env_id)
         history = self._env_success_history[env_id]
         if len(history) == 0:
             return 0.0
@@ -937,6 +968,7 @@ class AutoCurriculumManager:
                 - regressions: Number of regressions
         """
         # Calculate stage distribution
+        logger.debug("AutoCurriculumManager.get_stats called")
         unique, counts = np.unique(self.env_stages, return_counts=True)
         stage_distribution = dict(zip(unique.tolist(), counts.tolist()))
 
@@ -978,6 +1010,7 @@ class AutoCurriculumManager:
         Returns:
             Formatted string with stage distribution and success rates.
         """
+        logger.debug("AutoCurriculumManager.get_summary called")
         stats = self.get_stats()
         lines = [
             f"AutoCurriculum Summary ({self.num_envs} envs, {self._total_episodes} episodes):",
@@ -1007,6 +1040,7 @@ class AutoCurriculumManager:
         Returns:
             List of recent ProgressionEvent objects.
         """
+        logger.debug("AutoCurriculumManager.get_recent_progressions: n=%s", n)
         return self.progression_history[-n:]
 
     def _should_advance(self, env_id: int, stage: int) -> bool:
@@ -1019,6 +1053,7 @@ class AutoCurriculumManager:
         Returns:
             True if advancement criteria met.
         """
+        logger.debug("AutoCurriculumManager._should_advance: env_id=%s, stage=%s", env_id, stage)
         if stage >= self.config.max_stage:
             return False
 
@@ -1048,6 +1083,7 @@ class AutoCurriculumManager:
         Returns:
             True if regression criteria met.
         """
+        logger.debug("AutoCurriculumManager._should_regress: env_id=%s, stage=%s", env_id, stage)
         if stage <= self.config.min_stage:
             return False
 
@@ -1069,6 +1105,7 @@ class AutoCurriculumManager:
         Returns:
             True (always advances).
         """
+        logger.debug("AutoCurriculumManager._advance_stage: env_id=%s, old_stage=%s", env_id, old_stage)
         new_stage = old_stage + 1
         success_rate = self.get_env_success_rate(env_id)
 
@@ -1110,6 +1147,7 @@ class AutoCurriculumManager:
         Returns:
             True (always regresses).
         """
+        logger.debug("AutoCurriculumManager._regress_stage: env_id=%s, old_stage=%s", env_id, old_stage)
         new_stage = old_stage - 1
         success_rate = self.get_env_success_rate(env_id)
 
@@ -1135,6 +1173,7 @@ class AutoCurriculumManager:
 
     def reset(self) -> None:
         """Reset all curriculum state to initial values."""
+        logger.debug("AutoCurriculumManager.reset called")
         self.env_stages.fill(self.config.min_stage)
         self.env_episode_counts.fill(0)
         self._total_episodes = 0
@@ -1154,6 +1193,7 @@ class AutoCurriculumManager:
         Returns:
             Dictionary containing all state needed to restore.
         """
+        logger.debug("AutoCurriculumManager.save_state called")
         return {
             "config": {
                 "min_episodes_per_stage": self.config.min_episodes_per_stage,
@@ -1196,6 +1236,7 @@ class AutoCurriculumManager:
             state: Dictionary from save_state().
         """
         # Restore config (optional - allows loading with different config)
+        logger.info("AutoCurriculumManager.load_state: state=%s", state)
         if "config" in state:
             cfg = state["config"]
             self.config = CurriculumConfig(

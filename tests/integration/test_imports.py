@@ -15,6 +15,11 @@ def test_import(name, import_func):
         successes.append(name)
         print(f"✓ {name}")
     except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         errors.append((name, str(e)))
         print(f"✗ {name}: {e}")
 

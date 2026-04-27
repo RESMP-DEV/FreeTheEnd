@@ -605,6 +605,10 @@ def print_result(result: StructureVerificationResult) -> None:
 if __name__ == "__main__":
     import sys
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     # Test with multiple seeds
     num_seeds = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 

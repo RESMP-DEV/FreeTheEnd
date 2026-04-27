@@ -201,6 +201,11 @@ def test_observation_layout_with_sim() -> None:
     try:
         import mc189_core
     except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         print("mc189_core not available, skipping simulation test")
         print("Run 'make' in cpp/ directory to build the simulator")
         return

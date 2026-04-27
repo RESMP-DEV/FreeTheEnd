@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import NamedTuple
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class BlockPos(NamedTuple):
     """3D block position."""
@@ -60,10 +64,12 @@ class World:
 
     def set_block(self, dimension: Dimension, pos: BlockPos, block: BlockType) -> None:
         """Set a block in the world."""
+        logger.debug("World.set_block: dimension=%s, pos=%s, block=%s", dimension, pos, block)
         self.blocks[(dimension, pos)] = block
 
     def get_block(self, dimension: Dimension, pos: BlockPos) -> BlockType:
         """Get a block from the world, default air."""
+        logger.debug("World.get_block: dimension=%s, pos=%s", dimension, pos)
         return self.blocks.get((dimension, pos), BlockType.AIR)
 
     def clear_area(
@@ -73,6 +79,7 @@ class World:
         corner2: BlockPos,
     ) -> None:
         """Clear an area to air."""
+        logger.debug("World.clear_area: dimension=%s, corner1=%s, corner2=%s", dimension, corner1, corner2)
         for x in range(min(corner1.x, corner2.x), max(corner1.x, corner2.x) + 1):
             for y in range(min(corner1.y, corner2.y), max(corner1.y, corner2.y) + 1):
                 for z in range(min(corner1.z, corner2.z), max(corner1.z, corner2.z) + 1):
@@ -94,6 +101,7 @@ class NetherPortalTransitionVerifier:
     CREATIVE_WARMUP = 0
 
     def __init__(self):
+        logger.info("NetherPortalTransitionVerifier.__init__ called")
         self.transition_states: dict[str, TransitionState] = {}
 
     def entity_enters_portal(
@@ -112,6 +120,7 @@ class NetherPortalTransitionVerifier:
         Returns:
             Updated transition state
         """
+        logger.debug("NetherPortalTransitionVerifier.entity_enters_portal: entity_id=%s, source_dim=%s, creative_mode=%s", entity_id, source_dim, creative_mode)
         target_dim = Dimension.OVERWORLD if source_dim == Dimension.NETHER else Dimension.NETHER
 
         state = TransitionState(
@@ -134,6 +143,7 @@ class NetherPortalTransitionVerifier:
         Returns:
             Updated state, or None if entity not in portal
         """
+        logger.debug("NetherPortalTransitionVerifier.tick_entity: entity_id=%s", entity_id)
         state = self.transition_states.get(entity_id)
         if not state or not state.in_portal:
             return None
@@ -156,6 +166,7 @@ class NetherPortalTransitionVerifier:
         Returns:
             Reset state, or None if entity wasn't tracked
         """
+        logger.debug("NetherPortalTransitionVerifier.entity_leaves_portal: entity_id=%s", entity_id)
         state = self.transition_states.get(entity_id)
         if not state:
             return None
@@ -175,6 +186,7 @@ class NetherPortalTransitionVerifier:
         Returns:
             Progress from 0.0 to 1.0
         """
+        logger.debug("NetherPortalTransitionVerifier.get_progress: entity_id=%s", entity_id)
         state = self.transition_states.get(entity_id)
         if not state:
             return 0.0
@@ -192,6 +204,7 @@ class NetherPortalTransitionVerifier:
         Returns:
             Tuple of (is_correct, explanation)
         """
+        logger.debug("NetherPortalTransitionVerifier.verify_timing: actual_ticks=%s, expected_ticks=%s", actual_ticks, expected_ticks)
         if actual_ticks == expected_ticks:
             return (
                 True,
@@ -216,6 +229,7 @@ class EndPortalTransitionVerifier:
     END_SPAWN_ABOVE_PLATFORM = BlockPos(100, 50, 0)  # Where player appears
 
     def __init__(self):
+        logger.info("EndPortalTransitionVerifier.__init__ called")
         self.entities_entered_end: set[str] = set()
         self.dragon_spawned: bool = False
 
@@ -233,6 +247,7 @@ class EndPortalTransitionVerifier:
         Returns:
             Tuple of (spawn_position, spawns_dragon)
         """
+        logger.debug("EndPortalTransitionVerifier.entity_enters_end_portal: entity_id=%s, is_player=%s", entity_id, is_player)
         spawns_dragon = False
 
         if is_player and entity_id not in self.entities_entered_end:
@@ -253,6 +268,7 @@ class EndPortalTransitionVerifier:
         Returns:
             Tuple of (is_correct, explanation)
         """
+        logger.debug("EndPortalTransitionVerifier.verify_instant_teleport: warmup_ticks=%s", warmup_ticks)
         if warmup_ticks == 0:
             return True, "Correct: End portal is instant (0 ticks)"
         else:
@@ -275,6 +291,7 @@ class EndSpawnPlatformVerifier:
     CLEAR_HEIGHT = 3  # Air space above
 
     def __init__(self, world: World):
+        logger.info("EndSpawnPlatformVerifier.__init__: world=%s", world)
         self.world = world
         self.generation_count = 0
 
@@ -284,6 +301,7 @@ class EndSpawnPlatformVerifier:
         Returns:
             List of obsidian block positions
         """
+        logger.debug("EndSpawnPlatformVerifier.generate_spawn_platform called")
         cx, cy, cz = self.PLATFORM_CENTER
         half = self.PLATFORM_SIZE // 2
         obsidian_positions: list[BlockPos] = []
@@ -311,6 +329,7 @@ class EndSpawnPlatformVerifier:
         Returns:
             Tuple of (is_valid, issues)
         """
+        logger.debug("EndSpawnPlatformVerifier.verify_platform called")
         issues: list[str] = []
         cx, cy, cz = self.PLATFORM_CENTER
         half = self.PLATFORM_SIZE // 2
@@ -340,6 +359,7 @@ class EndSpawnPlatformVerifier:
         Returns:
             Tuple of (is_correct, explanation)
         """
+        logger.debug("EndSpawnPlatformVerifier.verify_dimensions called")
         expected_blocks = self.PLATFORM_SIZE * self.PLATFORM_SIZE
         expected_air = expected_blocks * self.CLEAR_HEIGHT
 
@@ -370,6 +390,7 @@ class EndSpawnPlatformVerifier:
 
 def run_verification() -> None:
     """Run all dimension transition verifications."""
+    logger.debug("run_verification called")
     print("=" * 60)
     print("DIMENSION TRANSITION VERIFICATION SUITE")
     print("=" * 60)

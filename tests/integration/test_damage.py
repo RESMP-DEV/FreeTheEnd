@@ -7,6 +7,10 @@ import numpy as np
 
 from minecraft_sim import mc189_core
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Check GPU support
 print("Device info:", mc189_core.get_device_info()["device_name"])
 

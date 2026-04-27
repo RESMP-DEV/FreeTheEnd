@@ -1,5 +1,9 @@
 """Minecraft 1.8.9 physics constants - authoritative reference values.
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 These values are decompiled from vanilla MC 1.8.9 Java Edition.
 All physics calculations must match these constants exactly.
 
@@ -115,6 +119,7 @@ def tick_fall_velocity(vy: float) -> float:
     Returns:
         New Y velocity after one tick
     """
+    logger.debug("tick_fall_velocity: vy=%s", vy)
     vy -= GRAVITY  # Apply gravity
     vy *= DRAG_AIR  # Apply air drag
     return vy
@@ -130,6 +135,7 @@ def tick_fall_position(y: float, vy: float) -> tuple[float, float]:
     Returns:
         Tuple of (new_y, new_vy) after one tick
     """
+    logger.debug("tick_fall_position: y=%s, vy=%s", y, vy)
     vy -= GRAVITY
     vy *= DRAG_AIR
     y += vy
@@ -147,6 +153,7 @@ def simulate_fall(y0: float, vy0: float, ticks: int) -> tuple[float, float]:
     Returns:
         Tuple of (final_y, final_vy)
     """
+    logger.debug("simulate_fall: y0=%s, vy0=%s, ticks=%s", y0, vy0, ticks)
     y, vy = y0, vy0
     for _ in range(ticks):
         y, vy = tick_fall_position(y, vy)
@@ -163,6 +170,7 @@ def simulate_jump(y0: float, ticks: int) -> tuple[float, float]:
     Returns:
         Tuple of (final_y, final_vy)
     """
+    logger.debug("simulate_jump: y0=%s, ticks=%s", y0, ticks)
     return simulate_fall(y0, JUMP_VELOCITY, ticks)
 
 
@@ -172,6 +180,7 @@ def find_jump_apex_tick() -> tuple[int, float]:
     Returns:
         Tuple of (apex_tick, apex_height) relative to starting position
     """
+    logger.debug("find_jump_apex_tick called")
     y, vy = 0.0, JUMP_VELOCITY
     max_y = 0.0
     apex_tick = 0

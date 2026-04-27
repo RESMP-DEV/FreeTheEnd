@@ -320,6 +320,11 @@ class SpeedrunReplayer:
 
             return DragonFightEnv(**self._env_kwargs)
         except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             raise ImportError(
                 "DragonFightEnv not available. Please provide an env_class to SpeedrunReplayer."
             ) from None

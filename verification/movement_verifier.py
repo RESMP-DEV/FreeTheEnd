@@ -174,6 +174,10 @@ def reference_ground_physics(
     """
     import math
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     x, z = x0, z0
     vx, vz = vx0, vz0
 

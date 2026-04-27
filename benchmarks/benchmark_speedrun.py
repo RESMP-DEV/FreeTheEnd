@@ -1461,6 +1461,11 @@ def benchmark_stronghold(
         backend = VulkanBackend(num_envs=num_agents)
         backend.reset()
     except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         print(f"  ERROR creating backend: {e}")
         return metrics
 

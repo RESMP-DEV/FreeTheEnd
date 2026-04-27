@@ -894,6 +894,11 @@ class SpeedrunVecEnv:
         try:
             next_stage = StageID(current_stage + 1)
         except ValueError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             return False
 
         self.set_stage(env_id, next_stage)

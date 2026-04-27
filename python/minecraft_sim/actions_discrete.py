@@ -282,4 +282,9 @@ def action_to_keyboard_mouse(action: int) -> dict[str, bool | float]:
     try:
         return ACTION_TO_KEYS[Action(action)].copy()
     except (ValueError, KeyError):
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         return {}

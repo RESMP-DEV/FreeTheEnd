@@ -415,6 +415,10 @@ def print_summary(name: str, summary: VerificationSummary) -> None:
 if __name__ == "__main__":
     import sys
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     seed = int(sys.argv[1]) if len(sys.argv) > 1 else 12345
 
     print(f"Running terrain verification for seed {seed}")

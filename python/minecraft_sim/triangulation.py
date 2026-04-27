@@ -347,6 +347,11 @@ class TriangulationState:
                     )
                     intersections.append(point)
                 except ValueError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
                     continue
 
         if len(intersections) < 2:

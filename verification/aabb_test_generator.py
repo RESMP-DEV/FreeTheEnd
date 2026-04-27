@@ -18,6 +18,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AABB:
@@ -31,16 +35,19 @@ class AABB:
     max_z: float
 
     def to_dict(self) -> dict[str, float]:
+        logger.debug("AABB.to_dict called")
         return asdict(self)
 
     @property
     def volume(self) -> float:
+        logger.debug("AABB.volume called")
         dx = self.max_x - self.min_x
         dy = self.max_y - self.min_y
         dz = self.max_z - self.min_z
         return max(0.0, dx * dy * dz)
 
     def is_valid(self) -> bool:
+        logger.debug("AABB.is_valid called")
         return self.max_x >= self.min_x and self.max_y >= self.min_y and self.max_z >= self.min_z
 
 
@@ -55,6 +62,7 @@ class TestCase:
     description: str
 
     def to_dict(self) -> dict[str, Any]:
+        logger.debug("TestCase.to_dict called")
         return {
             "id": self.id,
             "category": self.category,
@@ -68,21 +76,26 @@ class AABBTestGenerator:
     """Generates AABB test cases with controlled randomness."""
 
     def __init__(self, seed: int = 42):
+        logger.info("AABBTestGenerator.__init__: seed=%s", seed)
         self.rng = random.Random(seed)
         self.test_id = 0
 
     def _next_id(self) -> int:
+        logger.debug("AABBTestGenerator._next_id called")
         self.test_id += 1
         return self.test_id
 
     def _random_float(self, lo: float = -100.0, hi: float = 100.0) -> float:
+        logger.debug("AABBTestGenerator._random_float: lo=%s, hi=%s", lo, hi)
         return self.rng.uniform(lo, hi)
 
     def _random_positive(self, lo: float = 0.1, hi: float = 50.0) -> float:
+        logger.debug("AABBTestGenerator._random_positive: lo=%s, hi=%s", lo, hi)
         return self.rng.uniform(lo, hi)
 
     def _random_normal_box(self) -> AABB:
         """Generate a valid AABB with positive dimensions."""
+        logger.debug("AABBTestGenerator._random_normal_box called")
         x = self._random_float()
         y = self._random_float()
         z = self._random_float()
@@ -93,6 +106,7 @@ class AABBTestGenerator:
 
     def generate_normal_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases with two normal valid boxes."""
+        logger.debug("AABBTestGenerator.generate_normal_boxes: count=%s", count)
         cases = []
         for _ in range(count):
             cases.append(
@@ -108,6 +122,7 @@ class AABBTestGenerator:
 
     def generate_zero_volume_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases with zero-volume (degenerate) boxes."""
+        logger.debug("AABBTestGenerator.generate_zero_volume_boxes: count=%s", count)
         cases = []
         for i in range(count):
             box_a = self._random_normal_box()
@@ -166,6 +181,7 @@ class AABBTestGenerator:
 
     def generate_negative_dimension_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases with inverted min/max (negative dimensions)."""
+        logger.debug("AABBTestGenerator.generate_negative_dimension_boxes: count=%s", count)
         cases = []
         for i in range(count):
             box_a = self._random_normal_box()
@@ -235,6 +251,7 @@ class AABBTestGenerator:
 
     def generate_touching_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases where boxes touch at face/edge/corner."""
+        logger.debug("AABBTestGenerator.generate_touching_boxes: count=%s", count)
         cases = []
         for i in range(count):
             box_a = self._random_normal_box()
@@ -332,6 +349,7 @@ class AABBTestGenerator:
 
     def generate_overlapping_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases where boxes partially overlap."""
+        logger.debug("AABBTestGenerator.generate_overlapping_boxes: count=%s", count)
         cases = []
         for i in range(count):
             box_a = self._random_normal_box()
@@ -396,6 +414,7 @@ class AABBTestGenerator:
 
     def generate_contained_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases where one box fully contains the other."""
+        logger.debug("AABBTestGenerator.generate_contained_boxes: count=%s", count)
         cases = []
         for i in range(count):
             outer = self._random_normal_box()
@@ -458,6 +477,7 @@ class AABBTestGenerator:
 
     def generate_disjoint_boxes(self, count: int) -> list[TestCase]:
         """Generate test cases where boxes do not intersect at all."""
+        logger.debug("AABBTestGenerator.generate_disjoint_boxes: count=%s", count)
         cases = []
         for i in range(count):
             box_a = self._random_normal_box()
@@ -559,6 +579,7 @@ class AABBTestGenerator:
 
     def generate_extreme_values(self, count: int) -> list[TestCase]:
         """Generate test cases with extreme float values."""
+        logger.debug("AABBTestGenerator.generate_extreme_values: count=%s", count)
         cases = []
         extremes = [1e-10, 1e-5, 1e5, 1e10, float("inf"), -float("inf")]
 
@@ -612,6 +633,7 @@ class AABBTestGenerator:
     def generate_all(self, total: int = 10000) -> list[TestCase]:
         """Generate all test cases with balanced distribution."""
         # Distribution: ~40% normal, ~10% each for other categories
+        logger.debug("AABBTestGenerator.generate_all: total=%s", total)
         counts = {
             "normal": int(total * 0.30),
             "zero_volume": int(total * 0.10),
@@ -648,6 +670,7 @@ class AABBTestGenerator:
 
 
 def main():
+    logger.debug("main called")
     parser = argparse.ArgumentParser(description="Generate AABB test cases")
     parser.add_argument("--count", type=int, default=10000, help="Number of test cases")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

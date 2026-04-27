@@ -32,6 +32,10 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # SUB-GOAL DEFINITIONS
@@ -131,6 +135,7 @@ class SubGoal:
         Default implementation checks for specific conditions in info dict.
         Override for custom logic.
         """
+        logger.debug("SubGoal.check_completion: obs=%s, info=%s", obs, info)
         if f"subgoal_{self.name}_complete" in info:
             return bool(info[f"subgoal_{self.name}_complete"])
         return False
@@ -141,6 +146,7 @@ class SubGoal:
         Default implementation returns True (always initiable).
         Override to add preconditions.
         """
+        logger.info("SubGoal.check_initiation: obs=%s, info=%s", obs, info)
         return True
 
 
@@ -168,6 +174,7 @@ class SubGoalRegistry:
     def _register_defaults(self) -> None:
         """Register all default sub-goals."""
         # Resource gathering
+        logger.info("SubGoalRegistry._register_defaults called")
         self.register(
             SubGoal(
                 id=SubGoalID.GET_WOOD,
@@ -510,14 +517,17 @@ class SubGoalRegistry:
 
     def register(self, subgoal: SubGoal) -> None:
         """Register a sub-goal."""
+        logger.info("SubGoalRegistry.register: subgoal=%s", subgoal)
         self._subgoals[subgoal.id] = subgoal
 
     def get(self, subgoal_id: SubGoalID) -> SubGoal:
         """Get sub-goal by ID."""
+        logger.debug("SubGoalRegistry.get: subgoal_id=%s", subgoal_id)
         return self._subgoals[subgoal_id]
 
     def get_by_name(self, name: str) -> SubGoal | None:
         """Get sub-goal by name."""
+        logger.debug("SubGoalRegistry.get_by_name: name=%s", name)
         for sg in self._subgoals.values():
             if sg.name == name:
                 return sg
@@ -525,15 +535,18 @@ class SubGoalRegistry:
 
     def get_by_category(self, category: SubGoalCategory) -> list[SubGoal]:
         """Get all sub-goals in a category."""
+        logger.debug("SubGoalRegistry.get_by_category: category=%s", category)
         return [sg for sg in self._subgoals.values() if sg.category == category]
 
     def all_subgoals(self) -> list[SubGoal]:
         """Get all registered sub-goals."""
+        logger.debug("SubGoalRegistry.all_subgoals called")
         return list(self._subgoals.values())
 
     @property
     def num_subgoals(self) -> int:
         """Number of registered sub-goals."""
+        logger.debug("SubGoalRegistry.num_subgoals called")
         return len(self._subgoals)
 
 
@@ -588,6 +601,7 @@ class HighLevelPolicy(ABC, Generic[ObsType]):
         Returns:
             Selected sub-goal ID.
         """
+        logger.debug("HighLevelPolicy.select_subgoal: obs=%s, info=%s, available_subgoals=%s", obs, info, available_subgoals)
         ...
 
     @abstractmethod
@@ -615,6 +629,7 @@ class HighLevelPolicy(ABC, Generic[ObsType]):
         Returns:
             Dictionary of training metrics.
         """
+        logger.debug("HighLevelPolicy.update: obs=%s, selected_subgoal=%s, option_reward=%s, next_obs=%s", obs, selected_subgoal, option_reward, next_obs)
         ...
 
     def get_subgoal_values(self, obs: ObsType, info: dict[str, Any]) -> NDArray[np.float32]:
@@ -627,6 +642,7 @@ class HighLevelPolicy(ABC, Generic[ObsType]):
         Returns:
             Array of Q-values, one per sub-goal.
         """
+        logger.debug("HighLevelPolicy.get_subgoal_values: obs=%s, info=%s", obs, info)
         registry = SubGoalRegistry()
         return np.zeros(registry.num_subgoals, dtype=np.float32)
 
@@ -655,6 +671,7 @@ class LowLevelPolicy(ABC, Generic[ObsType, ActType]):
         Returns:
             Primitive action to execute.
         """
+        logger.debug("LowLevelPolicy.select_action: obs=%s, subgoal=%s, info=%s", obs, subgoal, info)
         ...
 
     @abstractmethod
@@ -682,6 +699,7 @@ class LowLevelPolicy(ABC, Generic[ObsType, ActType]):
         Returns:
             Dictionary of training metrics.
         """
+        logger.debug("LowLevelPolicy.update: obs=%s, action=%s, reward=%s, next_obs=%s", obs, action, reward, next_obs)
         ...
 
     def check_termination(
@@ -705,6 +723,7 @@ class LowLevelPolicy(ABC, Generic[ObsType, ActType]):
             Tuple of (should_terminate, termination_probability).
         """
         # Default: terminate on completion or max steps
+        logger.debug("LowLevelPolicy.check_termination: obs=%s, subgoal=%s, steps_taken=%s, info=%s", obs, subgoal, steps_taken, info)
         if subgoal.check_completion(obs, info):
             return True, 1.0
         if steps_taken >= subgoal.max_steps:
@@ -738,6 +757,7 @@ class TerminationCritic(ABC, Generic[ObsType]):
         Returns:
             Probability in [0, 1] of terminating.
         """
+        logger.debug("TerminationCritic.termination_probability: obs=%s, subgoal=%s, option_state=%s, info=%s", obs, subgoal, option_state, info)
         ...
 
     @abstractmethod
@@ -761,6 +781,7 @@ class TerminationCritic(ABC, Generic[ObsType]):
         Returns:
             Training metrics.
         """
+        logger.debug("TerminationCritic.update: obs=%s, subgoal=%s, terminated=%s, advantage=%s", obs, subgoal, terminated, advantage)
         ...
 
 
@@ -829,6 +850,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
             config: Hierarchical RL configuration.
             termination_critic: Optional learned termination function.
         """
+        logger.info("HierarchicalController.__init__: high_policy=%s, low_policy=%s, config=%s, termination_critic=%s", high_policy, low_policy, config, termination_critic)
         self.high_policy = high_policy
         self.low_policy = low_policy
         self.config = config or HierarchicalConfig()
@@ -842,10 +864,12 @@ class HierarchicalController(Generic[ObsType, ActType]):
     @property
     def current_subgoal(self) -> SubGoal | None:
         """Currently active sub-goal."""
+        logger.debug("HierarchicalController.current_subgoal called")
         return self._option_state.subgoal if self._option_state else None
 
     def reset(self) -> None:
         """Reset controller state for new episode."""
+        logger.debug("HierarchicalController.reset called")
         self._option_state = None
         self._last_obs = None
         self._episode_stats = defaultdict(float)
@@ -860,6 +884,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
         Returns:
             Primitive action to execute.
         """
+        logger.debug("HierarchicalController.step: obs=%s, info=%s", obs, info)
         self._last_obs = obs
 
         # Check if we need to select a new sub-goal
@@ -891,6 +916,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
         Returns:
             Dictionary of training metrics.
         """
+        logger.debug("HierarchicalController.receive_reward: reward=%s, terminated=%s, truncated=%s, info=%s", reward, terminated, truncated, info)
         if self._option_state is None or self._last_obs is None:
             return {}
 
@@ -931,6 +957,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
 
     def _should_terminate(self, obs: ObsType, info: dict[str, Any]) -> bool:
         """Check if current option should terminate."""
+        logger.debug("HierarchicalController._should_terminate: obs=%s, info=%s", obs, info)
         if self._option_state is None:
             return True
 
@@ -966,6 +993,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
     def _select_new_subgoal(self, obs: ObsType, info: dict[str, Any]) -> None:
         """Select a new sub-goal using high-level policy."""
         # Finalize previous option if exists
+        logger.debug("HierarchicalController._select_new_subgoal: obs=%s, info=%s", obs, info)
         if self._option_state is not None:
             self._finalize_option(obs, False, False, info)
 
@@ -987,6 +1015,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
         info: dict[str, Any],
     ) -> None:
         """Finalize option and update high-level policy."""
+        logger.debug("HierarchicalController._finalize_option: obs=%s, terminated=%s, truncated=%s, info=%s", obs, terminated, truncated, info)
         if self._option_state is None or self._option_state.start_obs is None:
             return
 
@@ -1003,6 +1032,7 @@ class HierarchicalController(Generic[ObsType, ActType]):
 
     def get_episode_stats(self) -> dict[str, float]:
         """Get statistics for current episode."""
+        logger.debug("HierarchicalController.get_episode_stats called")
         return dict(self._episode_stats)
 
 
@@ -1054,6 +1084,7 @@ class SubGoalDetector:
             min_segment_length: Minimum steps for a segment.
             max_segment_length: Maximum steps for a segment.
         """
+        logger.info("SubGoalDetector.__init__: registry=%s, min_segment_length=%s, max_segment_length=%s", registry, min_segment_length, max_segment_length)
         self.registry = registry or SubGoalRegistry()
         self.min_segment_length = min_segment_length
         self.max_segment_length = max_segment_length
@@ -1095,6 +1126,7 @@ class SubGoalDetector:
         Returns:
             List of detected trajectory segments with sub-goal labels.
         """
+        logger.debug("SubGoalDetector.detect_from_trajectory: observations=%s, actions=%s, rewards=%s, infos=%s", observations, actions, rewards, infos)
         segments: list[TrajectorySegment] = []
         total_steps = len(observations)
 
@@ -1146,6 +1178,7 @@ class SubGoalDetector:
         self, infos: list[dict[str, Any]]
     ) -> list[tuple[int, SubGoalID, float]]:
         """Detect item acquisition events from info dicts."""
+        logger.debug("SubGoalDetector._detect_item_acquisitions: infos=%s", infos)
         events: list[tuple[int, SubGoalID, float]] = []
 
         prev_inventory: dict[int, int] = {}
@@ -1165,6 +1198,7 @@ class SubGoalDetector:
         self, observations: NDArray[np.float32]
     ) -> list[tuple[int, SubGoalID, float]]:
         """Detect dimension change events from observations."""
+        logger.debug("SubGoalDetector._detect_dimension_changes: observations=%s", observations)
         events: list[tuple[int, SubGoalID, float]] = []
 
         # Assuming dimension is at index 14 (from observations.py)
@@ -1184,6 +1218,7 @@ class SubGoalDetector:
         self, infos: list[dict[str, Any]]
     ) -> list[tuple[int, SubGoalID, float]]:
         """Detect combat events (kills) from info dicts."""
+        logger.debug("SubGoalDetector._detect_combat_events: infos=%s", infos)
         events: list[tuple[int, SubGoalID, float]] = []
 
         mob_subgoal_map: dict[str, SubGoalID] = {
@@ -1212,6 +1247,7 @@ class SubGoalDetector:
         path: Path | str,
     ) -> None:
         """Save detected segments to JSON file."""
+        logger.debug("SubGoalDetector.save_detections: segments=%s, path=%s", segments, path)
         path = Path(path)
         data = [
             {
@@ -1254,6 +1290,7 @@ class HierarchicalRewardShaper:
             curiosity_scale: Scale for curiosity/exploration bonus.
             progress_scale: Scale for progress-toward-goal rewards.
         """
+        logger.info("HierarchicalRewardShaper.__init__: registry=%s, intrinsic_scale=%s, curiosity_scale=%s, progress_scale=%s", registry, intrinsic_scale, curiosity_scale, progress_scale)
         self.registry = registry or SubGoalRegistry()
         self.intrinsic_scale = intrinsic_scale
         self.curiosity_scale = curiosity_scale
@@ -1283,6 +1320,7 @@ class HierarchicalRewardShaper:
         Returns:
             Tuple of (shaped_reward, reward_components).
         """
+        logger.debug("HierarchicalRewardShaper.shape_reward: obs=%s, action=%s, reward=%s, next_obs=%s", obs, action, reward, next_obs)
         components: dict[str, float] = {"extrinsic": reward}
         total = reward
 
@@ -1312,6 +1350,7 @@ class HierarchicalRewardShaper:
     def _hash_state(self, obs: NDArray[np.float32]) -> int:
         """Hash observation for count-based exploration."""
         # Discretize to reduce state space
+        logger.debug("HierarchicalRewardShaper._hash_state: obs=%s", obs)
         discretized = (obs * 10).astype(np.int32)
         return hash(discretized.tobytes())
 
@@ -1327,6 +1366,7 @@ class HierarchicalRewardShaper:
         Returns value in [-1, 1] indicating backward/forward progress.
         """
         # Task-specific progress computation
+        logger.debug("HierarchicalRewardShaper._compute_progress: obs=%s, next_obs=%s, subgoal=%s, info=%s", obs, next_obs, subgoal, info)
         if subgoal.category == SubGoalCategory.NAVIGATION:
             # Check if getting closer to goal location
             goal_pos = info.get("goal_position")
@@ -1352,6 +1392,7 @@ class HierarchicalRewardShaper:
 
     def reset(self) -> None:
         """Reset episode-specific state."""
+        logger.debug("HierarchicalRewardShaper.reset called")
         self._state_counts.clear()
 
 
@@ -1377,10 +1418,12 @@ def create_hierarchical_env_wrapper(
     Returns:
         Environment step function with hierarchical control.
     """
+    logger.info("create_hierarchical_env_wrapper: env=%s, high_policy=%s, low_policy=%s, config=%s", env, high_policy, low_policy, config)
     controller = HierarchicalController(high_policy, low_policy, config)
     reward_shaper = HierarchicalRewardShaper()
 
     def step(obs: NDArray[np.float32], info: dict[str, Any]) -> tuple:
+        logger.debug("step: obs=%s, info=%s", obs, info)
         action = controller.step(obs, info)
         next_obs, reward, terminated, truncated, next_info = env.step(action)
 
@@ -1411,6 +1454,7 @@ def get_subgoal_embedding(
         Embedding vector of shape (embedding_dim,).
     """
     # One-hot with some structure based on category
+    logger.debug("get_subgoal_embedding: subgoal_id=%s, embedding_dim=%s", subgoal_id, embedding_dim)
     registry = SubGoalRegistry()
     subgoal = registry.get(subgoal_id)
 

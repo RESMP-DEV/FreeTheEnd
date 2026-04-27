@@ -17,6 +17,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     pass
 
@@ -50,6 +54,7 @@ class Position:
     z: float
 
     def distance_to(self, other: Position) -> float:
+        logger.debug("Position.distance_to: other=%s", other)
         return math.sqrt(
             (self.x - other.x) ** 2 + (self.y - other.y) ** 2 + (self.z - other.z) ** 2
         )
@@ -102,6 +107,7 @@ class EndWorld:
     VOID_Y = -64
 
     def __init__(self) -> None:
+        logger.info("EndWorld.__init__ called")
         self.blocks: dict[tuple[int, int, int], BlockType] = {}
         self.crystals: list[EnderCrystal] = []
         self.dragon: EnderDragon | None = None
@@ -112,6 +118,7 @@ class EndWorld:
 
     def _initialize_end(self) -> None:
         # Create obsidian spawn platform
+        logger.info("EndWorld._initialize_end called")
         for dx in range(-2, 3):
             for dz in range(-2, 3):
                 self.set_block(
@@ -158,6 +165,7 @@ class EndWorld:
         )
 
     def spawn_player(self, clear_obsidian: bool = False) -> Player:
+        logger.debug("EndWorld.spawn_player: clear_obsidian=%s", clear_obsidian)
         spawn = Position(self.SPAWN_PLATFORM.x, self.SPAWN_PLATFORM.y + 1, self.SPAWN_PLATFORM.z)
 
         if clear_obsidian:
@@ -176,12 +184,15 @@ class EndWorld:
         return self.player
 
     def set_block(self, x: int, y: int, z: int, block_type: BlockType) -> None:
+        logger.debug("EndWorld.set_block: x=%s, y=%s, z=%s, block_type=%s", x, y, z, block_type)
         self.blocks[(x, y, z)] = block_type
 
     def get_block(self, x: int, y: int, z: int) -> BlockType:
+        logger.debug("EndWorld.get_block: x=%s, y=%s, z=%s", x, y, z)
         return self.blocks.get((x, y, z), BlockType.AIR)
 
     def tick(self) -> None:
+        logger.debug("EndWorld.tick called")
         if not self.dragon or not self.player:
             return
 
@@ -208,6 +219,7 @@ class EndWorld:
                 self._on_dragon_death()
 
     def _on_dragon_death(self) -> None:
+        logger.debug("EndWorld._on_dragon_death called")
         if not self.dragon or not self.player:
             return
         self.dragon.alive = False
@@ -216,6 +228,7 @@ class EndWorld:
 
     def destroy_crystal(self, crystal: EnderCrystal) -> tuple[float, Position]:
         """Destroy a crystal, returns explosion damage and position."""
+        logger.info("EndWorld.destroy_crystal: crystal=%s", crystal)
         crystal.alive = False
         crystal.health = 0
         if self.dragon:
@@ -225,6 +238,7 @@ class EndWorld:
 
     def shoot_arrow_at(self, target: Position) -> bool:
         """Player shoots arrow at target. Returns True if hit."""
+        logger.debug("EndWorld.shoot_arrow_at: target=%s", target)
         if not self.player or ItemType.BOW not in self.player.inventory:
             return False
 
@@ -251,6 +265,7 @@ class EndWorld:
 
     def use_bed(self, target: Position) -> tuple[float, bool]:
         """Use bed at target position. Beds explode in End. Returns (damage, hit_dragon)."""
+        logger.debug("EndWorld.use_bed: target=%s", target)
         if not self.player or ItemType.BED not in self.player.inventory:
             return 0.0, False
 
@@ -280,6 +295,7 @@ class EndWorld:
 
     def dragon_perch(self) -> None:
         """Make dragon land on the fountain."""
+        logger.debug("EndWorld.dragon_perch called")
         if self.dragon and self.dragon.alive:
             self.dragon.phase = DragonPhase.PERCHING
             self.dragon.position = Position(0, 65, 0)
@@ -287,6 +303,7 @@ class EndWorld:
 
     def dragon_knockback(self, target: Player) -> None:
         """Dragon wing attack knocks back player."""
+        logger.debug("EndWorld.dragon_knockback: target=%s", target)
         if not self.dragon or not self.dragon.alive:
             return
         knockback_strength = 5.0
@@ -303,6 +320,7 @@ class EndWorld:
 
     def enter_portal(self) -> bool:
         """Player enters exit portal. Returns True on victory."""
+        logger.debug("EndWorld.enter_portal called")
         if not self.exit_portal_active or not self.player:
             return False
         if self.player.position.distance_to(self.FOUNTAIN_CENTER) <= 5.0:
@@ -321,6 +339,7 @@ class TestSpawnMechanics:
 
     def test_spawn_on_platform(self) -> None:
         """Player spawns at (100, 49, 0) on obsidian platform."""
+        logger.debug("TestSpawnMechanics.test_spawn_on_platform called")
         world = EndWorld()
         player = world.spawn_player()
 
@@ -331,6 +350,7 @@ class TestSpawnMechanics:
 
     def test_clear_spawn_obsidian(self) -> None:
         """Obsidian blocking spawn position is cleared."""
+        logger.debug("TestSpawnMechanics.test_clear_spawn_obsidian called")
         world = EndWorld()
 
         # Place blocking obsidian
@@ -350,6 +370,7 @@ class TestDragonState:
 
     def test_dragon_alive_on_enter(self) -> None:
         """Dragon is alive when player enters the End."""
+        logger.debug("TestDragonState.test_dragon_alive_on_enter called")
         world = EndWorld()
         world.spawn_player()
 
@@ -360,6 +381,7 @@ class TestDragonState:
 
     def test_crystals_heal_dragon(self) -> None:
         """Dragon heals when near active crystals."""
+        logger.debug("TestDragonState.test_crystals_heal_dragon called")
         world = EndWorld()
         world.spawn_player()
         assert world.dragon is not None
@@ -389,6 +411,7 @@ class TestCrystalDestruction:
 
     def test_destroy_crystal_arrow(self) -> None:
         """Bow destroys crystals with arrow shots."""
+        logger.info("TestCrystalDestruction.test_destroy_crystal_arrow called")
         world = EndWorld()
         world.spawn_player()
 
@@ -406,6 +429,7 @@ class TestCrystalDestruction:
 
     def test_crystal_explosion_damage(self) -> None:
         """Crystal explosion deals damage to nearby entities."""
+        logger.debug("TestCrystalDestruction.test_crystal_explosion_damage called")
         world = EndWorld()
         player = world.spawn_player()
 
@@ -422,6 +446,7 @@ class TestCrystalDestruction:
 
     def test_caged_crystal_harder(self) -> None:
         """Iron bars block arrow shots to caged crystals."""
+        logger.debug("TestCrystalDestruction.test_caged_crystal_harder called")
         world = EndWorld()
         world.spawn_player()
 
@@ -454,6 +479,7 @@ class TestDragonCombat:
 
     def test_dragon_perch_phase(self) -> None:
         """Dragon lands on fountain for perch attacks."""
+        logger.debug("TestDragonCombat.test_dragon_perch_phase called")
         world = EndWorld()
         world.spawn_player()
         assert world.dragon is not None
@@ -469,6 +495,7 @@ class TestDragonCombat:
 
     def test_bed_explosion(self) -> None:
         """Beds explode when used in the End."""
+        logger.debug("TestDragonCombat.test_bed_explosion called")
         world = EndWorld()
         player = world.spawn_player()
 
@@ -483,6 +510,7 @@ class TestDragonCombat:
 
     def test_bed_damage_dragon(self) -> None:
         """Bed explosion deals ~100 damage to dragon when perching."""
+        logger.debug("TestDragonCombat.test_bed_damage_dragon called")
         world = EndWorld()
         player = world.spawn_player()
         assert world.dragon is not None
@@ -504,6 +532,7 @@ class TestDragonCombat:
 
     def test_one_cycle_possible(self) -> None:
         """3 beds can kill dragon (one-cycle strategy)."""
+        logger.debug("TestDragonCombat.test_one_cycle_possible called")
         world = EndWorld()
         player = world.spawn_player()
         assert world.dragon is not None
@@ -535,6 +564,7 @@ class TestDragonCombat:
 
     def test_dragon_knockback(self) -> None:
         """Dragon wing swipe knocks back player."""
+        logger.debug("TestDragonCombat.test_dragon_knockback called")
         world = EndWorld()
         player = world.spawn_player()
         assert world.dragon is not None
@@ -558,6 +588,7 @@ class TestDeathConditions:
 
     def test_void_death(self) -> None:
         """Falling into void kills player."""
+        logger.debug("TestDeathConditions.test_void_death called")
         world = EndWorld()
         player = world.spawn_player()
 
@@ -575,6 +606,7 @@ class TestVictorySequence:
 
     def test_dragon_death_sequence(self) -> None:
         """Dragon has proper death animation."""
+        logger.debug("TestVictorySequence.test_dragon_death_sequence called")
         world = EndWorld()
         world.spawn_player()
         assert world.dragon is not None
@@ -593,6 +625,7 @@ class TestVictorySequence:
 
     def test_xp_drop(self) -> None:
         """Dragon drops 12000 XP on death."""
+        logger.debug("TestVictorySequence.test_xp_drop called")
         world = EndWorld()
         player = world.spawn_player()
         assert world.dragon is not None
@@ -611,6 +644,7 @@ class TestVictorySequence:
 
     def test_exit_portal_activates(self) -> None:
         """Exit portal appears after dragon death."""
+        logger.debug("TestVictorySequence.test_exit_portal_activates called")
         world = EndWorld()
         world.spawn_player()
         assert world.dragon is not None
@@ -629,6 +663,7 @@ class TestVictorySequence:
 
     def test_enter_exit_victory(self) -> None:
         """Entering exit portal wins the game."""
+        logger.debug("TestVictorySequence.test_enter_exit_victory called")
         world = EndWorld()
         player = world.spawn_player()
         assert world.dragon is not None
@@ -653,6 +688,7 @@ class TestTimedFight:
 
     def test_full_fight_timed(self) -> None:
         """Complete fight can be done under time limit."""
+        logger.debug("TestTimedFight.test_full_fight_timed called")
         world = EndWorld()
         player = world.spawn_player()
         assert world.dragon is not None

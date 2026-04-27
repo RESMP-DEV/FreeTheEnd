@@ -453,6 +453,11 @@ class TestActionBounds:
         try:
             sim.step(np.array([-1], dtype=np.int32))
         except Exception:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             pass  # OK if it raises
 
 

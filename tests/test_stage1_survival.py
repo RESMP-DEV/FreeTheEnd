@@ -114,6 +114,10 @@ def _make_mock_env():
             from minecraft_sim.stage_envs import BasicSurvivalEnv as BSE
             from minecraft_sim.stage_envs import StageConfig as SC
 
+import logging
+
+logger = logging.getLogger(__name__)
+
             config = SC()
             env = BSE(config=config, shader_dir=str(SHADERS_DIR))
 

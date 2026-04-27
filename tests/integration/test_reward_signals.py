@@ -23,6 +23,10 @@ import numpy as np
 
 from minecraft_sim import mc189_core
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Observation indices
 OBS_POS_X = 0
 OBS_POS_Y = 1
@@ -75,6 +79,7 @@ DRAGON_MAX_HEALTH = 200.0
 
 def create_sim(num_envs: int = 1) -> mc189_core.MC189Simulator:
     """Create and initialize simulator."""
+    logger.info("create_sim: num_envs=%s", num_envs)
     config = mc189_core.SimulatorConfig()
     config.num_envs = num_envs
     config.shader_dir = str(Path(__file__).parent.parent.parent / "cpp" / "shaders")
@@ -85,16 +90,19 @@ def create_sim(num_envs: int = 1) -> mc189_core.MC189Simulator:
 
 def get_dragon_phase(obs: np.ndarray) -> int:
     """Get dragon phase from observation."""
+    logger.debug("get_dragon_phase: obs=%s", obs)
     return int(obs[OBS_DRAGON_PHASE] * 6)
 
 
 def get_dragon_health(obs: np.ndarray) -> float:
     """Get dragon health from observation."""
+    logger.debug("get_dragon_health: obs=%s", obs)
     return obs[OBS_DRAGON_HEALTH] * DRAGON_MAX_HEALTH
 
 
 def aim_at_dragon(sim: mc189_core.MC189Simulator) -> None:
     """Aim the player toward the dragon."""
+    logger.debug("aim_at_dragon: sim=%s", sim)
     for _ in range(50):
         obs = sim.get_observations()[0]
         dragon_x = obs[OBS_DRAGON_X] * 100
@@ -122,6 +130,7 @@ def aim_at_dragon(sim: mc189_core.MC189Simulator) -> None:
 
 def wait_for_perch(sim: mc189_core.MC189Simulator, max_steps: int = 10000) -> bool:
     """Wait for dragon to enter perching phase."""
+    logger.debug("wait_for_perch: sim=%s, max_steps=%s", sim, max_steps)
     for step in range(max_steps):
         obs = sim.get_observations()[0]
         phase = get_dragon_phase(obs)
@@ -133,6 +142,7 @@ def wait_for_perch(sim: mc189_core.MC189Simulator, max_steps: int = 10000) -> bo
 
 def test_time_penalty():
     """Test that time penalty is applied each tick."""
+    logger.debug("test_time_penalty called")
     print("\n" + "=" * 60)
     print("TEST: Time Penalty (-0.001 per tick)")
     print("=" * 60)
@@ -159,6 +169,7 @@ def test_time_penalty():
 
 def test_dragon_damage_reward():
     """Test reward for dealing damage to vulnerable dragon."""
+    logger.debug("test_dragon_damage_reward called")
     print("\n" + "=" * 60)
     print("TEST: Dragon Damage Reward (damage * 2.0)")
     print("=" * 60)
@@ -208,6 +219,7 @@ def test_dragon_damage_reward():
 
 def test_critical_hit_bonus():
     """Test critical hit bonus (+2.0) when falling."""
+    logger.debug("test_critical_hit_bonus called")
     print("\n" + "=" * 60)
     print("TEST: Critical Hit Bonus (+2.0)")
     print("=" * 60)
@@ -219,6 +231,7 @@ def test_critical_hit_bonus():
 
 def test_crystal_destruction_reward():
     """Test reward for destroying end crystal (+10.0)."""
+    logger.debug("test_crystal_destruction_reward called")
     print("\n" + "=" * 60)
     print("TEST: Crystal Destruction Reward (+10.0)")
     print("=" * 60)
@@ -229,6 +242,7 @@ def test_crystal_destruction_reward():
 
 def test_dragon_death_reward():
     """Test massive reward for killing dragon (+1000.0)."""
+    logger.debug("test_dragon_death_reward called")
     print("\n" + "=" * 60)
     print("TEST: Dragon Death WIN Reward (+1000.0)")
     print("=" * 60)
@@ -297,6 +311,7 @@ def test_dragon_death_reward():
 
 def test_player_death_penalty():
     """Test penalty for player death (-50.0)."""
+    logger.debug("test_player_death_penalty called")
     print("\n" + "=" * 60)
     print("TEST: Player Death Penalty (-50.0)")
     print("=" * 60)
@@ -347,6 +362,7 @@ def test_player_death_penalty():
 
 def test_perching_proximity_bonus():
     """Test small bonus for being close to perching dragon (+0.01)."""
+    logger.debug("test_perching_proximity_bonus called")
     print("\n" + "=" * 60)
     print("TEST: Perching Proximity Bonus (+0.01)")
     print("=" * 60)
@@ -389,6 +405,7 @@ def test_perching_proximity_bonus():
 
 def test_non_vulnerable_hit_reward():
     """Test small reward for hitting non-vulnerable dragon (+0.1)."""
+    logger.debug("test_non_vulnerable_hit_reward called")
     print("\n" + "=" * 60)
     print("TEST: Non-Vulnerable Hit Reward (+0.1)")
     print("=" * 60)
@@ -431,6 +448,7 @@ def test_non_vulnerable_hit_reward():
 
 def main():
     """Run all reward signal tests."""
+    logger.debug("main called")
     print("=" * 60)
     print("MINECRAFT DRAGON FIGHT REWARD SIGNAL VERIFICATION")
     print("=" * 60)

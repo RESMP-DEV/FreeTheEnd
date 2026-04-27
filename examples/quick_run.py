@@ -14,6 +14,10 @@ sys.path.insert(0, str(_EXAMPLES_DIR.parent / "cpp" / "build"))
 
 from minecraft_sim.backend import VulkanBackend
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 print("=== MC189 Quick Training Run ===")
 print()
 

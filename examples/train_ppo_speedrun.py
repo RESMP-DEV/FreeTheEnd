@@ -613,6 +613,11 @@ def train(config: TrainingConfig, resume_path: str | None = None) -> None:
             progress_bar=True,
         )
     except KeyboardInterrupt:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         print("\nTraining interrupted by user.")
     finally:
         # Save final model and curriculum state

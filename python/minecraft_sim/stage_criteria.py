@@ -3,6 +3,10 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class StageCriteria:
@@ -26,16 +30,19 @@ class StageCriteria:
 
     def check_success(self, state: dict) -> bool:
         """Check if all required criteria are met."""
+        logger.debug("StageCriteria.check_success: state=%s", state)
         return all(cond(state) for cond in self.required)
 
     def get_partial_progress(self, state: dict) -> float:
         """Get fraction of required criteria met (0.0 - 1.0)."""
+        logger.debug("StageCriteria.get_partial_progress: state=%s", state)
         if not self.required:
             return 1.0
         return sum(1 for cond in self.required if cond(state)) / len(self.required)
 
     def get_optional_progress(self, state: dict) -> float:
         """Get fraction of optional criteria met (0.0 - 1.0)."""
+        logger.debug("StageCriteria.get_optional_progress: state=%s", state)
         if not self.optional:
             return 0.0
         return sum(1 for cond in self.optional if cond(state)) / len(self.optional)
@@ -43,14 +50,17 @@ class StageCriteria:
 
 # Helper functions for cleaner lambda definitions
 def _has_item(state: dict, item: str, count: int = 1) -> bool:
+    logger.debug("_has_item: state=%s, item=%s, count=%s", state, item, count)
     return state.get("inventory", {}).get(item, 0) >= count
 
 
 def _has_flag(state: dict, flag: str) -> bool:
+    logger.debug("_has_flag: state=%s, flag=%s", state, flag)
     return state.get(flag, False)
 
 
 def _has_count(state: dict, key: str, count: int) -> bool:
+    logger.debug("_has_count: state=%s, key=%s, count=%s", state, key, count)
     return state.get(key, 0) >= count
 
 
@@ -151,11 +161,13 @@ STAGE_CRITERIA: dict[int, StageCriteria] = {
 
 def get_stage_criteria(stage_id: int) -> StageCriteria | None:
     """Get criteria for a specific stage."""
+    logger.debug("get_stage_criteria: stage_id=%s", stage_id)
     return STAGE_CRITERIA.get(stage_id)
 
 
 def get_all_stages() -> list[StageCriteria]:
     """Get all stage criteria in order."""
+    logger.debug("get_all_stages called")
     return [STAGE_CRITERIA[i] for i in sorted(STAGE_CRITERIA.keys())]
 
 
@@ -164,6 +176,7 @@ def calculate_total_progress(state: dict, current_stage: int) -> float:
 
     Completed stages count as 1.0, current stage uses partial progress.
     """
+    logger.debug("calculate_total_progress: state=%s, current_stage=%s", state, current_stage)
     total_stages = len(STAGE_CRITERIA)
     completed = current_stage - 1
     current_criteria = STAGE_CRITERIA.get(current_stage)

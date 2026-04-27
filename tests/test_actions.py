@@ -5,6 +5,11 @@ from __future__ import annotations
 import numpy as np
 
 from minecraft_sim.actions import (
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     PITCH_DELTAS,
     YAW_DELTAS,
     ActionMask,

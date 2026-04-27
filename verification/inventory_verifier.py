@@ -1081,6 +1081,10 @@ class InventoryVerifier:
         """
         from verification.inventory_test_generator import InventoryTestGenerator
 
+import logging
+
+logger = logging.getLogger(__name__)
+
         generator = InventoryTestGenerator(items=self.items, seed=42)
         all_suites = generator.generate_all_tests()
 

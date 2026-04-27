@@ -16,6 +16,11 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from .mc189_constants import (
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     AIR_ACCELERATION,
     DRAG_AIR,
     DRAG_GROUND,

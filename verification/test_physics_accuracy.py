@@ -69,6 +69,11 @@ def get_simulator():
 
         return mc189_core
     except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         pytest.skip("mc189_core not available (GPU simulator not built)")
 
 

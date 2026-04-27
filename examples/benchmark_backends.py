@@ -91,6 +91,11 @@ def main() -> None:
         if not hasattr(cfg, "use_cpu"):
             print("\nNote: CPU backend not available (Phase 5 not yet implemented).")
     except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         print("\nNote: mc189_core not importable. Build the C++ extension first.")
         print("  cd contrib/minecraft_sim/cpp && mkdir -p build && cd build")
         print("  cmake .. && make -j$(nproc)")

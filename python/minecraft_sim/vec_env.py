@@ -54,6 +54,11 @@ if mc189_core is None:
     except Exception:
         pass
     except Exception:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         pass
 
 

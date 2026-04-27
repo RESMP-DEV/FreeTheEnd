@@ -11,6 +11,10 @@ Tests:
 from dataclasses import dataclass
 from enum import Enum
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class EffectCategory(Enum):
     """Categories of status effects."""
@@ -86,6 +90,7 @@ class StatusEffect:
     @property
     def display_level(self) -> str:
         """Convert amplifier to Roman numeral display."""
+        logger.debug("StatusEffect.display_level called")
         numerals = ["I", "II", "III", "IV", "V"]
         return numerals[min(self.max_amplifier, 4)]
 
@@ -457,15 +462,18 @@ class ActiveEffect:
     @property
     def level(self) -> int:
         """Human-readable level (1-256)."""
+        logger.debug("ActiveEffect.level called")
         return self.amplifier + 1
 
     @property
     def remaining_seconds(self) -> float:
         """Duration in seconds."""
+        logger.debug("ActiveEffect.remaining_seconds called")
         return self.duration_ticks / 20.0
 
     def tick(self) -> bool:
         """Advance one tick. Returns False if effect expired."""
+        logger.debug("ActiveEffect.tick called")
         if self.effect.is_instant:
             return False
         self.duration_ticks -= 1
@@ -476,6 +484,7 @@ class EffectManager:
     """Manages active effects on an entity."""
 
     def __init__(self):
+        logger.info("EffectManager.__init__ called")
         self.active_effects: dict[EffectType, ActiveEffect] = {}
 
     def apply_effect(
@@ -486,6 +495,7 @@ class EffectManager:
         show_particles: bool = True,
     ) -> bool:
         """Apply or upgrade an effect. Returns True if effect was applied/upgraded."""
+        logger.debug("EffectManager.apply_effect: effect_type=%s, amplifier=%s, duration_ticks=%s, show_particles=%s", effect_type, amplifier, duration_ticks, show_particles)
         if effect_type not in STATUS_EFFECTS:
             return False
 
@@ -514,6 +524,7 @@ class EffectManager:
 
     def remove_effect(self, effect_type: EffectType) -> bool:
         """Remove an effect. Returns True if effect was removed."""
+        logger.debug("EffectManager.remove_effect: effect_type=%s", effect_type)
         if effect_type in self.active_effects:
             del self.active_effects[effect_type]
             return True
@@ -521,6 +532,7 @@ class EffectManager:
 
     def clear_effects(self, category: EffectCategory | None = None) -> int:
         """Clear effects by category. Returns count removed."""
+        logger.debug("EffectManager.clear_effects: category=%s", category)
         to_remove = []
         for et, ae in self.active_effects.items():
             if category is None or ae.effect.category == category:
@@ -534,15 +546,18 @@ class StatusEffectsVerifier:
     """Verification suite for status effect mechanics."""
 
     def __init__(self):
+        logger.info("StatusEffectsVerifier.__init__ called")
         self.results: list[tuple[str, bool, str]] = []
 
     def verify(self, name: str, condition: bool, message: str = "") -> bool:
         """Record verification result."""
+        logger.debug("StatusEffectsVerifier.verify: name=%s, condition=%s, message=%s", name, condition, message)
         self.results.append((name, condition, message))
         return condition
 
     def run_all(self) -> dict[str, bool | int | list[tuple[str, bool, str]]]:
         """Run all verification tests."""
+        logger.debug("StatusEffectsVerifier.run_all called")
         self.results.clear()
 
         self._verify_all_effects_defined()
@@ -568,6 +583,7 @@ class StatusEffectsVerifier:
 
     def _verify_all_effects_defined(self) -> None:
         """Verify all effect types have definitions."""
+        logger.debug("StatusEffectsVerifier._verify_all_effects_defined called")
         for effect_type in EffectType:
             defined = effect_type in STATUS_EFFECTS
             self.verify(
@@ -578,6 +594,7 @@ class StatusEffectsVerifier:
 
     def _verify_categories(self) -> None:
         """Verify effect categorization."""
+        logger.debug("StatusEffectsVerifier._verify_categories called")
         beneficial = [
             et for et, e in STATUS_EFFECTS.items() if e.category == EffectCategory.BENEFICIAL
         ]
@@ -615,6 +632,7 @@ class StatusEffectsVerifier:
     def _verify_amplifier_limits(self) -> None:
         """Verify amplifier limits are appropriate."""
         # Binary effects (on/off) should have max_amplifier = 0
+        logger.debug("StatusEffectsVerifier._verify_amplifier_limits called")
         binary_effects = [
             EffectType.FIRE_RESISTANCE,
             EffectType.WATER_BREATHING,
@@ -641,6 +659,7 @@ class StatusEffectsVerifier:
 
     def _verify_instant_effects(self) -> None:
         """Verify instant effect behavior."""
+        logger.debug("StatusEffectsVerifier._verify_instant_effects called")
         instant_effects = [
             EffectType.INSTANT_HEALTH,
             EffectType.INSTANT_DAMAGE,
@@ -667,6 +686,7 @@ class StatusEffectsVerifier:
 
     def _verify_duration_mechanics(self) -> None:
         """Verify duration tick mechanics."""
+        logger.debug("StatusEffectsVerifier._verify_duration_mechanics called")
         manager = EffectManager()
         manager.apply_effect(EffectType.SPEED, amplifier=0, duration_ticks=100)
 
@@ -697,6 +717,7 @@ class StatusEffectsVerifier:
 
     def _verify_stacking_behavior(self) -> None:
         """Verify effect stacking and upgrade rules."""
+        logger.debug("StatusEffectsVerifier._verify_stacking_behavior called")
         manager = EffectManager()
 
         # Apply level I
@@ -736,6 +757,7 @@ class StatusEffectsVerifier:
     def _verify_opposing_effects(self) -> None:
         """Verify opposing effect relationships."""
         # Speed vs Slowness - both can coexist in Minecraft
+        logger.debug("StatusEffectsVerifier._verify_opposing_effects called")
         manager = EffectManager()
         manager.apply_effect(EffectType.SPEED, amplifier=1, duration_ticks=100)
         manager.apply_effect(EffectType.SLOWNESS, amplifier=0, duration_ticks=100)
@@ -759,6 +781,7 @@ class StatusEffectsVerifier:
 
     def _verify_potion_durations(self) -> None:
         """Verify standard potion durations."""
+        logger.debug("StatusEffectsVerifier._verify_potion_durations called")
         self.verify(
             "normal_potion_3min",
             POTION_DURATIONS["normal"] == 3600,
@@ -783,6 +806,7 @@ class StatusEffectsVerifier:
     def _verify_beacon_durations(self) -> None:
         """Verify beacon effect durations by pyramid level."""
         # Durations should increase with pyramid level
+        logger.debug("StatusEffectsVerifier._verify_beacon_durations called")
         levels = sorted(BEACON_DURATIONS.keys())
         for i in range(1, len(levels)):
             prev_lvl = levels[i - 1]
@@ -803,6 +827,7 @@ class StatusEffectsVerifier:
 
 def verify_status_effects() -> dict:
     """Run full status effects verification."""
+    logger.debug("verify_status_effects called")
     verifier = StatusEffectsVerifier()
     return verifier.run_all()
 

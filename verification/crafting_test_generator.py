@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class RecipeType(Enum):
     """Type of crafting recipe."""
@@ -33,6 +37,7 @@ class Ingredient:
     count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
+        logger.debug("Ingredient.to_dict called")
         return {"item_id": self.item_id, "count": self.count}
 
 
@@ -50,12 +55,14 @@ class Recipe:
 
     def total_ingredient_cost(self) -> dict[str, int]:
         """Calculate total ingredient cost."""
+        logger.debug("Recipe.total_ingredient_cost called")
         cost: dict[str, int] = {}
         for ing in self.ingredients:
             cost[ing.item_id] = cost.get(ing.item_id, 0) + ing.count
         return cost
 
     def to_dict(self) -> dict[str, Any]:
+        logger.debug("Recipe.to_dict called")
         return {
             "recipe_id": self.recipe_id,
             "recipe_type": self.recipe_type.name,
@@ -81,6 +88,7 @@ class CraftingTestCase:
     expected_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        logger.debug("CraftingTestCase.to_dict called")
         return {
             "name": self.name,
             "description": self.description,
@@ -100,9 +108,11 @@ class CraftingTestSuite:
     test_cases: list[CraftingTestCase] = field(default_factory=list)
 
     def add_test(self, test: CraftingTestCase) -> None:
+        logger.debug("CraftingTestSuite.add_test: test=%s", test)
         self.test_cases.append(test)
 
     def to_dict(self) -> dict[str, Any]:
+        logger.debug("CraftingTestSuite.to_dict called")
         return {
             "name": self.name,
             "test_count": len(self.test_cases),
@@ -508,11 +518,13 @@ class CraftingTestGenerator:
             recipes: Crafting recipes to test. Defaults to SPEEDRUN_RECIPES.
             smelting_recipes: Smelting recipes to test. Defaults to SMELTING_RECIPES.
         """
+        logger.info("CraftingTestGenerator.__init__: recipes=%s, smelting_recipes=%s", recipes, smelting_recipes)
         self.recipes = recipes or SPEEDRUN_RECIPES
         self.smelting_recipes = smelting_recipes or SMELTING_RECIPES
 
     def generate_recipe_correctness_tests(self) -> CraftingTestSuite:
         """Generate tests verifying all recipes produce correct output."""
+        logger.debug("CraftingTestGenerator.generate_recipe_correctness_tests called")
         suite = CraftingTestSuite("Recipe Correctness")
 
         for recipe_id, recipe in self.recipes.items():
@@ -545,6 +557,7 @@ class CraftingTestGenerator:
 
     def generate_ingredient_consumption_tests(self) -> CraftingTestSuite:
         """Generate tests verifying exact ingredient consumption."""
+        logger.debug("CraftingTestGenerator.generate_ingredient_consumption_tests called")
         suite = CraftingTestSuite("Ingredient Consumption")
 
         for recipe_id, recipe in self.recipes.items():
@@ -603,6 +616,7 @@ class CraftingTestGenerator:
 
     def generate_insufficient_ingredients_tests(self) -> CraftingTestSuite:
         """Generate tests for crafting with insufficient ingredients."""
+        logger.debug("CraftingTestGenerator.generate_insufficient_ingredients_tests called")
         suite = CraftingTestSuite("Insufficient Ingredients")
 
         # Test each recipe with missing ingredients
@@ -675,6 +689,7 @@ class CraftingTestGenerator:
 
     def generate_shaped_recipe_tests(self) -> CraftingTestSuite:
         """Generate tests for shaped recipe pattern matching."""
+        logger.debug("CraftingTestGenerator.generate_shaped_recipe_tests called")
         suite = CraftingTestSuite("Shaped Recipe Patterns")
 
         # Test correct patterns
@@ -773,6 +788,7 @@ class CraftingTestGenerator:
 
     def generate_shapeless_recipe_tests(self) -> CraftingTestSuite:
         """Generate tests for shapeless recipe flexibility."""
+        logger.debug("CraftingTestGenerator.generate_shapeless_recipe_tests called")
         suite = CraftingTestSuite("Shapeless Recipe Flexibility")
 
         shapeless_recipes = {
@@ -873,6 +889,7 @@ class CraftingTestGenerator:
 
     def generate_multi_output_tests(self) -> CraftingTestSuite:
         """Generate tests for recipes with multiple output items."""
+        logger.debug("CraftingTestGenerator.generate_multi_output_tests called")
         suite = CraftingTestSuite("Multi-Output Recipes")
 
         multi_output_recipes = {k: v for k, v in self.recipes.items() if v.output_count > 1}
@@ -1001,6 +1018,7 @@ class CraftingTestGenerator:
 
     def generate_smelting_tests(self) -> CraftingTestSuite:
         """Generate tests for furnace smelting recipes."""
+        logger.debug("CraftingTestGenerator.generate_smelting_tests called")
         suite = CraftingTestSuite("Smelting Recipes")
 
         for recipe_id, recipe in self.smelting_recipes.items():
@@ -1053,6 +1071,7 @@ class CraftingTestGenerator:
 
     def generate_all_tests(self) -> dict[str, CraftingTestSuite]:
         """Generate all test suites."""
+        logger.debug("CraftingTestGenerator.generate_all_tests called")
         return {
             "recipe_correctness": self.generate_recipe_correctness_tests(),
             "ingredient_consumption": self.generate_ingredient_consumption_tests(),
@@ -1065,6 +1084,7 @@ class CraftingTestGenerator:
 
     def export_tests(self, filepath: str) -> None:
         """Export all tests to JSON file."""
+        logger.debug("CraftingTestGenerator.export_tests: filepath=%s", filepath)
         all_suites = self.generate_all_tests()
         export_data = {suite_name: suite.to_dict() for suite_name, suite in all_suites.items()}
 
@@ -1081,11 +1101,13 @@ class CraftingTestGenerator:
 
     def get_test_count(self) -> dict[str, int]:
         """Get count of tests per suite."""
+        logger.debug("CraftingTestGenerator.get_test_count called")
         all_suites = self.generate_all_tests()
         return {name: len(suite.test_cases) for name, suite in all_suites.items()}
 
     def _build_inventory_with_ingredients(self, recipe: Recipe, extra: int = 0) -> dict[str, int]:
         """Build inventory dict with required ingredients."""
+        logger.debug("CraftingTestGenerator._build_inventory_with_ingredients: recipe=%s, extra=%s", recipe, extra)
         inv: dict[str, int] = {}
         for ing in recipe.ingredients:
             inv[ing.item_id] = inv.get(ing.item_id, 0) + ing.count + extra
@@ -1093,6 +1115,7 @@ class CraftingTestGenerator:
 
     def _build_crafting_grid(self, recipe: Recipe) -> list[list[str | None]]:
         """Build a 3x3 crafting grid from recipe pattern."""
+        logger.debug("CraftingTestGenerator._build_crafting_grid: recipe=%s", recipe)
         grid: list[list[str | None]] = [[None, None, None] for _ in range(3)]
 
         if not recipe.pattern or not recipe.key:
@@ -1117,6 +1140,7 @@ class CraftingTestGenerator:
 
     def _rotate_pattern(self, recipe: Recipe) -> list[list[str | None]]:
         """Rotate a crafting grid 90 degrees for testing wrong patterns."""
+        logger.debug("CraftingTestGenerator._rotate_pattern: recipe=%s", recipe)
         original = self._build_crafting_grid(recipe)
         # Rotate 90 degrees clockwise
         rotated: list[list[str | None]] = [[None, None, None] for _ in range(3)]
@@ -1128,6 +1152,7 @@ class CraftingTestGenerator:
 
 def main() -> None:
     """Run test generation and display summary."""
+    logger.debug("main called")
     generator = CraftingTestGenerator()
 
     print("Crafting Test Generator")

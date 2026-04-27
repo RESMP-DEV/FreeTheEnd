@@ -31,6 +31,10 @@ from stable_baselines3.common.vec_env import VecNormalize
 from minecraft_sim.curriculum import StageID
 from minecraft_sim.speedrun_vec_env import make_speedrun_vec_env
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def evaluate_model(model_path: str, vecnorm_path: str, num_episodes: int = 100):
     """Evaluate a trained model.
@@ -43,6 +47,7 @@ def evaluate_model(model_path: str, vecnorm_path: str, num_episodes: int = 100):
     Returns:
         Dictionary of evaluation metrics
     """
+    logger.debug("evaluate_model: model_path=%s, vecnorm_path=%s, num_episodes=%s", model_path, vecnorm_path, num_episodes)
     print("=" * 60)
     print("Stage 1 Model Evaluation")
     print("=" * 60)
@@ -152,6 +157,7 @@ def evaluate_model(model_path: str, vecnorm_path: str, num_episodes: int = 100):
 def print_results(summary: dict, action_pct: np.ndarray):
     """Print formatted evaluation results."""
 
+    logger.debug("print_results: summary=%s, action_pct=%s", summary, action_pct)
     ACTION_NAMES = [
         "NOOP",
         "FORWARD",
@@ -224,6 +230,7 @@ def print_results(summary: dict, action_pct: np.ndarray):
 
 
 def main():
+    logger.debug("main called")
     output_dir = Path(__file__).parent.parent
     model_path = output_dir / "models" / "stage1_basic_survival.zip"
     vecnorm_path = output_dir / "models" / "stage1_vecnormalize.pkl"

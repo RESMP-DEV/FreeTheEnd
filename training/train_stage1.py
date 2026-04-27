@@ -41,8 +41,13 @@ from stable_baselines3.common.vec_env import VecNormalize
 from minecraft_sim.curriculum import StageID
 from minecraft_sim.speedrun_vec_env import make_speedrun_vec_env
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def main():
+    logger.debug("main called")
     print("=" * 60)
     print("Stage 1: Basic Survival Training")
     print("=" * 60)

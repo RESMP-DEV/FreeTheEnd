@@ -613,6 +613,11 @@ def get_version_info() -> dict[str, str]:
 
         info["numpy"] = numpy.__version__
     except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         info["numpy"] = "not installed"
 
     return info

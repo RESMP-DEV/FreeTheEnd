@@ -5,6 +5,10 @@ import json
 import shutil
 from pathlib import Path
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 workspace = Path(__file__).parent.parent / "agent_workspace"
 mc_dir = workspace / "minecraft_combat_sim"
 
@@ -71,6 +75,7 @@ mc_keywords = [
 
 
 def is_minecraft_related(filepath):
+    logger.debug("is_minecraft_related: filepath=%s", filepath)
     name = filepath.name.lower()
     return any(kw in name for kw in mc_keywords)
 

@@ -6,6 +6,10 @@ from pathlib import Path
 import yaml
 from alphaheng.coordinator.task_queue import Priority, Task, TaskQueue
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 q = TaskQueue(redis_url="redis://localhost:6379")
 tasks_dir = Path("contrib/minecraft_sim/tasks")
 

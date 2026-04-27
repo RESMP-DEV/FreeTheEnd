@@ -22,6 +22,11 @@ _SHADER_DIR = _SIM_ROOT / "cpp" / "shaders"
 try:
     import minecraft_sim  # noqa: F401
 except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     if _PYTHON_DIR.exists():
         sys.path.insert(0, str(_PYTHON_DIR))
     if _CPP_BUILD_DIR.exists():

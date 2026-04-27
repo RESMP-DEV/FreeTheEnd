@@ -204,6 +204,10 @@ def verify_implementation(
     """
     import random
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     random.seed(seed)
 
     results = []

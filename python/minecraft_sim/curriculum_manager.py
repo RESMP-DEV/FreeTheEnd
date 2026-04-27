@@ -18,6 +18,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class StageOverride:
@@ -71,6 +75,7 @@ class StageStats:
     @property
     def success_rate(self) -> float:
         """Calculate overall success rate for this stage."""
+        logger.debug("StageStats.success_rate called")
         if self.total_episodes == 0:
             return 0.0
         return self.total_successes / self.total_episodes
@@ -78,6 +83,7 @@ class StageStats:
     @property
     def avg_reward(self) -> float:
         """Calculate average reward per episode."""
+        logger.debug("StageStats.avg_reward called")
         if self.total_episodes == 0:
             return 0.0
         return self.total_reward / self.total_episodes
@@ -151,6 +157,7 @@ class VecCurriculumManager:
         enable_regression: bool = False,
         stage_overrides: dict[int, StageOverride] | None = None,
     ) -> None:
+        logger.info("VecCurriculumManager.__init__: num_envs=%s, min_stage=%s, max_stage=%s, advancement_threshold=%s", num_envs, min_stage, max_stage, advancement_threshold)
         self.num_envs = num_envs
         self.min_stage = min_stage
         self.max_stage = max_stage
@@ -229,6 +236,7 @@ class VecCurriculumManager:
         Returns:
             True if the environment advanced to a new stage.
         """
+        logger.debug("VecCurriculumManager.update: env_id=%s, success=%s, stage=%s, reward=%s", env_id, success, stage, reward)
         self._total_episodes += 1
         self._env_episode_counts[env_id] += 1
         self._env_episodes_at_stage[env_id] += 1
@@ -294,6 +302,7 @@ class VecCurriculumManager:
         Returns:
             Boolean array indicating which envs advanced.
         """
+        logger.debug("VecCurriculumManager.update_batch: env_ids=%s, successes=%s, stages=%s, rewards=%s", env_ids, successes, stages, rewards)
         n = len(env_ids)
         if stages is None:
             stages = self.env_stages[env_ids]
@@ -324,6 +333,7 @@ class VecCurriculumManager:
         Returns:
             Minimum episodes required, using per-stage override if set.
         """
+        logger.debug("VecCurriculumManager._get_stage_min_episodes: stage=%s", stage)
         override = self.stage_overrides.get(stage)
         if override is not None and override.min_episodes_to_advance is not None:
             return override.min_episodes_to_advance
@@ -338,6 +348,7 @@ class VecCurriculumManager:
         Returns:
             Advancement threshold, using per-stage override if set.
         """
+        logger.debug("VecCurriculumManager._get_stage_threshold: stage=%s", stage)
         override = self.stage_overrides.get(stage)
         if override is not None and override.advancement_threshold is not None:
             return override.advancement_threshold
@@ -360,6 +371,7 @@ class VecCurriculumManager:
         Returns:
             True if advancement occurred.
         """
+        logger.debug("VecCurriculumManager._check_advancement: env_id=%s, current_stage=%s", env_id, current_stage)
         if current_stage >= self.max_stage:
             return False
 
@@ -464,6 +476,7 @@ class VecCurriculumManager:
         Returns:
             True if regression occurred.
         """
+        logger.debug("VecCurriculumManager._check_regression: env_id=%s, current_stage=%s", env_id, current_stage)
         if current_stage <= self.min_stage:
             return False
 
@@ -507,6 +520,7 @@ class VecCurriculumManager:
         Returns:
             Current stage ID.
         """
+        logger.debug("VecCurriculumManager.get_stage: env_id=%s", env_id)
         return int(self.env_stages[env_id])
 
     def get_stages(self) -> NDArray[np.int32]:
@@ -515,6 +529,7 @@ class VecCurriculumManager:
         Returns:
             Array of stage IDs, shape (num_envs,).
         """
+        logger.debug("VecCurriculumManager.get_stages called")
         return self.env_stages.copy()
 
     def set_stage(self, env_id: int, stage: int) -> None:
@@ -524,6 +539,7 @@ class VecCurriculumManager:
             env_id: Environment ID.
             stage: Stage to set.
         """
+        logger.debug("VecCurriculumManager.set_stage: env_id=%s, stage=%s", env_id, stage)
         self.env_stages[env_id] = np.clip(stage, self.min_stage, self.max_stage)
         self._env_episodes_at_stage[env_id] = 0
         self._env_recent_success[env_id].clear()
@@ -536,6 +552,7 @@ class VecCurriculumManager:
         Args:
             stage: Stage to set.
         """
+        logger.debug("VecCurriculumManager.set_all_stages: stage=%s", stage)
         self.env_stages.fill(np.clip(stage, self.min_stage, self.max_stage))
         self._env_episodes_at_stage.fill(0)
         self._env_metric_values.fill(0.0)
@@ -549,6 +566,7 @@ class VecCurriculumManager:
         Returns:
             Dictionary with stage distribution, success rates, and stats.
         """
+        logger.debug("VecCurriculumManager.get_stats called")
         stage_distribution = Counter(self.env_stages.tolist())
 
         success_rates = {}
@@ -588,6 +606,7 @@ class VecCurriculumManager:
         Returns:
             List of recent AdvancementEvent objects.
         """
+        logger.debug("VecCurriculumManager.get_recent_advancements: n=%s", n)
         return self.advancement_history[-n:]
 
     def get_stage_summary(self) -> str:
@@ -596,6 +615,7 @@ class VecCurriculumManager:
         Returns:
             Formatted string with stage distribution and rates.
         """
+        logger.debug("VecCurriculumManager.get_stage_summary called")
         dist = Counter(self.env_stages.tolist())
         lines = [f"Curriculum Summary ({self.num_envs} envs, {self._total_episodes} episodes):"]
 
@@ -610,6 +630,7 @@ class VecCurriculumManager:
 
     def reset(self) -> None:
         """Reset all curriculum state."""
+        logger.debug("VecCurriculumManager.reset called")
         self.env_stages.fill(self.min_stage)
         self._env_episode_counts.fill(0)
         self._env_episodes_at_stage.fill(0)
@@ -634,6 +655,7 @@ class VecCurriculumManager:
         Returns:
             Dictionary containing all state needed to restore.
         """
+        logger.debug("VecCurriculumManager.save_state called")
         return {
             "env_stages": self.env_stages.tolist(),
             "env_episode_counts": self._env_episode_counts.tolist(),
@@ -671,6 +693,7 @@ class VecCurriculumManager:
         Args:
             state: Dictionary from save_state().
         """
+        logger.info("VecCurriculumManager.load_state: state=%s", state)
         self.env_stages = np.array(state["env_stages"], dtype=np.int32)
         self._env_episode_counts = np.array(state["env_episode_counts"], dtype=np.int32)
         self._env_episodes_at_stage = np.array(state["env_episodes_at_stage"], dtype=np.int32)
@@ -723,6 +746,7 @@ def create_vec_curriculum_with_stage1_overrides(
     Returns:
         Configured VecCurriculumManager with Stage 1 overrides applied.
     """
+    logger.info("create_vec_curriculum_with_stage1_overrides: num_envs=%s, stage1_metadata=%s, stage1_min_episodes=%s", num_envs, stage1_metadata, stage1_min_episodes)
     threshold_override: float | None = None
     if stage1_metadata is not None:
         threshold_override = stage1_metadata.get("curriculum_threshold")
@@ -777,6 +801,7 @@ def create_vec_curriculum_with_stage_overrides(
         Configured VecCurriculumManager with Stage 1 and Stage 2 overrides.
     """
     # Stage 1 override
+    logger.info("create_vec_curriculum_with_stage_overrides: num_envs=%s, stage1_metadata=%s, stage2_metadata=%s, stage1_min_episodes=%s", num_envs, stage1_metadata, stage2_metadata, stage1_min_episodes)
     s1_threshold: float | None = None
     if stage1_metadata is not None:
         s1_threshold = stage1_metadata.get("curriculum_threshold")

@@ -1733,6 +1733,11 @@ def ghast_shaper():
 
         return create_stage3_reward_shaper()
     except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         pytest.skip(f"create_stage3_reward_shaper not available: {e}")
 
 

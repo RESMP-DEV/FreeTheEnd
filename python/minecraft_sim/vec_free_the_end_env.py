@@ -51,6 +51,11 @@ if mc189_core is None:
                 mc189_core = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mc189_core)
     except Exception:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         pass
 
 

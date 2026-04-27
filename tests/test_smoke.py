@@ -250,6 +250,11 @@ def test_sb3_env() -> None:
     try:
         env = SB3VecDragonFightEnv(num_envs=4)
     except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         pytest.skip("mc189_core C++ extension not available")
 
     try:

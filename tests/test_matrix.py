@@ -324,6 +324,11 @@ class TestBoundaryConditions:
             obs = sim.get_observations()
             assert not np.any(np.isnan(obs))
         except (ValueError, RuntimeError):
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             pass  # Expected behavior for invalid actions
 
     def test_observation_normalized_range(self, make_simulator):

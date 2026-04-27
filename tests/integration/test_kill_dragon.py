@@ -174,6 +174,10 @@ for step in range(max_steps):
                     print(f"  Perch attacks: {perch_count}")
                     import sys
 
+import logging
+
+logger = logging.getLogger(__name__)
+
                     sys.exit(0)
 
                 # Wait for cooldown

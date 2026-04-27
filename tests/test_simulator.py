@@ -35,6 +35,11 @@ try:
     HAS_MC189_CORE = True
     _import_error = ""
 except ImportError as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     HAS_MC189_CORE = False
     mc189_core = None
     _import_error = str(e)

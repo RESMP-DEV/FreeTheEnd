@@ -115,6 +115,7 @@ class ProgressWatchdog:
     """
 
     def __init__(self, config: StallAlertConfig | None = None) -> None:
+        logger.info("ProgressWatchdog.__init__: config=%s", config)
         self.config = config or StallAlertConfig()
         self._envs: dict[int, _EnvTrackingState] = {}
         self._total_alerts: int = 0
@@ -122,6 +123,7 @@ class ProgressWatchdog:
 
     def _get_env_state(self, env_id: int) -> _EnvTrackingState:
         """Get or create tracking state for an environment."""
+        logger.debug("ProgressWatchdog._get_env_state: env_id=%s", env_id)
         if env_id not in self._envs:
             self._envs[env_id] = _EnvTrackingState()
         return self._envs[env_id]
@@ -147,6 +149,7 @@ class ProgressWatchdog:
         Returns:
             A StallAlert if a stall was detected, None otherwise.
         """
+        logger.debug("ProgressWatchdog.observe: env_id=%s, progress_snapshot=%s, stage_id=%s", env_id, progress_snapshot, stage_id)
         self._total_observations += 1
         effective_stage = stage_id if stage_id is not None else self.config.target_stage
 
@@ -234,6 +237,7 @@ class ProgressWatchdog:
         Returns:
             List of StallAlerts (may be empty if no stalls detected).
         """
+        logger.debug("ProgressWatchdog.observe_batch: env_ids=%s, progress_snapshots=%s, stage_ids=%s", env_ids, progress_snapshots, stage_ids)
         alerts: list[StallAlert] = []
         for i, (eid, snap) in enumerate(zip(env_ids, progress_snapshots)):
             sid = stage_ids[i] if stage_ids else None
@@ -251,6 +255,7 @@ class ProgressWatchdog:
         Args:
             env_id: Environment ID to reset.
         """
+        logger.debug("ProgressWatchdog.reset_env: env_id=%s", env_id)
         if env_id in self._envs:
             del self._envs[env_id]
 
@@ -263,6 +268,7 @@ class ProgressWatchdog:
         Returns:
             Dictionary with tracking state, or empty dict if untracked.
         """
+        logger.debug("ProgressWatchdog.get_env_status: env_id=%s", env_id)
         if env_id not in self._envs:
             return {}
         state = self._envs[env_id]
@@ -283,6 +289,7 @@ class ProgressWatchdog:
         Returns:
             Dictionary with overall stall detection stats.
         """
+        logger.debug("ProgressWatchdog.get_stats called")
         stalled_envs = [
             eid
             for eid, state in self._envs.items()
@@ -309,6 +316,7 @@ class ProgressWatchdog:
             List of env_ids where obsidian growth has stalled beyond
             the configured window.
         """
+        logger.debug("ProgressWatchdog.get_stalled_envs called")
         return [
             eid
             for eid, state in self._envs.items()

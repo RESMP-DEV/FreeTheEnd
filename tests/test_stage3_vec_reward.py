@@ -97,6 +97,11 @@ def stage3_vec_env():
         )
         return env
     except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         pytest.skip(f"SpeedrunVecEnv not available: {e}")
 
 

@@ -26,6 +26,11 @@ try:
 
     HAS_MC189 = True
 except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     HAS_MC189 = False
     mc189_core = None
 

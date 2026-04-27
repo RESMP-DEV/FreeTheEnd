@@ -8,6 +8,10 @@ from typing import Any
 
 import yaml
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class EnvConfig:
@@ -76,6 +80,7 @@ class TrainingConfig:
     @classmethod
     def from_yaml(cls, path: str | Path) -> TrainingConfig:
         """Load config from YAML file."""
+        logger.debug("TrainingConfig.from_yaml: path=%s", path)
         with open(path) as f:
             data = yaml.safe_load(f)
         return cls.from_dict(data)
@@ -83,6 +88,7 @@ class TrainingConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TrainingConfig:
         """Create config from dictionary."""
+        logger.debug("TrainingConfig.from_dict: data=%s", data)
         config = cls()
 
         # Parse sub-configs
@@ -110,6 +116,7 @@ class TrainingConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
+        logger.debug("TrainingConfig.to_dict called")
         return {
             "env": {
                 "num_envs": self.env.num_envs,
@@ -150,5 +157,6 @@ class TrainingConfig:
 
     def to_yaml(self, path: str | Path) -> None:
         """Save config to YAML file."""
+        logger.debug("TrainingConfig.to_yaml: path=%s", path)
         with open(path, "w") as f:
             yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)

@@ -8,6 +8,10 @@ Run from contrib/minecraft_sim/:
 import mc189_core
 import numpy as np
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Create smaller simulator for debugging
 config = mc189_core.SimulatorConfig()
 config.num_envs = 4

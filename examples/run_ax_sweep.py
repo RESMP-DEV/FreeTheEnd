@@ -149,6 +149,11 @@ def run_sweep(
             print(f"Result: {metrics}")
 
         except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             print(f"Trial failed: {e}")
             ax_client.log_trial_failure(trial_index=trial_index)
 

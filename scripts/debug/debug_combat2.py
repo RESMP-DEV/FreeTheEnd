@@ -8,6 +8,10 @@ Run from contrib/minecraft_sim/:
 import mc189_core
 import numpy as np
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 config = mc189_core.SimulatorConfig()
 config.num_envs = 8
 config.shader_dir = "cpp/shaders"
@@ -21,6 +25,7 @@ actions = np.zeros(8, dtype=np.int32)
 def decode_obs(obs_vec):
     """Decode observation vector with correct normalizations."""
     # Player (indices 0-15)
+    logger.debug("decode_obs: obs_vec=%s", obs_vec)
     px = obs_vec[0] * 100
     py = obs_vec[1] * 50 + 64
     pz = obs_vec[2] * 100

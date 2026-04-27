@@ -24,20 +24,27 @@ sys.path.insert(0, str(_EXAMPLES_DIR.parent / "cpp" / "build"))
 
 from minecraft_sim.backend import VulkanBackend
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class SimplePolicyNet:
     """Simple linear policy for smoke test."""
 
     def __init__(self, obs_dim=48, act_dim=10):
+        logger.info("SimplePolicyNet.__init__: obs_dim=%s, act_dim=%s", obs_dim, act_dim)
         self.weights = np.random.randn(obs_dim, act_dim).astype(np.float32) * 0.01
         self.bias = np.zeros(act_dim, dtype=np.float32)
 
     def forward(self, obs):
         """Returns action logits."""
+        logger.debug("SimplePolicyNet.forward: obs=%s", obs)
         return np.clip(obs @ self.weights + self.bias, -20, 20)
 
     def act(self, obs):
         """Sample actions from policy."""
+        logger.debug("SimplePolicyNet.act: obs=%s", obs)
         logits = self.forward(obs)
         # Stable softmax
         logits = logits - logits.max(axis=1, keepdims=True)
@@ -51,6 +58,7 @@ class SimplePolicyNet:
 
     def update(self, obs, actions, advantages, lr=0.0003):
         """Simple policy gradient update."""
+        logger.debug("SimplePolicyNet.update: obs=%s, actions=%s, advantages=%s, lr=%s", obs, actions, advantages, lr)
         logits = self.forward(obs)
         logits = logits - logits.max(axis=1, keepdims=True)
         exp_logits = np.exp(logits)
@@ -70,14 +78,17 @@ class SimpleValueNet:
     """Simple linear value function."""
 
     def __init__(self, obs_dim=48):
+        logger.info("SimpleValueNet.__init__: obs_dim=%s", obs_dim)
         self.weights = np.random.randn(obs_dim).astype(np.float32) * 0.01
         self.bias = 0.0
 
     def forward(self, obs):
+        logger.debug("SimpleValueNet.forward: obs=%s", obs)
         return np.clip(obs @ self.weights + self.bias, -100, 100)
 
     def update(self, obs, returns, lr=0.001):
         """Simple value function update."""
+        logger.debug("SimpleValueNet.update: obs=%s, returns=%s, lr=%s", obs, returns, lr)
         values = self.forward(obs)
         errors = np.clip(returns - values, -10, 10)
 
@@ -91,6 +102,7 @@ class SimpleValueNet:
 def compute_gae_batched(rewards, values, dones, gamma=0.99, lam=0.95):
     """Compute GAE for all environments in parallel (vectorized)."""
     # rewards, values, dones: (steps, envs)
+    logger.debug("compute_gae_batched: rewards=%s, values=%s, dones=%s, gamma=%s", rewards, values, dones, gamma)
     T, N = rewards.shape
     advantages = np.zeros((T, N), dtype=np.float32)
     last_gae = np.zeros(N, dtype=np.float32)
@@ -110,6 +122,7 @@ def compute_gae_batched(rewards, values, dones, gamma=0.99, lam=0.95):
 
 
 def main():
+    logger.debug("main called")
     print("=" * 60)
     print("MC189 GPU Simulator - PPO Training")
     print("=" * 60)

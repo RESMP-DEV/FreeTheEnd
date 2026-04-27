@@ -258,6 +258,11 @@ class FreeTheEndEnv(gym.Env):
             self._simulator = mc189_core.MC189Simulator(config)
             self._has_simulator = True
         except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             self._simulator = None
             self._has_simulator = False
 

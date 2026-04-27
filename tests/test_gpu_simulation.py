@@ -7,12 +7,17 @@ import pytest
 pytest.importorskip("mc189_core")
 import mc189_core as mc
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 SHADER_DIR = str(Path(__file__).parent.parent / "cpp" / "shaders")
 OBS_SIZE = 48  # Dragon fight observation size
 
 
 def _create_sim(num_envs: int) -> mc.MC189Simulator:
     """Create simulator with proper config API."""
+    logger.info("_create_sim: num_envs=%s", num_envs)
     cfg = mc.SimulatorConfig()
     cfg.num_envs = num_envs
     cfg.shader_dir = SHADER_DIR
@@ -22,12 +27,14 @@ def _create_sim(num_envs: int) -> mc.MC189Simulator:
 
 class TestGPUSimulation:
     def test_observation_shape(self):
+        logger.debug("TestGPUSimulation.test_observation_shape called")
         sim = _create_sim(64)
         sim.reset()
         obs = sim.get_observations()
         assert obs.shape == (64, OBS_SIZE)
 
     def test_step_changes_state(self):
+        logger.debug("TestGPUSimulation.test_step_changes_state called")
         sim = _create_sim(1)
         sim.reset()
         obs1 = sim.get_observations().copy()
@@ -39,6 +46,7 @@ class TestGPUSimulation:
         assert not np.allclose(obs1[0, :3], obs2[0, :3])
 
     def test_damage_reduces_health(self):
+        logger.debug("TestGPUSimulation.test_damage_reduces_health called")
         sim = _create_sim(1)
         sim.reset()
         initial_health = sim.get_observations()[0, 8]
@@ -52,6 +60,7 @@ class TestGPUSimulation:
         assert final_health <= initial_health
 
     def test_throughput_32k_envs(self):
+        logger.debug("TestGPUSimulation.test_throughput_32k_envs called")
         sim = _create_sim(32768)
         sim.reset()
         actions = np.zeros(32768, dtype=np.int32)  # Discrete actions

@@ -15,6 +15,10 @@ from minecraft_sim.observations import (
 )
 from minecraft_sim.progression import ProgressTracker
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _make_compact_vector(
     *,
@@ -41,6 +45,7 @@ def _make_compact_vector(
     dragon_perched: bool = False,
 ) -> np.ndarray:
     """Build a compact 256-float observation vector with specified values."""
+    logger.debug("_make_compact_vector called")
     vec = np.zeros(256, dtype=np.float32)
 
     # Player state (0-31)
@@ -95,11 +100,13 @@ class TestDecodeFlatObservationBasic:
 
     def test_invalid_shape_raises(self) -> None:
         """Non-256 vectors must raise ValueError."""
+        logger.debug("TestDecodeFlatObservationBasic.test_invalid_shape_raises called")
         with pytest.raises(ValueError, match="shape"):
             decode_flat_observation(1, np.zeros(100, dtype=np.float32))
 
     def test_invalid_stage_raises(self) -> None:
         """stage_id outside [1, 6] must raise ValueError."""
+        logger.debug("TestDecodeFlatObservationBasic.test_invalid_stage_raises called")
         vec = np.zeros(256, dtype=np.float32)
         with pytest.raises(ValueError, match="stage_id"):
             decode_flat_observation(0, vec)
@@ -108,6 +115,7 @@ class TestDecodeFlatObservationBasic:
 
     def test_returns_dict_with_required_keys(self) -> None:
         """Result must contain all keys needed by ProgressTracker."""
+        logger.debug("TestDecodeFlatObservationBasic.test_returns_dict_with_required_keys called")
         vec = _make_compact_vector(stage=1)
         result = decode_flat_observation(1, vec)
         assert "player" in result
@@ -119,6 +127,7 @@ class TestDecodeFlatObservationBasic:
 
     def test_player_has_required_fields(self) -> None:
         """Player dict must contain health and dimension."""
+        logger.debug("TestDecodeFlatObservationBasic.test_player_has_required_fields called")
         vec = _make_compact_vector(health=15.0, dimension=0)
         result = decode_flat_observation(1, vec)
         player = result["player"]
@@ -128,6 +137,7 @@ class TestDecodeFlatObservationBasic:
 
     def test_dimension_extraction(self) -> None:
         """Dimension is correctly extracted from one-hot encoding."""
+        logger.debug("TestDecodeFlatObservationBasic.test_dimension_extraction called")
         for dim in (0, 1, 2):
             vec = _make_compact_vector(dimension=dim)
             result = decode_flat_observation(1, vec)
@@ -140,12 +150,14 @@ class TestDecodeFlatObservationStage1:
 
     def test_wood_count_decoded(self) -> None:
         """Wood count is extracted from compact inventory."""
+        logger.debug("TestDecodeFlatObservationStage1.test_wood_count_decoded called")
         vec = _make_compact_vector(stage=1, wood_count=16)
         result = decode_flat_observation(1, vec)
         assert result["inventory"]["wood"] == 16
 
     def test_health_decoded(self) -> None:
         """Player health is correctly denormalized."""
+        logger.debug("TestDecodeFlatObservationStage1.test_health_decoded called")
         vec = _make_compact_vector(stage=1, health=14.0)
         result = decode_flat_observation(1, vec)
         # Compact format: health stored as health/20, decoder multiplies by 20
@@ -153,18 +165,21 @@ class TestDecodeFlatObservationStage1:
 
     def test_on_ground_flag(self) -> None:
         """on_ground flag is correctly decoded."""
+        logger.debug("TestDecodeFlatObservationStage1.test_on_ground_flag called")
         vec = _make_compact_vector(stage=1, on_ground=True)
         result = decode_flat_observation(1, vec)
         assert result["player"]["on_ground"] is True
 
     def test_overworld_dimension(self) -> None:
         """Stage 1 should be in overworld (dimension 0)."""
+        logger.debug("TestDecodeFlatObservationStage1.test_overworld_dimension called")
         vec = _make_compact_vector(stage=1, dimension=0)
         result = decode_flat_observation(1, vec)
         assert result["dimension"] == 0
 
     def test_compatible_with_progress_tracker(self) -> None:
         """Decoded Stage 1 obs can be fed to ProgressTracker without error."""
+        logger.debug("TestDecodeFlatObservationStage1.test_compatible_with_progress_tracker called")
         vec = _make_compact_vector(stage=1, wood_count=8, health=20.0)
         result = decode_flat_observation(1, vec)
         tracker = ProgressTracker()
@@ -178,30 +193,35 @@ class TestDecodeFlatObservationStage2:
 
     def test_iron_count_decoded(self) -> None:
         """Iron ingot count is correctly extracted."""
+        logger.debug("TestDecodeFlatObservationStage2.test_iron_count_decoded called")
         vec = _make_compact_vector(stage=2, iron_count=10)
         result = decode_flat_observation(2, vec)
         assert result["inventory"]["iron_ingots"] == 10
 
     def test_diamond_count_decoded(self) -> None:
         """Diamond count is correctly extracted."""
+        logger.debug("TestDecodeFlatObservationStage2.test_diamond_count_decoded called")
         vec = _make_compact_vector(stage=2, diamond_count=3)
         result = decode_flat_observation(2, vec)
         assert result["inventory"]["diamonds"] == 3
 
     def test_iron_pickaxe_in_hotbar(self) -> None:
         """Iron pickaxe detection from hotbar item IDs."""
+        logger.debug("TestDecodeFlatObservationStage2.test_iron_pickaxe_in_hotbar called")
         vec = _make_compact_vector(stage=2, hotbar_items=[257, 0, 0, 0, 0, 0, 0, 0, 0])
         result = decode_flat_observation(2, vec)
         assert result["inventory"]["iron_pickaxe"] >= 1
 
     def test_bucket_in_hotbar(self) -> None:
         """Bucket detection from hotbar item IDs."""
+        logger.debug("TestDecodeFlatObservationStage2.test_bucket_in_hotbar called")
         vec = _make_compact_vector(stage=2, hotbar_items=[0, 325, 0, 0, 0, 0, 0, 0, 0])
         result = decode_flat_observation(2, vec)
         assert result["inventory"]["empty_buckets"] >= 1
 
     def test_progress_tracker_iron_update(self) -> None:
         """ProgressTracker correctly updates iron from decoded Stage 2."""
+        logger.debug("TestDecodeFlatObservationStage2.test_progress_tracker_iron_update called")
         vec = _make_compact_vector(stage=2, iron_count=5)
         result = decode_flat_observation(2, vec)
         tracker = ProgressTracker()
@@ -210,6 +230,7 @@ class TestDecodeFlatObservationStage2:
 
     def test_progress_tracker_diamond_update(self) -> None:
         """ProgressTracker correctly updates diamonds from decoded Stage 2."""
+        logger.debug("TestDecodeFlatObservationStage2.test_progress_tracker_diamond_update called")
         vec = _make_compact_vector(stage=2, diamond_count=2)
         result = decode_flat_observation(2, vec)
         tracker = ProgressTracker()
@@ -222,12 +243,14 @@ class TestDecodeFlatObservationStage3:
 
     def test_blaze_rod_count_decoded(self) -> None:
         """Blaze rod count is correctly extracted."""
+        logger.debug("TestDecodeFlatObservationStage3.test_blaze_rod_count_decoded called")
         vec = _make_compact_vector(stage=3, blaze_rod_count=7, dimension=1)
         result = decode_flat_observation(3, vec)
         assert result["inventory"]["blaze_rods"] == 7
 
     def test_nether_dimension(self) -> None:
         """Stage 3 in the nether reports dimension=1."""
+        logger.debug("TestDecodeFlatObservationStage3.test_nether_dimension called")
         vec = _make_compact_vector(stage=3, dimension=1)
         result = decode_flat_observation(3, vec)
         assert result["dimension"] == 1
@@ -235,6 +258,7 @@ class TestDecodeFlatObservationStage3:
     def test_nether_dimension_triggers_entered_nether(self) -> None:
         """Feeding a nether-dimension obs to ProgressTracker sets entered_nether."""
         # First send an overworld obs to establish prev_dimension
+        logger.debug("TestDecodeFlatObservationStage3.test_nether_dimension_triggers_entered_nether called")
         vec_ow = _make_compact_vector(stage=3, dimension=0)
         result_ow = decode_flat_observation(3, vec_ow)
         tracker = ProgressTracker()
@@ -250,6 +274,7 @@ class TestDecodeFlatObservationStage3:
 
     def test_progress_tracker_blaze_rod_update(self) -> None:
         """ProgressTracker correctly counts blaze rods from decoded Stage 3."""
+        logger.debug("TestDecodeFlatObservationStage3.test_progress_tracker_blaze_rod_update called")
         vec = _make_compact_vector(stage=3, blaze_rod_count=4, dimension=1)
         result = decode_flat_observation(3, vec)
         tracker = ProgressTracker()
@@ -262,18 +287,21 @@ class TestDecodeFlatObservationStage4:
 
     def test_ender_pearl_count_decoded(self) -> None:
         """Ender pearl count is correctly extracted."""
+        logger.debug("TestDecodeFlatObservationStage4.test_ender_pearl_count_decoded called")
         vec = _make_compact_vector(stage=4, ender_pearl_count=12)
         result = decode_flat_observation(4, vec)
         assert result["inventory"]["ender_pearls"] == 12
 
     def test_eye_of_ender_count_decoded(self) -> None:
         """Eye of ender count is correctly extracted."""
+        logger.debug("TestDecodeFlatObservationStage4.test_eye_of_ender_count_decoded called")
         vec = _make_compact_vector(stage=4, eye_of_ender_count=6)
         result = decode_flat_observation(4, vec)
         assert result["inventory"]["eyes_of_ender"] == 6
 
     def test_progress_tracker_pearl_update(self) -> None:
         """ProgressTracker correctly counts pearls from decoded Stage 4."""
+        logger.debug("TestDecodeFlatObservationStage4.test_progress_tracker_pearl_update called")
         vec = _make_compact_vector(stage=4, ender_pearl_count=8)
         result = decode_flat_observation(4, vec)
         tracker = ProgressTracker()
@@ -282,6 +310,7 @@ class TestDecodeFlatObservationStage4:
 
     def test_progress_tracker_eye_update(self) -> None:
         """ProgressTracker correctly counts eyes from decoded Stage 4."""
+        logger.debug("TestDecodeFlatObservationStage4.test_progress_tracker_eye_update called")
         vec = _make_compact_vector(stage=4, eye_of_ender_count=5)
         result = decode_flat_observation(4, vec)
         tracker = ProgressTracker()
@@ -290,6 +319,7 @@ class TestDecodeFlatObservationStage4:
 
     def test_sequential_pearl_collection(self) -> None:
         """Simulates progressive pearl collection across observations."""
+        logger.debug("TestDecodeFlatObservationStage4.test_sequential_pearl_collection called")
         tracker = ProgressTracker()
         for n_pearls in (2, 5, 9, 12):
             vec = _make_compact_vector(stage=4, ender_pearl_count=n_pearls)
@@ -299,6 +329,7 @@ class TestDecodeFlatObservationStage4:
 
     def test_hotbar_decoded(self) -> None:
         """Hotbar item IDs are preserved in decoded output."""
+        logger.debug("TestDecodeFlatObservationStage4.test_hotbar_decoded called")
         items = [276, 261, 262, 0, 0, 0, 0, 0, 0]  # sword, bow, arrow
         vec = _make_compact_vector(stage=4, hotbar_items=items)
         result = decode_flat_observation(4, vec)
@@ -314,12 +345,14 @@ class TestDecodeFlatObservationDragonState:
 
     def test_dragon_inactive_by_default(self) -> None:
         """No dragon state when not active."""
+        logger.debug("TestDecodeFlatObservationDragonState.test_dragon_inactive_by_default called")
         vec = _make_compact_vector(stage=1)
         result = decode_flat_observation(1, vec)
         assert result["dragon"]["is_active"] is False
 
     def test_dragon_active_decoded(self) -> None:
         """Active dragon state is decoded correctly."""
+        logger.debug("TestDecodeFlatObservationDragonState.test_dragon_active_decoded called")
         vec = _make_compact_vector(
             stage=6,
             dimension=2,
@@ -335,6 +368,7 @@ class TestDecodeFlatObservationDragonState:
 
     def test_dragon_perched_phase(self) -> None:
         """Dragon perched state maps to phase 3."""
+        logger.debug("TestDecodeFlatObservationDragonState.test_dragon_perched_phase called")
         vec = _make_compact_vector(
             stage=6,
             dimension=2,
@@ -351,6 +385,7 @@ class TestDecodeFlatObservationEdgeCases:
 
     def test_zero_vector(self) -> None:
         """All-zero vector decodes without errors."""
+        logger.debug("TestDecodeFlatObservationEdgeCases.test_zero_vector called")
         vec = np.zeros(256, dtype=np.float32)
         result = decode_flat_observation(1, vec)
         assert result["player"]["health"] == 0.0
@@ -358,6 +393,7 @@ class TestDecodeFlatObservationEdgeCases:
 
     def test_accepts_float64_input(self) -> None:
         """Function handles float64 arrays by casting to float32."""
+        logger.debug("TestDecodeFlatObservationEdgeCases.test_accepts_float64_input called")
         vec = np.zeros(256, dtype=np.float64)
         vec[224] = 1.0  # overworld
         result = decode_flat_observation(1, vec)
@@ -365,6 +401,7 @@ class TestDecodeFlatObservationEdgeCases:
 
     def test_full_inventory_stage2(self) -> None:
         """Full Stage 2 inventory with multiple items."""
+        logger.debug("TestDecodeFlatObservationEdgeCases.test_full_inventory_stage2 called")
         vec = _make_compact_vector(
             stage=2,
             iron_count=15,

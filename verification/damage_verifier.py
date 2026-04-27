@@ -21,6 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from damage_test_generator import (
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     ARMOR_VALUES,
     PROTECTION_LEVELS,
     RAW_DAMAGE_VALUES,

@@ -208,6 +208,11 @@ class DragonFightEnv(gym.Env):
             self._sim = mc189_core.MC189Simulator(config)
             self._has_sim = True
         except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             self._sim = None
             self._has_sim = False
 

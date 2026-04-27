@@ -1168,6 +1168,10 @@ def run_interactive(trajectory: TrajectoryData) -> None:
 
     from matplotlib.widgets import Slider
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     viz = RunVisualizer(trajectory)
 
     fig = plt.figure(figsize=(16, 14))

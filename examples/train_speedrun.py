@@ -355,6 +355,11 @@ def main() -> int:
             progress_bar=True,
         )
     except KeyboardInterrupt:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
         print("\n[Train] Training interrupted")
     finally:
         # Save final model

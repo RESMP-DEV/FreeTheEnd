@@ -11,6 +11,10 @@ Tests:
 from dataclasses import dataclass
 from enum import Enum
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class XPSource(Enum):
     """Sources of experience points."""
@@ -46,6 +50,7 @@ class XPOrbValue:
     def from_value(value: int) -> "XPOrbValue":
         """Create orb with appropriate texture based on value."""
         # Minecraft orb sizes based on XP value
+        logger.debug("XPOrbValue.from_value: value=%s", value)
         if value >= 2477:
             texture = 10
         elif value >= 1237:
@@ -80,6 +85,7 @@ class XPOrbValue:
 
 def total_xp_for_level(level: int) -> int:
     """Calculate total XP points needed to reach a level from 0."""
+    logger.debug("total_xp_for_level: level=%s", level)
     if level <= 0:
         return 0
     elif level <= 16:
@@ -96,6 +102,7 @@ def xp_for_next_level(current_level: int) -> int:
     #   L ∈ [0, 15]:  2L + 7
     #   L ∈ [16, 30]: 5L - 38
     #   L ≥ 31:       9L - 158
+    logger.debug("xp_for_next_level: current_level=%s", current_level)
     if current_level <= 15:
         return 2 * current_level + 7
     elif current_level <= 30:
@@ -110,6 +117,7 @@ def level_from_total_xp(total_xp: int) -> tuple[int, int]:
     Returns:
         (level, xp_into_current_level)
     """
+    logger.debug("level_from_total_xp: total_xp=%s", total_xp)
     if total_xp <= 0:
         return (0, 0)
 
@@ -245,12 +253,14 @@ class XPState:
             level: Current experience level
             xp_progress: Progress toward next level (0.0 to 1.0)
         """
+        logger.info("XPState.__init__: level=%s, xp_progress=%s", level, xp_progress)
         self.level = level
         self.xp_progress = min(max(xp_progress, 0.0), 0.9999)
         self._total_xp = self._calculate_total()
 
     def _calculate_total(self) -> int:
         """Calculate total XP from level and progress."""
+        logger.debug("XPState._calculate_total called")
         base = total_xp_for_level(self.level)
         progress_xp = int(self.xp_progress * xp_for_next_level(self.level))
         return base + progress_xp
@@ -258,10 +268,12 @@ class XPState:
     @property
     def total_xp(self) -> int:
         """Total accumulated XP points."""
+        logger.debug("XPState.total_xp called")
         return self._total_xp
 
     def add_xp(self, points: int) -> int:
         """Add XP points. Returns levels gained."""
+        logger.debug("XPState.add_xp: points=%s", points)
         if points <= 0:
             return 0
 
@@ -274,6 +286,7 @@ class XPState:
 
     def remove_levels(self, levels: int) -> bool:
         """Remove levels (for enchanting). Returns True if successful."""
+        logger.debug("XPState.remove_levels: levels=%s", levels)
         if levels > self.level:
             return False
         self.level -= levels
@@ -284,6 +297,7 @@ class XPState:
 
     def xp_bar_percent(self) -> float:
         """Get XP bar fill percentage (0-100)."""
+        logger.debug("XPState.xp_bar_percent called")
         return self.xp_progress * 100
 
 
@@ -291,15 +305,18 @@ class XPVerifier:
     """Verification suite for XP mechanics."""
 
     def __init__(self):
+        logger.info("XPVerifier.__init__ called")
         self.results: list[tuple[str, bool, str]] = []
 
     def verify(self, name: str, condition: bool, message: str = "") -> bool:
         """Record verification result."""
+        logger.debug("XPVerifier.verify: name=%s, condition=%s, message=%s", name, condition, message)
         self.results.append((name, condition, message))
         return condition
 
     def run_all(self) -> dict[str, bool | int | list[tuple[str, bool, str]]]:
         """Run all verification tests."""
+        logger.debug("XPVerifier.run_all called")
         self.results.clear()
 
         self._verify_level_curve()
@@ -326,6 +343,7 @@ class XPVerifier:
     def _verify_level_curve(self) -> None:
         """Verify XP level curve matches Minecraft formula."""
         # Test specific level totals (from Minecraft wiki)
+        logger.debug("XPVerifier._verify_level_curve called")
         expected_totals = {
             0: 0,
             1: 7,
@@ -354,6 +372,7 @@ class XPVerifier:
     def _verify_xp_requirements(self) -> None:
         """Verify XP needed per level transition."""
         # L → L+1 requirements
+        logger.debug("XPVerifier._verify_xp_requirements called")
         expected_requirements = {
             0: 7,  # 0→1
             5: 17,  # 5→6
@@ -378,6 +397,7 @@ class XPVerifier:
 
     def _verify_level_from_total(self) -> None:
         """Verify level calculation from total XP."""
+        logger.debug("XPVerifier._verify_level_from_total called")
         test_cases = [
             (0, 0, 0),  # 0 XP = level 0, 0 into level
             (7, 1, 0),  # 7 XP = level 1, 0 into level
@@ -398,6 +418,7 @@ class XPVerifier:
 
     def _verify_orb_values(self) -> None:
         """Verify XP orb texture/size mapping."""
+        logger.debug("XPVerifier._verify_orb_values called")
         orb_tests = [
             (1, 0),
             (3, 1),
@@ -423,6 +444,7 @@ class XPVerifier:
     def _verify_mob_xp(self) -> None:
         """Verify mob XP values."""
         # Ender Dragon gives massive XP (first kill)
+        logger.debug("XPVerifier._verify_mob_xp called")
         dragon_xp = XP_VALUES.get("kill_ender_dragon")
         self.verify(
             "ender_dragon_12000_xp",
@@ -459,6 +481,7 @@ class XPVerifier:
     def _verify_enchantment_costs(self) -> None:
         """Verify enchantment table costs."""
         # Three slots with level 1, 2, 3 requirements
+        logger.debug("XPVerifier._verify_enchantment_costs called")
         self.verify(
             "enchant_slot_1_cost_1_level",
             ENCHANTMENT_SLOTS[0].min_level == 1,
@@ -493,6 +516,7 @@ class XPVerifier:
     def _verify_anvil_costs(self) -> None:
         """Verify anvil repair/combine costs."""
         # Rename costs 1 level
+        logger.debug("XPVerifier._verify_anvil_costs called")
         self.verify(
             "anvil_rename_1_level",
             ANVIL_COSTS["rename"] == 1,
@@ -537,6 +561,7 @@ class XPVerifier:
     def _verify_xp_state(self) -> None:
         """Verify XP state management."""
         # Initial state
+        logger.debug("XPVerifier._verify_xp_state called")
         state = XPState(level=0, xp_progress=0.0)
         self.verify(
             "initial_state_level_0",
@@ -581,6 +606,7 @@ class XPVerifier:
     def _verify_specific_totals(self) -> None:
         """Verify specific XP milestones."""
         # Level 30 for max enchants
+        logger.debug("XPVerifier._verify_specific_totals called")
         self.verify(
             "level_30_requires_1395",
             total_xp_for_level(30) == 1395,
@@ -609,6 +635,7 @@ class XPVerifier:
 
 def verify_xp_mechanics() -> dict:
     """Run full XP mechanics verification."""
+    logger.debug("verify_xp_mechanics called")
     verifier = XPVerifier()
     return verifier.run_all()
 

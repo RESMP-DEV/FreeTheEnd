@@ -19,6 +19,10 @@ from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Test matrix values
 RAW_DAMAGE_VALUES = [1, 2, 4, 6, 8, 10, 15, 20]
 ARMOR_VALUES = [0, 2, 4, 8, 12, 16, 20]
@@ -37,6 +41,7 @@ class DamageTestCase:
 
     def to_dict(self) -> dict:
         """Convert to dictionary representation."""
+        logger.debug("DamageTestCase.to_dict called")
         return {
             "raw_damage": self.raw_damage,
             "armor": self.armor,
@@ -47,6 +52,7 @@ class DamageTestCase:
     @property
     def test_id(self) -> str:
         """Unique identifier for this test case."""
+        logger.debug("DamageTestCase.test_id called")
         return f"d{self.raw_damage}_a{self.armor}_p{self.protection_level}_r{self.resistance_level}"
 
 
@@ -56,6 +62,7 @@ def generate_test_matrix() -> Iterator[DamageTestCase]:
     Yields:
         DamageTestCase for each combination in the test matrix.
     """
+    logger.debug("generate_test_matrix called")
     for raw_damage, armor, protection, resistance in product(
         RAW_DAMAGE_VALUES,
         ARMOR_VALUES,
@@ -72,6 +79,7 @@ def generate_test_matrix() -> Iterator[DamageTestCase]:
 
 def count_test_cases() -> int:
     """Calculate total number of test cases in the matrix."""
+    logger.debug("count_test_cases called")
     return (
         len(RAW_DAMAGE_VALUES) * len(ARMOR_VALUES) * len(PROTECTION_LEVELS) * len(RESISTANCE_LEVELS)
     )
@@ -86,6 +94,7 @@ def export_test_cases(output_path: Path | str) -> int:
     Returns:
         Number of test cases exported.
     """
+    logger.debug("export_test_cases: output_path=%s", output_path)
     output_path = Path(output_path)
     test_cases = [tc.to_dict() for tc in generate_test_matrix()]
 
@@ -113,6 +122,7 @@ def generate_pytest_parametrize() -> str:
     Returns:
         Python code string with pytest.mark.parametrize decorator.
     """
+    logger.debug("generate_pytest_parametrize called")
     cases = list(generate_test_matrix())
     params = ", ".join(
         f"({tc.raw_damage}, {tc.armor}, {tc.protection_level}, {tc.resistance_level})"

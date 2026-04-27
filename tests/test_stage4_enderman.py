@@ -47,6 +47,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def sim_config():
     """Create simulator config for Stage 4 testing."""
+    logger.debug("sim_config called")
     config = mc189_core.SimulatorConfig()
     config.num_envs = 1
     config.shader_dir = str(SHADERS_DIR)
@@ -56,12 +57,14 @@ def sim_config():
 @pytest.fixture
 def simulator(sim_config):
     """Create simulator instance."""
+    logger.debug("simulator: sim_config=%s", sim_config)
     return mc189_core.MC189Simulator(sim_config)
 
 
 @pytest.fixture
 def reset_simulator(simulator):
     """Simulator that has been reset and stepped to populate observations."""
+    logger.debug("reset_simulator: simulator=%s", simulator)
     simulator.reset()
     simulator.step(np.array([0], dtype=np.int32))
     return simulator
@@ -74,6 +77,7 @@ def reset_simulator(simulator):
 
 def decode_player(obs: np.ndarray) -> dict:
     """Decode player state from observation vector."""
+    logger.debug("decode_player: obs=%s", obs)
     return {
         "x": obs[0] * 100,
         "y": obs[1] * 50 + 64,
@@ -94,6 +98,7 @@ def decode_time(obs: np.ndarray) -> dict:
     """
     # Time is typically encoded at a specific index, check simulator spec
     # For now assume index 44 or similar
+    logger.debug("decode_time: obs=%s", obs)
     time_normalized = obs[44] if len(obs) > 44 else 0.5
     return {
         "time_normalized": time_normalized,
@@ -108,6 +113,7 @@ def decode_enderman(obs: np.ndarray, mob_index: int = 0) -> dict:
     Mob observation layout (assumed starting at index 64):
     - mob_type, x, y, z, health, is_aggro, distance
     """
+    logger.debug("decode_enderman: obs=%s, mob_index=%s", obs, mob_index)
     base_idx = 64 + mob_index * 8
     if len(obs) <= base_idx + 7:
         return {"present": False}
@@ -130,6 +136,7 @@ def decode_inventory(obs: np.ndarray) -> dict:
     Inventory layout (assumed starting at index 32):
     - pearls, sword_type, armor_level, etc.
     """
+    logger.debug("decode_inventory: obs=%s", obs)
     return {
         "ender_pearls": int(obs[32] * 16) if len(obs) > 32 else 0,
         "sword_type": int(obs[33] * 5) if len(obs) > 33 else 0,
@@ -140,6 +147,7 @@ def decode_inventory(obs: np.ndarray) -> dict:
 def decode_pearl_projectile(obs: np.ndarray) -> dict:
     """Decode thrown pearl state from observation."""
     # Pearl state typically at specific indices
+    logger.debug("decode_pearl_projectile: obs=%s", obs)
     return {
         "in_flight": obs[96] > 0.5 if len(obs) > 96 else False,
         "x": obs[97] * 100 if len(obs) > 97 else 0,
@@ -182,6 +190,7 @@ class TestEndermanSpawning:
         - On solid blocks
         - Any overworld biome
         """
+        logger.debug("TestEndermanSpawning.test_enderman_spawns_night: reset_simulator=%s", reset_simulator)
         max_steps = 5000
         enderman_found = False
 
@@ -215,6 +224,7 @@ class TestEndermanAggro:
         - Distance < 64 blocks
         - Not wearing pumpkin helmet
         """
+        logger.debug("TestEndermanAggro.test_enderman_stare_aggro: reset_simulator=%s", reset_simulator)
         aggro_triggered = False
         max_steps = 3000
 
@@ -255,6 +265,7 @@ class TestEndermanTeleportation:
         - Won't teleport into water
         - 0.5 second cooldown
         """
+        logger.debug("TestEndermanTeleportation.test_enderman_teleport_damage: reset_simulator=%s", reset_simulator)
         teleport_observed = False
         max_steps = 3000
 
@@ -294,6 +305,7 @@ class TestEndermanTeleportation:
         - Triggers immediate teleport attempt
         - Won't teleport INTO water
         """
+        logger.debug("TestEndermanTeleportation.test_enderman_water_flee: reset_simulator=%s", reset_simulator)
         water_flee_observed = False
         max_steps = 2000
 
@@ -324,6 +336,7 @@ class TestEndermanCombat:
         - Fast attack speed when aggro
         - Can combo with teleport attacks
         """
+        logger.debug("TestEndermanCombat.test_enderman_attack_damage: reset_simulator=%s", reset_simulator)
         damage_taken = 0
         max_steps = 3000
 
@@ -365,6 +378,7 @@ class TestEndermanCombat:
         - Base: 0-1 pearls (50% chance)
         - With Looting III: 0-4 pearls
         """
+        logger.debug("TestEndermanCombat.test_enderman_drops_pearl: reset_simulator=%s", reset_simulator)
         pearl_dropped = False
         max_steps = 5000
 
@@ -408,6 +422,7 @@ class TestEnderPearlMechanics:
         - Arc trajectory (gravity affected)
         - ~20 block average range when thrown level
         """
+        logger.debug("TestEnderPearlMechanics.test_throw_pearl: reset_simulator=%s", reset_simulator)
         pearl_thrown = False
         max_steps = 100
 
@@ -441,6 +456,7 @@ class TestEnderPearlMechanics:
         - Maintains player facing direction
         - Can cross terrain, gaps
         """
+        logger.debug("TestEnderPearlMechanics.test_pearl_teleport: reset_simulator=%s", reset_simulator)
         teleported = False
         max_steps = 200
 
@@ -481,6 +497,7 @@ class TestEnderPearlMechanics:
         - Applied regardless of landing height
         - Can be fatal if low health
         """
+        logger.debug("TestEnderPearlMechanics.test_pearl_fall_damage: reset_simulator=%s", reset_simulator)
         damage_taken = 0
         max_steps = 100
 
@@ -517,6 +534,7 @@ class TestEnderPearlMechanics:
         - Shared across all pearls in inventory
         - Visual indicator on hotbar
         """
+        logger.debug("TestEnderPearlMechanics.test_pearl_cooldown: reset_simulator=%s", reset_simulator)
         cooldown_observed = False
         max_steps = 100
 
@@ -551,6 +569,7 @@ class TestSpeedrunTechniques:
         - Enderman stuck, free hits
         - Prevents teleport escape
         """
+        logger.debug("TestSpeedrunTechniques.test_boat_trap_enderman: reset_simulator=%s", reset_simulator)
         boat_trap_success = False
         max_steps = 2000
 
@@ -602,6 +621,7 @@ class TestLootingEnchantment:
         - Looting II: 0-3 pearls (avg 1.5)
         - Looting III: 0-4 pearls (avg 2.0)
         """
+        logger.debug("TestLootingEnchantment.test_looting_increases_drops: reset_simulator=%s", reset_simulator)
         pearls_collected = 0
         kills = 0
         max_steps = 10000
@@ -668,6 +688,7 @@ reward_shaping_mark = pytest.mark.skipif(
 
 def _base_state(**overrides: Any) -> dict[str, Any]:
     """Create a base state dict with sane defaults for Stage 4 testing."""
+    logger.debug("_base_state called")
     state: dict[str, Any] = {
         "health": 20.0,
         "hunger": 20.0,
@@ -687,6 +708,10 @@ def _base_state(**overrides: Any) -> dict[str, Any]:
 
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @reward_shaping_mark
 class TestStage4PerEyeRewards:
@@ -700,6 +725,7 @@ class TestStage4PerEyeRewards:
 
     def test_first_eye_milestone(self):
         """First eye of ender crafted triggers +0.2 milestone reward."""
+        logger.debug("TestStage4PerEyeRewards.test_first_eye_milestone called")
         shaper = create_stage4_reward_shaper()
 
         # Prime with initial state (no eyes)
@@ -717,6 +743,7 @@ class TestStage4PerEyeRewards:
 
     def test_six_eye_milestone(self):
         """Reaching 6 eyes of ender triggers +0.15 milestone."""
+        logger.debug("TestStage4PerEyeRewards.test_six_eye_milestone called")
         shaper = create_stage4_reward_shaper()
 
         # Walk up to 5 eyes first
@@ -737,6 +764,7 @@ class TestStage4PerEyeRewards:
 
     def test_twelve_eye_milestone(self):
         """Reaching 12 eyes of ender triggers +0.25 milestone."""
+        logger.debug("TestStage4PerEyeRewards.test_twelve_eye_milestone called")
         shaper = create_stage4_reward_shaper()
 
         # Walk up to 11 eyes
@@ -762,6 +790,7 @@ class TestStage4PerEyeRewards:
         formula: min(eye_count * 0.025, 0.35). Cap is hit at 14 effective eyes.
         We use inventory only (not eyes_crafted) so each eye adds exactly +0.025.
         """
+        logger.debug("TestStage4PerEyeRewards.test_each_eye_gives_positive_progressive_reward called")
         shaper = create_stage4_reward_shaper()
 
         # Prime with zero-eye state
@@ -791,6 +820,7 @@ class TestStage4PerEyeRewards:
         (no new progressive reward, no new milestones past 12).
         Note: effective eye count = inventory + eyes_crafted.
         """
+        logger.debug("TestStage4PerEyeRewards.test_progressive_reward_caps_at_14_eyes called")
         shaper = create_stage4_reward_shaper()
 
         # Walk up to 14 eyes (inventory only) to hit the cap
@@ -813,6 +843,7 @@ class TestStage4PerEyeRewards:
 
     def test_milestones_are_one_shot(self):
         """Milestone rewards (first_eye, eye_x6, eye_x12) fire only once."""
+        logger.debug("TestStage4PerEyeRewards.test_milestones_are_one_shot called")
         shaper = create_stage4_reward_shaper()
 
         state_12_eyes = _base_state(
@@ -841,6 +872,7 @@ class TestStage4PerEyeRewards:
         The shaper checks both inventory eye_of_ender AND eyes_crafted to
         handle cases where eyes are immediately placed in portal frames.
         """
+        logger.debug("TestStage4PerEyeRewards.test_eye_crafted_via_eyes_crafted_counter called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())
 
@@ -860,6 +892,7 @@ class TestStage4PerEyeRewards:
 
         This verifies the pearl collection sub-goal feeds into eye crafting.
         """
+        logger.debug("TestStage4PerEyeRewards.test_pearl_progressive_rewards_per_pearl called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())
 
@@ -888,6 +921,7 @@ class TestStage4PortalBonus:
 
     def test_stage_complete_bonus_value(self):
         """stage_complete flag triggers exactly +2.0 bonus."""
+        logger.debug("TestStage4PortalBonus.test_stage_complete_bonus_value called")
         shaper = create_stage4_reward_shaper()
 
         # Prime with a near-complete state
@@ -910,6 +944,7 @@ class TestStage4PortalBonus:
 
     def test_stage_complete_fires_only_once(self):
         """Stage completion bonus does not fire on repeated calls."""
+        logger.debug("TestStage4PortalBonus.test_stage_complete_fires_only_once called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())
 
@@ -924,6 +959,7 @@ class TestStage4PortalBonus:
 
     def test_stage_complete_requires_flag(self):
         """Without stage_complete flag, no bonus is given even with 12 eyes."""
+        logger.debug("TestStage4PortalBonus.test_stage_complete_requires_flag called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())
 
@@ -941,6 +977,7 @@ class TestStage4PortalBonus:
 
     def test_stats_track_completion_bonus(self):
         """RewardStats.stage_completion_bonus is set to 2.0 on completion."""
+        logger.debug("TestStage4PortalBonus.test_stats_track_completion_bonus called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())
         shaper(_base_state(stage_complete=True))
@@ -956,6 +993,7 @@ class TestStage4PortalBonus:
         If the agent collects 12 eyes and completes the stage in one transition,
         the reward should include both the eye milestones and the completion bonus.
         """
+        logger.debug("TestStage4PortalBonus.test_portal_bonus_stacks_with_eye_milestones called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())  # Prime with zero state
 
@@ -979,6 +1017,7 @@ class TestStage4PortalBonus:
         Simulates: 0 -> 1 -> ... -> 12 eyes, then stage_complete.
         Verifies total accumulated reward is in the expected range.
         """
+        logger.debug("TestStage4PortalBonus.test_full_sequence_accumulates_correctly called")
         shaper = create_stage4_reward_shaper()
         shaper(_base_state())
 

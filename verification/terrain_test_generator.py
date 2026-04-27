@@ -474,6 +474,10 @@ def save_test_vectors(
 if __name__ == "__main__":
     import sys
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     seed = int(sys.argv[1]) if len(sys.argv) > 1 else 12345
 
     print(f"Generating noise test vectors for seed {seed}...")

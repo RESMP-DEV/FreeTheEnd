@@ -1,6 +1,11 @@
 """Oracle module - authoritative MC 1.8.9 constants and reference implementations."""
 
 from .mc189_constants import (
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     DRAG_AIR,
     DRAG_GROUND,
     GRAVITY,

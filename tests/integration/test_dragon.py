@@ -10,6 +10,10 @@ import time
 import mc189_core
 import numpy as np
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 print("Testing Dragon Fight Simulator - Combat Test")
 print("=" * 50)
 

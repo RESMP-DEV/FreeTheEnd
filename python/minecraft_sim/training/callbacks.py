@@ -251,6 +251,11 @@ class WandBCallback(BaseCallback):
                 reinit=True,
             )
         except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             if self.verbose > 0:
                 print("[WandB] wandb not installed, skipping logging")
             self._wandb = None

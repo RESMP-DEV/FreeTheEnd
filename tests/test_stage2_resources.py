@@ -963,6 +963,11 @@ try:
 
     HAS_STAGE_ENVS = True
 except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     HAS_STAGE_ENVS = False
     ResourceGatheringEnv = None  # type: ignore[assignment, misc]
     SpeedrunVecEnv = None  # type: ignore[assignment, misc]

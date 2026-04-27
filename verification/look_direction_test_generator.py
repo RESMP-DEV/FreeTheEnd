@@ -10,6 +10,10 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TestCase:
@@ -41,6 +45,7 @@ def yaw_pitch_to_unit_vector(yaw_deg: float, pitch_deg: float) -> tuple[float, f
     Returns:
         Tuple (x, y, z) representing the unit direction vector.
     """
+    logger.debug("yaw_pitch_to_unit_vector: yaw_deg=%s, pitch_deg=%s", yaw_deg, pitch_deg)
     yaw_rad = math.radians(yaw_deg)
     pitch_rad = math.radians(pitch_deg)
 
@@ -54,6 +59,7 @@ def yaw_pitch_to_unit_vector(yaw_deg: float, pitch_deg: float) -> tuple[float, f
 
 def generate_cardinal_direction_tests() -> list[TestCase]:
     """Generate tests for cardinal directions (yaw 0, 90, 180, 270 with pitch 0)."""
+    logger.debug("generate_cardinal_direction_tests called")
     cases = []
 
     # Yaw 0, pitch 0 -> +X direction
@@ -117,6 +123,7 @@ def generate_cardinal_direction_tests() -> list[TestCase]:
 
 def generate_pitch_extreme_tests() -> list[TestCase]:
     """Generate tests for pitch extremes (-90 and +90)."""
+    logger.debug("generate_pitch_extreme_tests called")
     cases = []
 
     # Pitch -90 -> looking straight down (-Y)
@@ -188,6 +195,7 @@ def generate_random_tests(count: int = 5000, seed: int = 42) -> list[TestCase]:
     Returns:
         List of random test cases.
     """
+    logger.debug("generate_random_tests: count=%s, seed=%s", count, seed)
     random.seed(seed)
     cases = []
 
@@ -213,6 +221,7 @@ def generate_random_tests(count: int = 5000, seed: int = 42) -> list[TestCase]:
 
 def generate_edge_case_tests() -> list[TestCase]:
     """Generate edge case tests (yaw > 360, pitch clamping)."""
+    logger.debug("generate_edge_case_tests called")
     cases = []
 
     # Yaw > 360 (should wrap)
@@ -303,6 +312,7 @@ def generate_edge_case_tests() -> list[TestCase]:
 
 def generate_all_test_cases() -> list[TestCase]:
     """Generate all test cases."""
+    logger.debug("generate_all_test_cases called")
     cases = []
     cases.extend(generate_cardinal_direction_tests())
     cases.extend(generate_pitch_extreme_tests())
@@ -318,6 +328,7 @@ def save_test_cases(cases: list[TestCase], output_path: Path) -> None:
         cases: List of test cases to save.
         output_path: Path to output JSON file.
     """
+    logger.debug("save_test_cases: cases=%s, output_path=%s", cases, output_path)
     data = {
         "metadata": {
             "total_cases": len(cases),

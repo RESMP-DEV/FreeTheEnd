@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 EPSILON = 1e-5
 
 
@@ -31,6 +35,7 @@ class AABB:
 
     @classmethod
     def from_dict(cls, d: dict[str, float]) -> AABB:
+        logger.debug("AABB.from_dict: d=%s", d)
         return cls(d["min_x"], d["min_y"], d["min_z"], d["max_x"], d["max_y"], d["max_z"])
 
 
@@ -51,6 +56,7 @@ class IntersectionResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> IntersectionResult:
+        logger.debug("IntersectionResult.from_dict: d=%s", d)
         return cls(
             intersects=d["intersects"],
             intersection_min_x=d.get("intersection_min_x"),
@@ -65,6 +71,7 @@ class IntersectionResult:
 
 def float_eq(a: float | None, b: float | None, eps: float = EPSILON) -> bool:
     """Compare two floats with epsilon tolerance."""
+    logger.debug("float_eq: a=%s, b=%s, eps=%s", a, b, eps)
     if a is None and b is None:
         return True
     if a is None or b is None:
@@ -78,6 +85,7 @@ def results_match(
     java: IntersectionResult, vulkan: IntersectionResult, eps: float = EPSILON
 ) -> tuple[bool, str]:
     """Compare Java and Vulkan results, return (match, reason)."""
+    logger.debug("results_match: java=%s, vulkan=%s, eps=%s", java, vulkan, eps)
     if java.intersects != vulkan.intersects:
         return False, f"Intersection mismatch: Java={java.intersects}, Vulkan={vulkan.intersects}"
 
@@ -125,11 +133,13 @@ class JavaOracle:
     """Java implementation of AABB intersection as reference oracle."""
 
     def __init__(self, java_path: Path | None = None, classpath: Path | None = None):
+        logger.info("JavaOracle.__init__: java_path=%s, classpath=%s", java_path, classpath)
         self.java_path = java_path or Path("java")
         self.classpath = classpath
 
     def _run_java(self, input_data: dict[str, Any]) -> dict[str, Any]:
         """Run Java oracle with input data, return results."""
+        logger.debug("JavaOracle._run_java: input_data=%s", input_data)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(input_data, f)
             input_file = Path(f.name)
@@ -151,10 +161,12 @@ class JavaOracle:
     def compute_intersection(self, box_a: AABB, box_b: AABB) -> IntersectionResult:
         """Compute AABB intersection using Java oracle."""
         # For now, compute using Python reference (Java would be external)
+        logger.debug("JavaOracle.compute_intersection: box_a=%s, box_b=%s", box_a, box_b)
         return self._compute_reference(box_a, box_b)
 
     def compute_batch(self, test_cases: list[dict[str, Any]]) -> list[IntersectionResult]:
         """Compute intersections for a batch of test cases."""
+        logger.debug("JavaOracle.compute_batch: test_cases=%s", test_cases)
         results = []
         for tc in test_cases:
             box_a = AABB.from_dict(tc["box_a"])
@@ -165,6 +177,7 @@ class JavaOracle:
     def _compute_reference(self, box_a: AABB, box_b: AABB) -> IntersectionResult:
         """Reference implementation of AABB intersection."""
         # Normalize boxes (handle inverted min/max)
+        logger.debug("JavaOracle._compute_reference: box_a=%s, box_b=%s", box_a, box_b)
         a_min_x, a_max_x = min(box_a.min_x, box_a.max_x), max(box_a.min_x, box_a.max_x)
         a_min_y, a_max_y = min(box_a.min_y, box_a.max_y), max(box_a.min_y, box_a.max_y)
         a_min_z, a_max_z = min(box_a.min_z, box_a.max_z), max(box_a.min_z, box_a.max_z)
@@ -216,11 +229,13 @@ class VulkanComputeShader:
     """Vulkan compute shader implementation of AABB intersection."""
 
     def __init__(self, shader_path: Path | None = None, runner_path: Path | None = None):
+        logger.info("VulkanComputeShader.__init__: shader_path=%s, runner_path=%s", shader_path, runner_path)
         self.shader_path = shader_path
         self.runner_path = runner_path or Path("vulkan_aabb_runner")
 
     def _run_vulkan(self, input_data: dict[str, Any]) -> dict[str, Any]:
         """Run Vulkan compute shader with input data, return results."""
+        logger.debug("VulkanComputeShader._run_vulkan: input_data=%s", input_data)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(input_data, f)
             input_file = Path(f.name)
@@ -241,10 +256,12 @@ class VulkanComputeShader:
     def compute_intersection(self, box_a: AABB, box_b: AABB) -> IntersectionResult:
         """Compute AABB intersection using Vulkan compute shader."""
         # For now, use reference implementation (Vulkan would be external)
+        logger.debug("VulkanComputeShader.compute_intersection: box_a=%s, box_b=%s", box_a, box_b)
         return self._compute_reference(box_a, box_b)
 
     def compute_batch(self, test_cases: list[dict[str, Any]]) -> list[IntersectionResult]:
         """Compute intersections for a batch of test cases."""
+        logger.debug("VulkanComputeShader.compute_batch: test_cases=%s", test_cases)
         results = []
         for tc in test_cases:
             box_a = AABB.from_dict(tc["box_a"])
@@ -255,6 +272,7 @@ class VulkanComputeShader:
     def _compute_reference(self, box_a: AABB, box_b: AABB) -> IntersectionResult:
         """Reference implementation (mirrors Vulkan shader logic)."""
         # Normalize boxes
+        logger.debug("VulkanComputeShader._compute_reference: box_a=%s, box_b=%s", box_a, box_b)
         a_min_x, a_max_x = min(box_a.min_x, box_a.max_x), max(box_a.min_x, box_a.max_x)
         a_min_y, a_max_y = min(box_a.min_y, box_a.max_y), max(box_a.min_y, box_a.max_y)
         a_min_z, a_max_z = min(box_a.min_z, box_a.max_z), max(box_a.min_z, box_a.max_z)
@@ -314,12 +332,14 @@ class AABBVerifier:
     """Verification harness for comparing Java and Vulkan AABB implementations."""
 
     def __init__(self, epsilon: float = EPSILON):
+        logger.info("AABBVerifier.__init__: epsilon=%s", epsilon)
         self.epsilon = epsilon
         self.java_oracle = JavaOracle()
         self.vulkan_shader = VulkanComputeShader()
 
     def verify_single(self, test_case: dict[str, Any]) -> VerificationResult:
         """Verify a single test case."""
+        logger.debug("AABBVerifier.verify_single: test_case=%s", test_case)
         box_a = AABB.from_dict(test_case["box_a"])
         box_b = AABB.from_dict(test_case["box_b"])
 
@@ -341,6 +361,7 @@ class AABBVerifier:
         self, test_cases: list[dict[str, Any]], progress_callback=None
     ) -> list[VerificationResult]:
         """Verify a batch of test cases."""
+        logger.debug("AABBVerifier.verify_batch: test_cases=%s, progress_callback=%s", test_cases, progress_callback)
         java_results = self.java_oracle.compute_batch(test_cases)
         vulkan_results = self.vulkan_shader.compute_batch(test_cases)
 
@@ -365,6 +386,7 @@ class AABBVerifier:
 
     def generate_report(self, results: list[VerificationResult]) -> dict[str, Any]:
         """Generate verification report."""
+        logger.debug("AABBVerifier.generate_report: results=%s", results)
         total = len(results)
         passed = sum(1 for r in results if r.passed)
         failed = total - passed
@@ -417,6 +439,7 @@ class AABBVerifier:
 
 def progress_bar(current: int, total: int, width: int = 50):
     """Simple progress bar."""
+    logger.debug("progress_bar: current=%s, total=%s, width=%s", current, total, width)
     pct = current / total
     filled = int(width * pct)
     bar = "=" * filled + "-" * (width - filled)
@@ -424,6 +447,7 @@ def progress_bar(current: int, total: int, width: int = 50):
 
 
 def main():
+    logger.debug("main called")
     parser = argparse.ArgumentParser(description="Verify AABB implementations")
     parser.add_argument(
         "--input",

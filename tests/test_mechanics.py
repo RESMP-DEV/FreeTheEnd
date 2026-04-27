@@ -50,6 +50,11 @@ class TestAABB:
 
             return aabb_verifier
         except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             pytest.skip("aabb_verifier not available")
 
     def test_aabb_verifier_exists(self, aabb_verifier):

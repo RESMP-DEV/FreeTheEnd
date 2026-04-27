@@ -426,6 +426,10 @@ class EndPortalValidator:
         """
         import random
 
+import logging
+
+logger = logging.getLogger(__name__)
+
         eyes = 0
         for _ in range(12):
             if random.random() < 0.1:

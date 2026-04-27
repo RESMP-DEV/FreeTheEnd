@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import NamedTuple
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class Direction(Enum):
     """Cardinal and vertical directions."""
@@ -23,12 +27,14 @@ class Direction(Enum):
     EAST = (1, 0, 0)
 
     def __init__(self, dx: int, dy: int, dz: int) -> None:
+        logger.info("Direction.__init__: dx=%s, dy=%s, dz=%s", dx, dy, dz)
         self.dx = dx
         self.dy = dy
         self.dz = dz
 
     @property
     def opposite(self) -> Direction:
+        logger.debug("Direction.opposite called")
         opposites = {
             Direction.DOWN: Direction.UP,
             Direction.UP: Direction.DOWN,
@@ -101,6 +107,7 @@ class Position(NamedTuple):
     z: int
 
     def offset(self, direction: Direction) -> Position:
+        logger.debug("Position.offset: direction=%s", direction)
         return Position(
             self.x + direction.dx,
             self.y + direction.dy,
@@ -116,6 +123,7 @@ class BlockState:
     properties: dict[str, str | int | bool] = field(default_factory=dict)
 
     def with_property(self, key: str, value: str | int | bool) -> BlockState:
+        logger.debug("BlockState.with_property: key=%s, value=%s", key, value)
         new_props = dict(self.properties)
         new_props[key] = value
         return BlockState(self.block_id, new_props)
@@ -260,6 +268,7 @@ PLACEMENT_RULES: dict[str, PlacementRules] = {
 
 def get_log_axis_from_face(click_direction: Direction) -> Axis:
     """Get log axis based on the clicked face."""
+    logger.debug("get_log_axis_from_face: click_direction=%s", click_direction)
     if click_direction in (Direction.UP, Direction.DOWN):
         return Axis.Y
     elif click_direction in (Direction.NORTH, Direction.SOUTH):
@@ -271,6 +280,7 @@ def get_log_axis_from_face(click_direction: Direction) -> Axis:
 def get_stair_direction(player_direction: Direction) -> Direction:
     """Get stair facing direction based on player facing."""
     # Stairs face the player (opposite of player direction)
+    logger.debug("get_stair_direction: player_direction=%s", player_direction)
     horizontal = {
         Direction.NORTH: Direction.NORTH,
         Direction.SOUTH: Direction.SOUTH,
@@ -284,6 +294,7 @@ def get_stair_half(
     click_position: tuple[float, float, float], click_direction: Direction
 ) -> StairHalf:
     """Determine stair half based on click position."""
+    logger.debug("get_stair_half: click_position=%s, click_direction=%s", click_position, click_direction)
     _, y, _ = click_position
 
     if click_direction == Direction.UP:
@@ -302,6 +313,7 @@ def get_stair_shape(
 ) -> StairShape:
     """Determine stair shape based on neighboring stairs."""
     # Check neighbors for stair connections
+    logger.debug("get_stair_shape: pos=%s, facing=%s, world=%s", pos, facing, world)
     left_dir = {
         Direction.NORTH: Direction.WEST,
         Direction.SOUTH: Direction.EAST,
@@ -320,6 +332,7 @@ def get_stair_shape(
     right_state = world.get(right_pos)
 
     def is_stairs_facing(state: BlockState | None, direction: Direction) -> bool:
+        logger.debug("is_stairs_facing: state=%s, direction=%s", state, direction)
         if state is None:
             return False
         if "stairs" not in state.block_id:
@@ -348,6 +361,7 @@ def get_slab_type(
     click_position: tuple[float, float, float], click_direction: Direction
 ) -> SlabType:
     """Determine slab type based on click position."""
+    logger.debug("get_slab_type: click_position=%s, click_direction=%s", click_position, click_direction)
     _, y, _ = click_position
 
     if click_direction == Direction.UP:
@@ -375,6 +389,7 @@ def can_place_block(
     Returns:
         Tuple of (can_place, reason)
     """
+    logger.debug("can_place_block: block_id=%s, pos=%s, context=%s, world=%s", block_id, pos, context, world)
     if block_id not in PLACEMENT_RULES:
         return True, "No rules defined, assuming placeable"
 
@@ -447,6 +462,7 @@ def get_placed_state(
     Returns:
         BlockState with appropriate metadata
     """
+    logger.debug("get_placed_state: block_id=%s, pos=%s, context=%s, world=%s", block_id, pos, context, world)
     if block_id not in PLACEMENT_RULES:
         return BlockState(block_id)
 
@@ -526,6 +542,7 @@ class FallingBlockPhysics:
     @staticmethod
     def should_fall(pos: Position, world: dict[Position, BlockState]) -> bool:
         """Check if a falling block at this position should fall."""
+        logger.debug("FallingBlockPhysics.should_fall: pos=%s, world=%s", pos, world)
         below = world.get(pos.offset(Direction.DOWN))
         if below is None:
             return True  # Void
@@ -547,6 +564,7 @@ class FallingBlockPhysics:
         Returns:
             Tuple of (final_position, ticks_elapsed)
         """
+        logger.debug("FallingBlockPhysics.simulate_fall: start_pos=%s, world=%s, max_ticks=%s", start_pos, world, max_ticks)
         y = float(start_pos.y)
         velocity = 0.0
         ticks = 0
@@ -586,6 +604,7 @@ class FallingBlockPhysics:
         """
         # h = 0.5 * g * t^2, solving for t
         # t = sqrt(2h / g)
+        logger.debug("FallingBlockPhysics.fall_time_seconds: height=%s", height)
         g = FallingBlockPhysics.GRAVITY * FallingBlockPhysics.TICK_RATE**2
         t = math.sqrt(2 * height / g)
         return t
@@ -595,13 +614,16 @@ class BlockPlacingVerifier:
     """Verifier for block placing mechanics."""
 
     def __init__(self) -> None:
+        logger.info("BlockPlacingVerifier.__init__ called")
         self.test_results: list[tuple[str, bool, str]] = []
 
     def _add_result(self, name: str, passed: bool, message: str = "") -> None:
+        logger.debug("BlockPlacingVerifier._add_result: name=%s, passed=%s, message=%s", name, passed, message)
         self.test_results.append((name, passed, message))
 
     def verify_log_axis_placement(self) -> bool:
         """Test log axis based on clicked face."""
+        logger.debug("BlockPlacingVerifier.verify_log_axis_placement called")
         test_cases = [
             (Direction.UP, Axis.Y),
             (Direction.DOWN, Axis.Y),
@@ -626,6 +648,7 @@ class BlockPlacingVerifier:
 
     def verify_stair_facing(self) -> bool:
         """Test stair facing based on player direction."""
+        logger.debug("BlockPlacingVerifier.verify_stair_facing called")
         world: dict[Position, BlockState] = {}
         pos = Position(0, 0, 0)
 
@@ -653,6 +676,7 @@ class BlockPlacingVerifier:
 
     def verify_stair_half(self) -> bool:
         """Test stair half based on click position."""
+        logger.debug("BlockPlacingVerifier.verify_stair_half called")
         world: dict[Position, BlockState] = {}
         pos = Position(0, 0, 0)
 
@@ -690,6 +714,7 @@ class BlockPlacingVerifier:
         """Test stair shape connections."""
         # Create a world with stairs for corner detection
         # Straight stair
+        logger.debug("BlockPlacingVerifier.verify_stair_shapes called")
         world: dict[Position, BlockState] = {}
         pos = Position(5, 64, 5)
 
@@ -742,6 +767,7 @@ class BlockPlacingVerifier:
 
     def verify_slab_placement(self) -> bool:
         """Test slab placement top/bottom."""
+        logger.debug("BlockPlacingVerifier.verify_slab_placement called")
         world: dict[Position, BlockState] = {}
         pos = Position(0, 0, 0)
 
@@ -775,6 +801,7 @@ class BlockPlacingVerifier:
 
     def verify_torch_placement_rules(self) -> bool:
         """Test torch placement requires solid surface."""
+        logger.debug("BlockPlacingVerifier.verify_torch_placement_rules called")
         all_passed = True
 
         # Torch on ground
@@ -827,6 +854,7 @@ class BlockPlacingVerifier:
 
     def verify_plant_placement_rules(self) -> bool:
         """Test plants require dirt/grass below."""
+        logger.debug("BlockPlacingVerifier.verify_plant_placement_rules called")
         all_passed = True
 
         # Sapling on grass
@@ -862,6 +890,7 @@ class BlockPlacingVerifier:
 
     def verify_rail_placement(self) -> bool:
         """Test rails require solid below."""
+        logger.debug("BlockPlacingVerifier.verify_rail_placement called")
         all_passed = True
 
         # Rail on stone
@@ -897,6 +926,7 @@ class BlockPlacingVerifier:
 
     def verify_falling_block_detection(self) -> bool:
         """Test falling block should_fall detection."""
+        logger.debug("BlockPlacingVerifier.verify_falling_block_detection called")
         all_passed = True
 
         # Sand on stone - shouldn't fall
@@ -941,6 +971,7 @@ class BlockPlacingVerifier:
 
     def verify_falling_block_physics(self) -> bool:
         """Test falling block physics simulation."""
+        logger.debug("BlockPlacingVerifier.verify_falling_block_physics called")
         all_passed = True
 
         # Create a world with ground at y=0
@@ -976,6 +1007,7 @@ class BlockPlacingVerifier:
 
     def verify_piston_facing(self) -> bool:
         """Test piston facing based on player direction."""
+        logger.debug("BlockPlacingVerifier.verify_piston_facing called")
         world: dict[Position, BlockState] = {}
         pos = Position(0, 0, 0)
 
@@ -1003,6 +1035,7 @@ class BlockPlacingVerifier:
 
     def verify_door_placement(self) -> bool:
         """Test door placement rules."""
+        logger.debug("BlockPlacingVerifier.verify_door_placement called")
         all_passed = True
 
         # Door on solid ground
@@ -1041,6 +1074,7 @@ class BlockPlacingVerifier:
 
     def verify_y_bounds(self) -> bool:
         """Test Y coordinate bounds checking."""
+        logger.debug("BlockPlacingVerifier.verify_y_bounds called")
         all_passed = True
 
         world: dict[Position, BlockState] = {}
@@ -1081,6 +1115,7 @@ class BlockPlacingVerifier:
 
     def verify_occupied_position(self) -> bool:
         """Test cannot place in occupied position."""
+        logger.debug("BlockPlacingVerifier.verify_occupied_position called")
         world: dict[Position, BlockState] = {
             Position(0, 0, 0): BlockState("stone"),
         }
@@ -1104,6 +1139,7 @@ class BlockPlacingVerifier:
         Returns:
             Tuple of (passed_count, total_count)
         """
+        logger.debug("BlockPlacingVerifier.run_all_tests called")
         self.test_results.clear()
 
         self.verify_log_axis_placement()
@@ -1128,6 +1164,7 @@ class BlockPlacingVerifier:
 
     def print_results(self) -> None:
         """Print all test results."""
+        logger.debug("BlockPlacingVerifier.print_results called")
         passed = sum(1 for _, p, _ in self.test_results if p)
         total = len(self.test_results)
 
@@ -1146,6 +1183,7 @@ class BlockPlacingVerifier:
 
 def main() -> None:
     """Run block placing verification."""
+    logger.debug("main called")
     verifier = BlockPlacingVerifier()
     passed, total = verifier.run_all_tests()
     verifier.print_results()

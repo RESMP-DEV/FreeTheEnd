@@ -8,6 +8,10 @@ Run from contrib/minecraft_sim/:
 import mc189_core
 import numpy as np
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 config = mc189_core.SimulatorConfig()
 config.num_envs = 16
 config.shader_dir = "cpp/shaders"
@@ -22,6 +26,7 @@ obs = sim.get_observations()
 
 
 def decode_pos(obs, idx=0):
+    logger.debug("decode_pos: obs=%s, idx=%s", obs, idx)
     x = obs[idx, 0] * 100
     y = obs[idx, 1] * 50 + 64
     z = obs[idx, 2] * 100
@@ -29,6 +34,7 @@ def decode_pos(obs, idx=0):
 
 
 def decode_dragon_pos(obs, idx=0):
+    logger.debug("decode_dragon_pos: obs=%s, idx=%s", obs, idx)
     x = obs[idx, 17] * 100
     y = obs[idx, 18] * 50 + 64
     z = obs[idx, 19] * 100

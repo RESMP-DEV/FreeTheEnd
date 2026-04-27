@@ -14,6 +14,11 @@ try:
 
     _HAS_CORE = True
 except ImportError:  # pragma: no cover - fallback for environments without bindings
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     _mc189 = None
     _HAS_CORE = False
 

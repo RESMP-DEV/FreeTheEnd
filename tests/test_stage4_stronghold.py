@@ -67,6 +67,11 @@ try:
     HAS_STAGE_ENVS = True
     _stage_envs_error = ""
 except ImportError as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     HAS_STAGE_ENVS = False
     StrongholdFindingEnv = None
     StageConfig = None

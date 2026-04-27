@@ -23,6 +23,10 @@ from typing import Any
 
 import numpy as np
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class SpeedrunStage(IntEnum):
     """Speedrun stages matching curriculum StageID."""
@@ -163,6 +167,7 @@ class SpeedrunProgress:
 
     def reset_episode(self) -> None:
         """Reset per-episode counters while preserving cumulative stats."""
+        logger.debug("SpeedrunProgress.reset_episode called")
         self.episode_count += 1
         self.current_stage = 1
 
@@ -175,6 +180,7 @@ class SpeedrunProgress:
         Returns:
             Completion percentage [0.0, 1.0].
         """
+        logger.debug("SpeedrunProgress.get_stage_completion: stage=%s", stage)
         stage_val = stage.value if isinstance(stage, SpeedrunStage) else stage
 
         if stage_val == SpeedrunStage.SURVIVAL:
@@ -230,6 +236,7 @@ class SpeedrunProgress:
         Returns:
             Weighted average completion across all stages [0.0, 1.0].
         """
+        logger.debug("SpeedrunProgress.get_overall_completion called")
         weights = [1.0, 1.5, 2.0, 2.0, 1.5, 3.0]  # Later stages weighted more
         completions = [self.get_stage_completion(s) for s in SpeedrunStage]
         return sum(c * w for c, w in zip(completions, weights)) / sum(weights)
@@ -243,6 +250,7 @@ class SpeedrunProgress:
         Returns:
             True if stage is considered complete.
         """
+        logger.debug("SpeedrunProgress.is_stage_complete: stage=%s", stage)
         stage_val = stage.value if isinstance(stage, SpeedrunStage) else stage
 
         if stage_val == SpeedrunStage.SURVIVAL:
@@ -265,6 +273,7 @@ class SpeedrunProgress:
         Returns:
             Float32 array of shape (32,) with normalized progress values.
         """
+        logger.debug("SpeedrunProgress.to_observation called")
         return np.array(
             [
                 # Stage 1 (5 values)
@@ -316,6 +325,7 @@ class SpeedrunProgress:
         Returns:
             Dictionary representation suitable for JSON serialization.
         """
+        logger.debug("SpeedrunProgress.to_dict called")
         return asdict(self)
 
     @classmethod
@@ -329,6 +339,7 @@ class SpeedrunProgress:
             SpeedrunProgress instance.
         """
         # Handle nested dicts that need int keys
+        logger.debug("SpeedrunProgress.from_dict: data=%s", data)
         if "stage_times" in data and isinstance(data["stage_times"], dict):
             data["stage_times"] = {int(k): v for k, v in data["stage_times"].items()}
         if "stage_deaths" in data and isinstance(data["stage_deaths"], dict):
@@ -341,6 +352,7 @@ class SpeedrunProgress:
         Args:
             path: Path to save file.
         """
+        logger.debug("SpeedrunProgress.save: path=%s", path)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
@@ -356,6 +368,7 @@ class SpeedrunProgress:
         Returns:
             Loaded SpeedrunProgress instance.
         """
+        logger.info("SpeedrunProgress.load: path=%s", path)
         with open(path) as f:
             data = json.load(f)
         return cls.from_dict(data)
@@ -389,6 +402,7 @@ class ProgressTracker:
         Returns:
             Dictionary of reward signals for achievements unlocked this tick.
         """
+        logger.debug("ProgressTracker.update_from_observation: obs=%s", obs)
         rewards: dict[str, float] = {}
         p = self.progress
 
@@ -487,6 +501,7 @@ class ProgressTracker:
 
     def _update_inventory_progress(self, inv: dict[str, int], rewards: dict[str, float]) -> None:
         """Update progress based on inventory contents."""
+        logger.debug("ProgressTracker._update_inventory_progress: inv=%s, rewards=%s", inv, rewards)
         p = self.progress
 
         # Wood (item IDs 17, 162 for logs, or count from inventory summary)
@@ -559,6 +574,7 @@ class ProgressTracker:
 
     def _update_dragon_progress(self, dragon: dict[str, Any], rewards: dict[str, float]) -> None:
         """Update progress from dragon fight state."""
+        logger.debug("ProgressTracker._update_dragon_progress: dragon=%s, rewards=%s", dragon, rewards)
         p = self.progress
 
         # Track dragon damage
@@ -602,6 +618,7 @@ class ProgressTracker:
             Dictionary with keys 'progress', 'stage_completions',
             'overall_completion', and 'current_stage'.
         """
+        logger.debug("ProgressTracker.to_snapshot called")
         p = self.progress
         return {
             "progress": p.to_dict(),
@@ -615,6 +632,7 @@ class ProgressTracker:
 
     def reset(self) -> None:
         """Reset tracker for new episode while preserving cumulative stats."""
+        logger.debug("ProgressTracker.reset called")
         self.progress.reset_episode()
         self.prev_health = 20.0
         self.prev_dimension = 0
@@ -627,6 +645,7 @@ def create_progress_observation_space() -> tuple[np.ndarray, np.ndarray]:
     Returns:
         Tuple of (low_bounds, high_bounds) arrays of shape (32,).
     """
+    logger.info("create_progress_observation_space called")
     low = np.zeros(32, dtype=np.float32)
     high = np.ones(32, dtype=np.float32)
     return low, high
@@ -641,6 +660,7 @@ def merge_progress(runs: list[SpeedrunProgress]) -> SpeedrunProgress:
     Returns:
         New SpeedrunProgress with summed/maxed values.
     """
+    logger.debug("merge_progress: runs=%s", runs)
     if not runs:
         return SpeedrunProgress()
 

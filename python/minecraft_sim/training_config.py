@@ -18,11 +18,16 @@ from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
 
 
 def _merge_nested(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge override into base, creating nested structure."""
+    logger.debug("_merge_nested: base=%s, override=%s", base, override)
     result = base.copy()
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
@@ -34,12 +39,14 @@ def _merge_nested(base: dict[str, Any], override: dict[str, Any]) -> dict[str, A
 
 def _is_dataclass_type(tp: type) -> bool:
     """Check if a type is a dataclass."""
+    logger.debug("_is_dataclass_type: tp=%s", tp)
     return dataclasses.is_dataclass(tp) and isinstance(tp, type)
 
 
 def _dataclass_from_dict(cls: type[T], data: dict[str, Any]) -> T:
     """Recursively construct a dataclass from a dictionary."""
     # Get resolved type hints (handles string annotations from __future__)
+    logger.debug("_dataclass_from_dict: data=%s", data)
     hints = get_type_hints(cls)
     kwargs: dict[str, Any] = {}
 
@@ -251,6 +258,7 @@ class TrainingConfig:
             FileNotFoundError: If the config file doesn't exist.
             yaml.YAMLError: If the file contains invalid YAML.
         """
+        logger.debug("TrainingConfig.from_yaml: path=%s", path)
         path = Path(path)
         with path.open() as f:
             data = yaml.safe_load(f) or {}
@@ -266,6 +274,7 @@ class TrainingConfig:
         Returns:
             TrainingConfig instance.
         """
+        logger.debug("TrainingConfig.from_dict: data=%s", data)
         return _dataclass_from_dict(cls, data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -274,6 +283,7 @@ class TrainingConfig:
         Returns:
             Nested dictionary representation.
         """
+        logger.debug("TrainingConfig.to_dict called")
         return asdict(self)
 
     def to_yaml(self, path: str | Path) -> None:
@@ -282,6 +292,7 @@ class TrainingConfig:
         Args:
             path: Path to save the YAML file.
         """
+        logger.debug("TrainingConfig.to_yaml: path=%s", path)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
@@ -296,6 +307,7 @@ class TrainingConfig:
         Returns:
             New TrainingConfig with merged values.
         """
+        logger.debug("TrainingConfig.merge: overrides=%s", overrides)
         base = self.to_dict()
         merged = _merge_nested(base, overrides)
         return self.from_dict(merged)
@@ -306,6 +318,7 @@ class TrainingConfig:
         Returns:
             List of validation error messages (empty if valid).
         """
+        logger.debug("TrainingConfig.validate called")
         errors: list[str] = []
 
         # Environment validation

@@ -2,8 +2,12 @@
 
 import sys
 from pathlib import Path
+import logging
 
 # Use project-relative paths
+
+logger = logging.getLogger(__name__)
+
 _SIM_ROOT = Path(__file__).parent.parent.parent
 _PYTHON_DIR = _SIM_ROOT / "python"
 _CPP_BUILD_DIR = _SIM_ROOT / "cpp" / "build"

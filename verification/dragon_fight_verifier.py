@@ -1051,6 +1051,10 @@ def main() -> None:
     """Run verification from command line."""
     import sys
 
+import logging
+
+logger = logging.getLogger(__name__)
+
     verifier = DragonFightVerifier()
 
     if len(sys.argv) > 1:

@@ -25,6 +25,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class RewardStats:
@@ -40,16 +44,19 @@ class RewardStats:
 
 def _get_inventory(state: dict[str, Any], item: str, default: int = 0) -> int:
     """Safely get item count from inventory."""
+    logger.debug("_get_inventory: state=%s, item=%s, default=%s", state, item, default)
     return state.get("inventory", {}).get(item, default)
 
 
 def _get_flag(state: dict[str, Any], flag: str) -> bool:
     """Safely get boolean flag from state."""
+    logger.debug("_get_flag: state=%s, flag=%s", state, flag)
     return bool(state.get(flag, False))
 
 
 def _get_value(state: dict[str, Any], key: str, default: float = 0.0) -> float:
     """Safely get numeric value from state."""
+    logger.debug("_get_value: state=%s, key=%s, default=%s", state, key, default)
     return float(state.get(key, default))
 
 
@@ -73,11 +80,13 @@ def create_stage1_reward_shaper() -> Callable[[dict[str, Any]], float]:
     Returns:
         Callable that takes state dict and returns shaped reward.
     """
+    logger.info("create_stage1_reward_shaper called")
     given_rewards: set[str] = set()
     prev_state: dict[str, Any] = {}
     stats = RewardStats()
 
     def shape_reward(state: dict[str, Any]) -> float:
+        logger.debug("shape_reward: state=%s", state)
         nonlocal prev_state
         reward = 0.0
 
@@ -233,11 +242,13 @@ def create_stage2_reward_shaper() -> Callable[[dict[str, Any]], float]:
     Returns:
         Callable that takes state dict and returns shaped reward.
     """
+    logger.info("create_stage2_reward_shaper called")
     given_rewards: set[str] = set()
     prev_state: dict[str, Any] = {}
     stats = RewardStats()
 
     def shape_reward(state: dict[str, Any]) -> float:
+        logger.debug("shape_reward: state=%s", state)
         nonlocal prev_state
         reward = 0.0
 
@@ -367,11 +378,13 @@ def create_stage3_reward_shaper() -> Callable[[dict[str, Any]], float]:
     Returns:
         Callable that takes state dict and returns shaped reward.
     """
+    logger.info("create_stage3_reward_shaper called")
     given_rewards: set[str] = set()
     prev_state: dict[str, Any] = {}
     stats = RewardStats()
 
     def shape_reward(state: dict[str, Any]) -> float:
+        logger.debug("shape_reward: state=%s", state)
         nonlocal prev_state
         reward = 0.0
 
@@ -503,11 +516,13 @@ def create_stage4_reward_shaper() -> Callable[[dict[str, Any]], float]:
     Returns:
         Callable that takes state dict and returns shaped reward.
     """
+    logger.info("create_stage4_reward_shaper called")
     given_rewards: set[str] = set()
     prev_state: dict[str, Any] = {}
     stats = RewardStats()
 
     def shape_reward(state: dict[str, Any]) -> float:
+        logger.debug("shape_reward: state=%s", state)
         nonlocal prev_state
         reward = 0.0
 
@@ -668,12 +683,14 @@ def create_stage5_reward_shaper() -> Callable[[dict[str, Any]], float]:
     Returns:
         Callable that takes state dict and returns shaped reward.
     """
+    logger.info("create_stage5_reward_shaper called")
     given_rewards: set[str] = set()
     prev_state: dict[str, Any] = {}
     stats = RewardStats()
     triangulation_points: list[tuple[float, float]] = []
 
     def shape_reward(state: dict[str, Any]) -> float:
+        logger.debug("shape_reward: state=%s", state)
         nonlocal prev_state
         reward = 0.0
 
@@ -814,12 +831,14 @@ def create_stage6_reward_shaper() -> Callable[[dict[str, Any]], float]:
     Returns:
         Callable that takes state dict and returns shaped reward.
     """
+    logger.info("create_stage6_reward_shaper called")
     given_rewards: set[str] = set()
     prev_state: dict[str, Any] = {}
     stats = RewardStats()
     max_dragon_health_seen = 200.0
 
     def shape_reward(state: dict[str, Any]) -> float:
+        logger.debug("shape_reward: state=%s", state)
         nonlocal prev_state, max_dragon_health_seen
         reward = 0.0
 
@@ -997,6 +1016,7 @@ def create_reward_shaper(stage_id: int) -> Callable[[dict[str, Any]], float]:
         >>> state = {"health": 20, "inventory": {"oak_log": 5}}
         >>> reward = shaper(state)
     """
+    logger.info("create_reward_shaper: stage_id=%s", stage_id)
     if stage_id not in REWARD_SHAPERS:
         raise ValueError(f"Invalid stage_id {stage_id}. Must be 1-6.")
     return REWARD_SHAPERS[stage_id]()
@@ -1013,6 +1033,7 @@ def get_reward_shaper_factory(stage_id: int) -> Callable[[], Callable[[dict[str,
     Returns:
         Factory function that creates reward shapers.
     """
+    logger.debug("get_reward_shaper_factory: stage_id=%s", stage_id)
     if stage_id not in REWARD_SHAPERS:
         raise ValueError(f"Invalid stage_id {stage_id}. Must be 1-6.")
     return REWARD_SHAPERS[stage_id]
@@ -1038,12 +1059,14 @@ class CompositeRewardShaper:
         Args:
             initial_stage: Starting stage (1-6).
         """
+        logger.info("CompositeRewardShaper.__init__: initial_stage=%s", initial_stage)
         self.current_stage = initial_stage
         self._shapers: dict[int, Callable[[dict[str, Any]], float]] = {}
         self._ensure_shaper(initial_stage)
 
     def _ensure_shaper(self, stage_id: int) -> None:
         """Ensure a shaper exists for the given stage."""
+        logger.debug("CompositeRewardShaper._ensure_shaper: stage_id=%s", stage_id)
         if stage_id not in self._shapers:
             self._shapers[stage_id] = create_reward_shaper(stage_id)
 
@@ -1053,6 +1076,7 @@ class CompositeRewardShaper:
         Args:
             stage_id: Stage to switch to (1-6).
         """
+        logger.debug("CompositeRewardShaper.set_stage: stage_id=%s", stage_id)
         if stage_id < 1 or stage_id > 6:
             raise ValueError(f"Invalid stage_id {stage_id}. Must be 1-6.")
         self.current_stage = stage_id
@@ -1064,6 +1088,7 @@ class CompositeRewardShaper:
         Returns:
             True if advanced, False if already at final stage.
         """
+        logger.debug("CompositeRewardShaper.advance_stage called")
         if self.current_stage >= 6:
             return False
         self.current_stage += 1
@@ -1079,6 +1104,7 @@ class CompositeRewardShaper:
         Returns:
             Shaped reward value.
         """
+        logger.debug("CompositeRewardShaper.shape_reward: state=%s", state)
         self._ensure_shaper(self.current_stage)
         return self._shapers[self.current_stage](state)
 
@@ -1088,6 +1114,7 @@ class CompositeRewardShaper:
         Args:
             stage_id: Optionally set stage on reset.
         """
+        logger.debug("CompositeRewardShaper.reset: stage_id=%s", stage_id)
         if stage_id is not None:
             self.set_stage(stage_id)
         # Reset all shapers
@@ -1101,6 +1128,7 @@ class CompositeRewardShaper:
         Returns:
             RewardStats if available, None otherwise.
         """
+        logger.debug("CompositeRewardShaper.get_stats called")
         shaper = self._shapers.get(self.current_stage)
         if shaper and hasattr(shaper, "stats"):
             return shaper.stats  # type: ignore[attr-defined]

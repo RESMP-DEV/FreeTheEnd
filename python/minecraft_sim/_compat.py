@@ -33,3 +33,7 @@ except ImportError:
 # For type checkers: expose the types when gymnasium is available
 if TYPE_CHECKING:
     from gymnasium import spaces as spaces  # noqa: F811
+
+import logging
+
+logger = logging.getLogger(__name__)

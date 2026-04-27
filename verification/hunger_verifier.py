@@ -11,6 +11,10 @@ Tests:
 from dataclasses import dataclass
 from enum import Enum
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class PlayerAction(Enum):
     """Actions that deplete hunger."""
@@ -49,6 +53,7 @@ class FoodItem:
     @property
     def saturation_ratio(self) -> float:
         """Saturation/hunger ratio (quality indicator)."""
+        logger.debug("FoodItem.saturation_ratio called")
         return self.saturation / max(self.hunger_points, 1)
 
 
@@ -145,12 +150,14 @@ class HungerState:
         saturation: float = 5.0,
         exhaustion: float = 0.0,
     ):
+        logger.info("HungerState.__init__: food_level=%s, saturation=%s, exhaustion=%s", food_level, saturation, exhaustion)
         self.food_level = min(food_level, MAX_FOOD_LEVEL)
         self.saturation = min(saturation, float(self.food_level))
         self.exhaustion = exhaustion
 
     def add_exhaustion(self, amount: float) -> None:
         """Add exhaustion and process any overflow."""
+        logger.debug("HungerState.add_exhaustion: amount=%s", amount)
         self.exhaustion += amount
         while self.exhaustion >= EXHAUSTION_TO_SATURATION:
             self.exhaustion -= EXHAUSTION_TO_SATURATION
@@ -161,6 +168,7 @@ class HungerState:
 
     def eat(self, food: FoodItem) -> bool:
         """Consume food item. Returns True if eaten."""
+        logger.debug("HungerState.eat: food=%s", food)
         if self.food_level >= MAX_FOOD_LEVEL:
             return False  # Can't eat when full
         self.food_level = min(MAX_FOOD_LEVEL, self.food_level + food.hunger_points)
@@ -170,10 +178,12 @@ class HungerState:
 
     def can_sprint(self) -> bool:
         """Check if player can sprint."""
+        logger.debug("HungerState.can_sprint called")
         return self.food_level >= SPRINT_THRESHOLD
 
     def can_regenerate(self) -> bool:
         """Check if player can naturally regenerate health."""
+        logger.debug("HungerState.can_regenerate called")
         return self.food_level >= REGENERATION_THRESHOLD
 
 
@@ -181,15 +191,18 @@ class HungerVerifier:
     """Verification suite for hunger mechanics."""
 
     def __init__(self):
+        logger.info("HungerVerifier.__init__ called")
         self.results: list[tuple[str, bool, str]] = []
 
     def verify(self, name: str, condition: bool, message: str = "") -> bool:
         """Record verification result."""
+        logger.debug("HungerVerifier.verify: name=%s, condition=%s, message=%s", name, condition, message)
         self.results.append((name, condition, message))
         return condition
 
     def run_all(self) -> dict[str, bool | int | list[tuple[str, bool, str]]]:
         """Run all verification tests."""
+        logger.debug("HungerVerifier.run_all called")
         self.results.clear()
 
         self._verify_exhaustion_costs()
@@ -213,6 +226,7 @@ class HungerVerifier:
 
     def _verify_exhaustion_costs(self) -> None:
         """Verify exhaustion costs are defined for all actions."""
+        logger.debug("HungerVerifier._verify_exhaustion_costs called")
         for action in PlayerAction:
             cost = EXHAUSTION_COSTS.get(action)
             self.verify(
@@ -242,6 +256,7 @@ class HungerVerifier:
     def _verify_food_restoration(self) -> None:
         """Verify food item values are correct."""
         # Best foods
+        logger.debug("HungerVerifier._verify_food_restoration called")
         self.verify(
             "golden_carrot_best_saturation",
             FOOD_ITEMS["golden_carrot"].saturation >= 14.0,
@@ -286,6 +301,7 @@ class HungerVerifier:
     def _verify_sprint_threshold(self) -> None:
         """Verify sprint threshold behavior."""
         # At threshold
+        logger.debug("HungerVerifier._verify_sprint_threshold called")
         state_at = HungerState(food_level=SPRINT_THRESHOLD)
         self.verify(
             "can_sprint_at_threshold",
@@ -311,6 +327,7 @@ class HungerVerifier:
     def _verify_regeneration_threshold(self) -> None:
         """Verify natural regeneration threshold."""
         # At threshold
+        logger.debug("HungerVerifier._verify_regeneration_threshold called")
         state_at = HungerState(food_level=REGENERATION_THRESHOLD)
         self.verify(
             "can_regen_at_threshold",
@@ -336,6 +353,7 @@ class HungerVerifier:
     def _verify_starvation_damage(self) -> None:
         """Verify starvation damage per difficulty."""
         # Peaceful: no starvation
+        logger.debug("HungerVerifier._verify_starvation_damage called")
         dmg, min_hp = STARVATION_DAMAGE[Difficulty.PEACEFUL]
         self.verify(
             "peaceful_no_starvation",
@@ -369,6 +387,7 @@ class HungerVerifier:
 
     def _verify_saturation_cap(self) -> None:
         """Verify saturation cannot exceed food level."""
+        logger.debug("HungerVerifier._verify_saturation_cap called")
         state = HungerState(food_level=10, saturation=20.0)
         self.verify(
             "saturation_capped_to_food_level",
@@ -388,6 +407,7 @@ class HungerVerifier:
     def _verify_exhaustion_overflow(self) -> None:
         """Verify exhaustion overflow mechanics."""
         # Saturation depletes first
+        logger.debug("HungerVerifier._verify_exhaustion_overflow called")
         state = HungerState(food_level=20, saturation=5.0, exhaustion=0.0)
         state.add_exhaustion(4.0)  # Should drain 1 saturation
         self.verify(
@@ -408,6 +428,7 @@ class HungerVerifier:
 
 def verify_hunger_mechanics() -> dict:
     """Run full hunger mechanics verification."""
+    logger.debug("verify_hunger_mechanics called")
     verifier = HungerVerifier()
     return verifier.run_all()
 

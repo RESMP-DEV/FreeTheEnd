@@ -31,6 +31,10 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 from minecraft_sim import SB3VecFreeTheEndEnv
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def evaluate_stage(
     model: PPO,
@@ -53,6 +57,7 @@ def evaluate_stage(
     Returns:
         Dictionary with evaluation metrics.
     """
+    logger.debug("evaluate_stage: model=%s, stage=%s, num_episodes=%s, deterministic=%s", model, stage, num_episodes, deterministic)
     env = SB3VecFreeTheEndEnv(
         num_envs=num_envs,
         start_stage=stage,
@@ -127,6 +132,7 @@ def evaluate_full_speedrun(
         Dictionary with full speedrun metrics.
     """
     # Start from stage 1 for full speedrun
+    logger.debug("evaluate_full_speedrun: model=%s, num_episodes=%s, deterministic=%s, num_envs=%s", model, num_episodes, deterministic, num_envs)
     env = SB3VecFreeTheEndEnv(
         num_envs=num_envs,
         start_stage=1,
@@ -218,6 +224,7 @@ def evaluate_with_vecnorm(
         Dictionary with evaluation results.
     """
     # Create base environment
+    logger.debug("evaluate_with_vecnorm: model=%s, vecnorm_path=%s, stage=%s, num_episodes=%s", model, vecnorm_path, stage, num_episodes)
     base_env = SB3VecFreeTheEndEnv(
         num_envs=num_envs,
         start_stage=stage if stage else 1,
@@ -282,6 +289,7 @@ def evaluate_with_vecnorm(
 
 
 def main() -> int:
+    logger.debug("main called")
     parser = argparse.ArgumentParser(
         description="Evaluate trained Minecraft speedrun agents with SB3.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

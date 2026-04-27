@@ -38,6 +38,11 @@ try:
     HAS_STAGE_ENVS = True
     _import_error = ""
 except ImportError as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     HAS_STAGE_ENVS = False
     EndermanHuntingEnv = None  # type: ignore[assignment, misc]
     StageConfig = None  # type: ignore[assignment, misc]

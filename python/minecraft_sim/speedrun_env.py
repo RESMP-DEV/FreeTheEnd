@@ -1181,6 +1181,11 @@ class SpeedrunEnv(gym.Env):
                 sim_action = self._map_action(action)
                 self._sim.step(np.array([sim_action], dtype=np.int32))
             except Exception:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
                 pass
 
         # Tick dimension cooldown

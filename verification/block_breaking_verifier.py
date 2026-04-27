@@ -10,6 +10,10 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class ToolType(Enum):
     """Tool categories that affect block breaking speed."""
@@ -35,6 +39,7 @@ class ToolMaterial(Enum):
     GOLD = (12.0, 0)  # Fast but low harvest level
 
     def __init__(self, speed: float, harvest_level: int) -> None:
+        logger.info("ToolMaterial.__init__: speed=%s, harvest_level=%s", speed, harvest_level)
         self.speed = speed
         self.harvest_level = harvest_level
 
@@ -461,6 +466,7 @@ def calculate_break_time(
     Returns:
         Break time in seconds, or math.inf for unbreakable blocks
     """
+    logger.debug("calculate_break_time: block_id=%s, tool=%s, in_water=%s, on_ground=%s", block_id, tool, in_water, on_ground)
     if block_id not in BLOCK_REGISTRY:
         raise ValueError(f"Unknown block: {block_id}")
 
@@ -556,6 +562,7 @@ def get_drops(
     Returns:
         List of (item_id, min_count, max_count) tuples
     """
+    logger.debug("get_drops: block_id=%s, tool=%s", block_id, tool)
     if block_id not in BLOCK_REGISTRY:
         raise ValueError(f"Unknown block: {block_id}")
 
@@ -608,13 +615,16 @@ class BlockBreakingVerifier:
     """Verifier for block breaking mechanics."""
 
     def __init__(self) -> None:
+        logger.info("BlockBreakingVerifier.__init__ called")
         self.test_results: list[tuple[str, bool, str]] = []
 
     def _add_result(self, name: str, passed: bool, message: str = "") -> None:
+        logger.debug("BlockBreakingVerifier._add_result: name=%s, passed=%s, message=%s", name, passed, message)
         self.test_results.append((name, passed, message))
 
     def verify_instant_break_blocks(self) -> bool:
         """Test that instant-break blocks break in one tick."""
+        logger.debug("BlockBreakingVerifier.verify_instant_break_blocks called")
         instant_blocks = [
             "torch",
             "redstone_torch",
@@ -646,6 +656,7 @@ class BlockBreakingVerifier:
 
     def verify_unbreakable_blocks(self) -> bool:
         """Test that unbreakable blocks return infinite break time."""
+        logger.debug("BlockBreakingVerifier.verify_unbreakable_blocks called")
         unbreakable = ["bedrock", "end_portal_frame", "barrier", "command_block"]
 
         all_passed = True
@@ -665,6 +676,7 @@ class BlockBreakingVerifier:
 
     def verify_tool_speeds(self) -> bool:
         """Test that proper tools break blocks faster."""
+        logger.debug("BlockBreakingVerifier.verify_tool_speeds called")
         test_cases = [
             ("stone", ToolType.PICKAXE, ToolMaterial.WOOD),
             ("oak_log", ToolType.AXE, ToolMaterial.WOOD),
@@ -694,6 +706,7 @@ class BlockBreakingVerifier:
 
     def verify_harvest_levels(self) -> bool:
         """Test that blocks require proper harvest level."""
+        logger.debug("BlockBreakingVerifier.verify_harvest_levels called")
         test_cases = [
             ("iron_ore", ToolMaterial.WOOD, False),
             ("iron_ore", ToolMaterial.STONE, True),
@@ -728,6 +741,7 @@ class BlockBreakingVerifier:
 
     def verify_efficiency_enchantment(self) -> bool:
         """Test that efficiency enchantment speeds up mining."""
+        logger.debug("BlockBreakingVerifier.verify_efficiency_enchantment called")
         all_passed = True
 
         for eff_level in [1, 2, 3, 4, 5]:
@@ -751,6 +765,7 @@ class BlockBreakingVerifier:
 
     def verify_haste_effect(self) -> bool:
         """Test that haste effect speeds up mining."""
+        logger.debug("BlockBreakingVerifier.verify_haste_effect called")
         all_passed = True
 
         tool = ToolProperties(ToolType.PICKAXE, ToolMaterial.DIAMOND)
@@ -771,6 +786,7 @@ class BlockBreakingVerifier:
 
     def verify_mining_fatigue(self) -> bool:
         """Test that mining fatigue slows mining."""
+        logger.debug("BlockBreakingVerifier.verify_mining_fatigue called")
         all_passed = True
 
         tool = ToolProperties(ToolType.PICKAXE, ToolMaterial.DIAMOND)
@@ -790,6 +806,7 @@ class BlockBreakingVerifier:
 
     def verify_water_penalty(self) -> bool:
         """Test that mining underwater is slower."""
+        logger.debug("BlockBreakingVerifier.verify_water_penalty called")
         tool = ToolProperties(ToolType.PICKAXE, ToolMaterial.DIAMOND)
 
         normal_time = calculate_break_time("stone", tool)
@@ -805,6 +822,7 @@ class BlockBreakingVerifier:
 
     def verify_air_penalty(self) -> bool:
         """Test that mining in air is slower."""
+        logger.debug("BlockBreakingVerifier.verify_air_penalty called")
         tool = ToolProperties(ToolType.PICKAXE, ToolMaterial.DIAMOND)
 
         ground_time = calculate_break_time("stone", tool, on_ground=True)
@@ -820,6 +838,7 @@ class BlockBreakingVerifier:
 
     def verify_silk_touch_drops(self) -> bool:
         """Test silk touch drop behavior."""
+        logger.debug("BlockBreakingVerifier.verify_silk_touch_drops called")
         test_cases = [
             ("stone", "stone"),  # Drops stone instead of cobblestone
             ("grass_block", "grass_block"),  # Drops grass block instead of dirt
@@ -854,6 +873,7 @@ class BlockBreakingVerifier:
 
     def verify_fortune_drops(self) -> bool:
         """Test fortune enchantment increases drops."""
+        logger.debug("BlockBreakingVerifier.verify_fortune_drops called")
         ore_blocks = [
             "coal_ore",
             "diamond_ore",
@@ -893,6 +913,7 @@ class BlockBreakingVerifier:
         # Obsidian: hardness 50, requires diamond pickaxe
 
         # Diamond pickaxe: ~9.4 seconds
+        logger.debug("BlockBreakingVerifier.verify_obsidian_break_time called")
         diamond_pick = ToolProperties(ToolType.PICKAXE, ToolMaterial.DIAMOND)
         diamond_time = calculate_break_time("obsidian", diamond_pick)
 
@@ -922,6 +943,7 @@ class BlockBreakingVerifier:
 
     def verify_shears_special_cases(self) -> bool:
         """Test shears on special blocks (wool, leaves, cobweb)."""
+        logger.debug("BlockBreakingVerifier.verify_shears_special_cases called")
         all_passed = True
 
         shears = ToolProperties(ToolType.SHEARS, ToolMaterial.HAND)
@@ -972,6 +994,7 @@ class BlockBreakingVerifier:
         Returns:
             Tuple of (passed_count, total_count)
         """
+        logger.debug("BlockBreakingVerifier.run_all_tests called")
         self.test_results.clear()
 
         self.verify_instant_break_blocks()
@@ -995,6 +1018,7 @@ class BlockBreakingVerifier:
 
     def print_results(self) -> None:
         """Print all test results."""
+        logger.debug("BlockBreakingVerifier.print_results called")
         passed, total = len(self.test_results), len(self.test_results)
         passed = sum(1 for _, p, _ in self.test_results if p)
 
@@ -1013,6 +1037,7 @@ class BlockBreakingVerifier:
 
 def main() -> None:
     """Run block breaking verification."""
+    logger.debug("main called")
     verifier = BlockBreakingVerifier()
     passed, total = verifier.run_all_tests()
     verifier.print_results()

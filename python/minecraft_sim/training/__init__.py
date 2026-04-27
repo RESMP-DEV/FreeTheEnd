@@ -15,4 +15,9 @@ try:
 
     __all__.extend(["CurriculumCallback", "LoggingCallback", "CheckpointCallback"])
 except ImportError:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     pass  # stable_baselines3 not installed

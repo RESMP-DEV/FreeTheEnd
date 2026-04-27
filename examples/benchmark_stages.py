@@ -38,6 +38,11 @@ if __name__ == "__main__":
             rate = benchmark_stage(stage_id)
             print(f"{stage_id.name:<25} {rate:>12,.0f}")
         except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             print(f"{stage_id.name:<25} {'ERROR':>12} ({e})")
 
     print("=" * 50)

@@ -51,10 +51,12 @@ class WorldModelProtocol(Protocol):
 
     def encode(self, obs: NDArray[np.float32]) -> NDArray[np.float32]:
         """Encode observations to latent states."""
+        logger.debug("WorldModelProtocol.encode: obs=%s", obs)
         ...
 
     def decode(self, latent: NDArray[np.float32]) -> NDArray[np.float32]:
         """Decode latent states to observation predictions."""
+        logger.debug("WorldModelProtocol.decode: latent=%s", latent)
         ...
 
     def predict(
@@ -63,6 +65,7 @@ class WorldModelProtocol(Protocol):
         action: NDArray[np.int32],
     ) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
         """Predict next latent, reward, and done probability."""
+        logger.debug("WorldModelProtocol.predict: latent=%s, action=%s", latent, action)
         ...
 
 
@@ -88,6 +91,7 @@ class TransitionBatch:
 
     def to_dict(self) -> dict[str, NDArray[Any]]:
         """Convert to dictionary for framework compatibility."""
+        logger.debug("TransitionBatch.to_dict called")
         return {
             "observations": self.observations,
             "actions": self.actions,
@@ -100,11 +104,13 @@ class TransitionBatch:
     @property
     def batch_size(self) -> int:
         """Return batch size."""
+        logger.debug("TransitionBatch.batch_size called")
         return self.observations.shape[0]
 
     @property
     def seq_len(self) -> int:
         """Return sequence length."""
+        logger.debug("TransitionBatch.seq_len called")
         return self.observations.shape[1]
 
 
@@ -145,6 +151,7 @@ class TransitionBuffer:
         obs_shape: tuple[int, ...],
         action_dtype: np.dtype[Any] = np.dtype(np.int32),
     ) -> None:
+        logger.info("TransitionBuffer.__init__: capacity=%s, obs_shape=%s, action_dtype=%s", capacity, obs_shape, action_dtype)
         self.capacity = capacity
         self.obs_shape = obs_shape
         self.action_dtype = action_dtype
@@ -167,6 +174,7 @@ class TransitionBuffer:
     @property
     def size(self) -> int:
         """Current number of stored transitions."""
+        logger.debug("TransitionBuffer.size called")
         return self._size
 
     def add(
@@ -186,6 +194,7 @@ class TransitionBuffer:
             done: Whether episode ended.
             next_obs: Resulting observation.
         """
+        logger.debug("TransitionBuffer.add: obs=%s, action=%s, reward=%s, done=%s", obs, action, reward, done)
         with self._lock:
             self._observations[self._idx] = obs
             self._actions[self._idx] = action
@@ -223,6 +232,7 @@ class TransitionBuffer:
             dones: Done flags, shape (batch,).
             next_obs: Next observations, shape (batch, *obs_shape).
         """
+        logger.debug("TransitionBuffer.add_batch: obs=%s, actions=%s, rewards=%s, dones=%s", obs, actions, rewards, dones)
         batch_size = obs.shape[0]
         with self._lock:
             for i in range(batch_size):
@@ -262,6 +272,7 @@ class TransitionBuffer:
         Raises:
             ValueError: If buffer has fewer transitions than required.
         """
+        logger.debug("TransitionBuffer.sample: batch_size=%s, seq_len=%s", batch_size, seq_len)
         if self._size < seq_len:
             raise ValueError(f"Buffer has {self._size} transitions, need at least {seq_len}")
 
@@ -309,6 +320,7 @@ class TransitionBuffer:
 
     def _get_valid_sequence_starts(self, seq_len: int) -> NDArray[np.int64]:
         """Get valid starting indices for sequences that don't cross buffer boundaries."""
+        logger.info("TransitionBuffer._get_valid_sequence_starts: seq_len=%s", seq_len)
         if self._size == self.capacity:
             # Buffer is full, avoid wraparound region
             invalid_region_start = (self._idx - seq_len + 1) % self.capacity
@@ -331,6 +343,7 @@ class TransitionBuffer:
 
     def clear(self) -> None:
         """Clear all stored transitions."""
+        logger.debug("TransitionBuffer.clear called")
         with self._lock:
             self._idx = 0
             self._size = 0
@@ -339,6 +352,7 @@ class TransitionBuffer:
 
     def get_statistics(self) -> dict[str, Any]:
         """Get buffer statistics."""
+        logger.debug("TransitionBuffer.get_statistics called")
         return {
             "size": self._size,
             "capacity": self.capacity,
@@ -359,6 +373,11 @@ class WorldModelDataLoader:
 
     Provides an iterator interface for sampling batches of transition sequences
     from a TransitionBuffer. Supports configurable sequence lengths for
+
+import logging
+
+logger = logging.getLogger(__name__)
+
     recurrent world models.
 
     Args:
@@ -381,6 +400,7 @@ class WorldModelDataLoader:
         seq_len: int = 50,
         num_batches: int | None = None,
     ) -> None:
+        logger.info("WorldModelDataLoader.__init__: buffer=%s, batch_size=%s, seq_len=%s, num_batches=%s", buffer, batch_size, seq_len, num_batches)
         self.buffer = buffer
         self.batch_size = batch_size
         self.seq_len = seq_len
@@ -431,11 +451,13 @@ class LatentState:
     @property
     def combined(self) -> NDArray[np.float32]:
         """Concatenated deterministic and stochastic states."""
+        logger.debug("LatentState.combined called")
         return np.concatenate([self.deterministic, self.stochastic], axis=-1)
 
     @property
     def shape(self) -> tuple[int, ...]:
         """Shape of combined state."""
+        logger.debug("LatentState.shape called")
         return self.combined.shape
 
 
@@ -463,6 +485,7 @@ class LatentStateExtractor(Generic[T]):
         deterministic_size: int = 512,
         stochastic_size: int = 32,
     ) -> None:
+        logger.info("LatentStateExtractor.__init__: world_model=%s, deterministic_size=%s, stochastic_size=%s", world_model, deterministic_size, stochastic_size)
         self.world_model = world_model
         self.deterministic_size = deterministic_size
         self.stochastic_size = stochastic_size
@@ -476,6 +499,7 @@ class LatentStateExtractor(Generic[T]):
         Returns:
             Zero-initialized LatentState.
         """
+        logger.info("LatentStateExtractor.initial_state: batch_size=%s", batch_size)
         return LatentState(
             deterministic=np.zeros((batch_size, self.deterministic_size), dtype=np.float32),
             stochastic=np.zeros((batch_size, self.stochastic_size), dtype=np.float32),
@@ -499,6 +523,7 @@ class LatentStateExtractor(Generic[T]):
         Returns:
             Posterior LatentState.
         """
+        logger.debug("LatentStateExtractor.encode: obs=%s, prev_state=%s, prev_action=%s", obs, prev_state, prev_action)
         batch_size = obs.shape[0]
 
         if prev_state is None:
@@ -537,6 +562,7 @@ class LatentStateExtractor(Generic[T]):
         Returns:
             Tuple of (next_state, predicted_reward, predicted_done).
         """
+        logger.debug("LatentStateExtractor.imagine_step: state=%s, action=%s", state, action)
         if hasattr(self.world_model, "predict"):
             next_latent, reward, done = self.world_model.predict(state.combined, action)
             next_det = next_latent[..., : self.deterministic_size]
@@ -595,6 +621,7 @@ class DreamEnv:
         horizon: int = 15,
         num_envs: int = 64,
     ) -> None:
+        logger.info("DreamEnv.__init__: world_model=%s, extractor=%s, horizon=%s, num_envs=%s", world_model, extractor, horizon, num_envs)
         self.world_model = world_model
         self.extractor = extractor
         self.horizon = horizon
@@ -623,6 +650,7 @@ class DreamEnv:
         Returns:
             Decoded observation from initial latent state.
         """
+        logger.debug("DreamEnv.reset: initial_obs=%s, initial_state=%s", initial_obs, initial_state)
         self._step_count = 0
         self._latent_trajectory = []
         self._action_trajectory = []
@@ -655,6 +683,7 @@ class DreamEnv:
         Returns:
             Tuple of (observations, rewards, dones, info).
         """
+        logger.debug("DreamEnv.step: actions=%s", actions)
         if self._state is None:
             raise RuntimeError("Must call reset() before step()")
 
@@ -698,6 +727,7 @@ class DreamEnv:
                 - rewards: (horizon, num_envs)
                 - dones: (horizon, num_envs)
         """
+        logger.debug("DreamEnv.get_trajectory called")
         if not self._latent_trajectory:
             raise RuntimeError("No trajectory available. Call reset() and step() first.")
 
@@ -730,6 +760,7 @@ class DreamEnv:
         Returns:
             Lambda-returns, shape (horizon, num_envs).
         """
+        logger.debug("DreamEnv.compute_lambda_returns: values=%s, gamma=%s, lambda_=%s", values, gamma, lambda_)
         if not self._reward_trajectory:
             raise RuntimeError("No trajectory available.")
 
@@ -757,6 +788,7 @@ class DreamEnv:
     @property
     def observation_shape(self) -> tuple[int, ...]:
         """Shape of observations."""
+        logger.debug("DreamEnv.observation_shape called")
         return (self.extractor.deterministic_size + self.extractor.stochastic_size,)
 
 
@@ -780,6 +812,7 @@ def make_buffer(
     Returns:
         Configured TransitionBuffer.
     """
+    logger.debug("make_buffer: capacity=%s, obs_shape=%s, discrete_actions=%s", capacity, obs_shape, discrete_actions)
     action_dtype = np.dtype(np.int32) if discrete_actions else np.dtype(np.float32)
     return TransitionBuffer(capacity, obs_shape, action_dtype)
 
@@ -801,6 +834,7 @@ def make_data_loader(
     Returns:
         Configured WorldModelDataLoader.
     """
+    logger.info("make_data_loader: buffer=%s, batch_size=%s, seq_len=%s, batches_per_epoch=%s", buffer, batch_size, seq_len, batches_per_epoch)
     return WorldModelDataLoader(
         buffer,
         batch_size=batch_size,
@@ -828,6 +862,7 @@ def collect_transitions(
     Returns:
         Collection statistics.
     """
+    logger.debug("collect_transitions: env=%s, policy=%s, buffer=%s, num_steps=%s", env, policy, buffer, num_steps)
     obs, _ = env.reset()
     episode_rewards: list[float] = []
     current_episode_reward = 0.0
@@ -890,6 +925,7 @@ def collect_vec_transitions(
     Returns:
         Collection statistics.
     """
+    logger.debug("collect_vec_transitions: vec_env=%s, policy=%s, buffer=%s, num_steps=%s", vec_env, policy, buffer, num_steps)
     obs = vec_env.reset()
     if isinstance(obs, tuple):
         obs = obs[0]  # Handle (obs, info) return

@@ -11,6 +11,10 @@ import numpy as np
 
 from minecraft_sim import mc189_core
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 config = mc189_core.SimulatorConfig()
 config.num_envs = 1
 config.shader_dir = str(Path(__file__).parent.parent.parent / "cpp" / "shaders")

@@ -53,6 +53,10 @@ class DragonFightEnv:
         # Use MC189Simulator for now (will add DragonFightSimulator later)
         from minecraft_sim.backend import VulkanBackend
 
+import logging
+
+logger = logging.getLogger(__name__)
+
         self.backend = VulkanBackend(num_envs=num_envs)
 
         # Observation and action space

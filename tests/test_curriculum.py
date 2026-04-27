@@ -1838,6 +1838,10 @@ class TestStage3MetadataProgressKeys:
         """Load Stage 3 from YAML config."""
         import yaml
 
+import logging
+
+logger = logging.getLogger(__name__)
+
         config_path = (
             Path(__file__).parent.parent
             / "python"

@@ -17,6 +17,10 @@ if str(_SIM_ROOT / "cpp/build") not in sys.path:
 
 import mc189_core
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 config = mc189_core.SimulatorConfig()
 config.num_envs = 256
 config.shader_dir = str(_SIM_ROOT / "cpp/shaders")

@@ -202,6 +202,11 @@ class TestCPUGPUParity:
             mc.MC189Simulator(cfg)
             return True
         except Exception:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             return False
 
     def test_observation_shapes_match(self, gpu_available):

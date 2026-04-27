@@ -56,17 +56,20 @@ class Vec3:
     z: float
 
     def distance_to(self, other: Vec3) -> float:
+        logger.debug("Vec3.distance_to: other=%s", other)
         return math.sqrt(
             (self.x - other.x) ** 2 + (self.y - other.y) ** 2 + (self.z - other.z) ** 2
         )
 
     def normalized(self) -> Vec3:
+        logger.debug("Vec3.normalized called")
         mag = math.sqrt(self.x**2 + self.y**2 + self.z**2)
         if mag == 0:
             return Vec3(0, 0, 0)
         return Vec3(self.x / mag, self.y / mag, self.z / mag)
 
     def dot(self, other: Vec3) -> float:
+        logger.debug("Vec3.dot: other=%s", other)
         return self.x * other.x + self.y * other.y + self.z * other.z
 
     def __add__(self, other: Vec3) -> Vec3:
@@ -175,11 +178,13 @@ class MobAIVerifier:
     LOOTING_BONUS_PER_LEVEL = 0.01  # +1% per looting level
 
     def __init__(self) -> None:
+        logger.info("MobAIVerifier.__init__ called")
         self.results: list[VerificationResult] = []
         self.current_tick = 0
 
     def reset(self) -> None:
         """Reset verifier state."""
+        logger.debug("MobAIVerifier.reset called")
         self.results.clear()
         self.current_tick = 0
 
@@ -204,6 +209,7 @@ class MobAIVerifier:
         - Distance must be <= 64 blocks
         - Pumpkin helmet negates aggro
         """
+        logger.debug("MobAIVerifier.verify_enderman_eye_contact_aggro: enderman=%s, player=%s", enderman, player)
         test_name = "enderman_eye_contact_aggro"
 
         distance = enderman.position.distance_to(player.position)
@@ -271,6 +277,7 @@ class MobAIVerifier:
         - Cannot teleport into water or lava
         - Cannot teleport onto transparent blocks
         """
+        logger.debug("MobAIVerifier.verify_enderman_teleport_pattern: enderman=%s, teleport_target=%s, current_tick=%s", enderman, teleport_target, current_tick)
         test_name = "enderman_teleport_pattern"
 
         # Check cooldown
@@ -323,6 +330,7 @@ class MobAIVerifier:
         - 0.5 second (10 tick) interval between fireballs in burst
         - 3 second (60 tick) cooldown between bursts
         """
+        logger.debug("MobAIVerifier.verify_blaze_fireball_timing: blaze=%s, fireballs=%s, current_tick=%s", blaze, fireballs, current_tick)
         test_name = "blaze_fireball_timing"
 
         if len(fireballs) < 2:
@@ -376,6 +384,7 @@ class MobAIVerifier:
         - Speed should be approximately 0.4 blocks/tick
         - Should have slight gravity effect
         """
+        logger.debug("MobAIVerifier.verify_blaze_fireball_trajectory: blaze=%s, target=%s, fireball=%s", blaze, target, fireball)
         test_name = "blaze_fireball_trajectory"
 
         # Expected direction (with leading for moving targets)
@@ -420,6 +429,7 @@ class MobAIVerifier:
         - Will also target villagers
         - Prefers players over villagers at equal distance
         """
+        logger.debug("MobAIVerifier.verify_zombie_targeting: zombie=%s, players=%s, villagers=%s", zombie, players, villagers)
         test_name = "zombie_targeting"
 
         # Find valid targets
@@ -469,6 +479,7 @@ class MobAIVerifier:
         - Has line of sight requirement
         - Shoots every ~2 seconds (40 ticks) on Normal difficulty
         """
+        logger.debug("MobAIVerifier.verify_skeleton_shoot_behavior: skeleton=%s, target=%s, arrow_fired=%s, current_tick=%s", skeleton, target, arrow_fired, current_tick)
         test_name = "skeleton_shoot_behavior"
 
         distance = skeleton.position.distance_to(target.position)
@@ -500,6 +511,7 @@ class MobAIVerifier:
         - Path nodes should be at most 1 block apart
         - Path should be reasonably efficient (no backtracking)
         """
+        logger.debug("MobAIVerifier.verify_pathfinding: mob=%s, target=%s, path=%s, obstacles=%s", mob, target, path, obstacles)
         test_name = "pathfinding"
 
         if not path:
@@ -565,6 +577,7 @@ class MobAIVerifier:
         - Aggro lasts 20-40 seconds (400-800 ticks)
         - All aggro'd pigmen target the attacker
         """
+        logger.debug("MobAIVerifier.verify_pigman_group_aggro: attacked_pigman=%s, nearby_pigmen=%s, attacker=%s", attacked_pigman, nearby_pigmen, attacker)
         test_name = "pigman_group_aggro"
 
         should_aggro: list[Mob] = []
@@ -619,6 +632,7 @@ class MobAIVerifier:
         - Must be on solid, non-transparent block
         - Different rules for Nether/End
         """
+        logger.debug("MobAIVerifier.verify_spawning_conditions: spawn_position=%s, light_level=%s, player_positions=%s, block_type=%s", spawn_position, light_level, player_positions, block_type)
         test_name = "spawning_conditions"
 
         # Light level check (doesn't apply in Nether/End for most mobs)
@@ -682,6 +696,7 @@ class MobAIVerifier:
 
         Different mobs have different spawn weights.
         """
+        logger.debug("MobAIVerifier.verify_spawn_rates: spawns_per_minute=%s, mob_type=%s, dimension=%s", spawns_per_minute, mob_type, dimension)
         test_name = "spawn_rates"
 
         # Expected spawn rates (spawns per minute in a chunk)
@@ -724,6 +739,7 @@ class MobAIVerifier:
         - Each looting level adds 1% (up to Looting III = +3%)
         - Common drops are guaranteed with variable quantity
         """
+        logger.debug("MobAIVerifier.verify_drop_rates: mob_type=%s, looting_level=%s, observed_drops=%s, total_kills=%s", mob_type, looting_level, observed_drops, total_kills)
         test_name = "drop_rates"
 
         # Define expected drops per mob type
@@ -795,6 +811,7 @@ class MobAIVerifier:
 
     def run_scenario(self, scenario: dict[str, Any]) -> list[VerificationResult]:
         """Run a test scenario from JSON configuration."""
+        logger.debug("MobAIVerifier.run_scenario: scenario=%s", scenario)
         results: list[VerificationResult] = []
         scenario_type = scenario.get("type", "")
 
@@ -940,6 +957,7 @@ class MobAIVerifier:
 
     def load_and_run_scenarios(self, scenario_file: Path) -> list[VerificationResult]:
         """Load scenarios from JSON and run all tests."""
+        logger.info("MobAIVerifier.load_and_run_scenarios: scenario_file=%s", scenario_file)
         with open(scenario_file) as f:
             data = json.load(f)
 
@@ -954,6 +972,7 @@ class MobAIVerifier:
 
     def generate_report(self) -> str:
         """Generate a summary report of all verification results."""
+        logger.debug("MobAIVerifier.generate_report called")
         total = len(self.results)
         passed = sum(1 for r in self.results if r.passed)
         failed = total - passed
@@ -983,6 +1002,7 @@ class MobAIVerifier:
 
 def main() -> None:
     """Main entry point for verification."""
+    logger.debug("main called")
     import argparse
 
     parser = argparse.ArgumentParser(description="Mob AI Verification System")

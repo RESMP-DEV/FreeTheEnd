@@ -32,6 +32,11 @@ def test_backend():
             o, r, d, i = b.step(a)
             print(f"✓ Batch size {num_envs:5d}: obs={o.shape}")
         except Exception as e:
+
+import logging
+
+logger = logging.getLogger(__name__)
+
             print(f"✗ Batch size {num_envs}: {e}")
 
     # Test throughput with 32K environments

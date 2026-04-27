@@ -25,6 +25,10 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # CONSTANTS
@@ -150,6 +154,7 @@ class PlayerState:
         Returns:
             Array of shape (22,) containing normalized state values.
         """
+        logger.debug("PlayerState.to_array called")
         return np.array(
             [
                 self.x,
@@ -201,6 +206,7 @@ class PlayerState:
     ) -> PlayerState:
         """Create from raw Minecraft values with automatic normalization."""
         # Get dimension bounds for position normalization
+        logger.debug("PlayerState.from_raw: position=%s, velocity=%s, health=%s, max_health=%s", position, velocity, health, max_health)
         bounds = DIMENSION_BOUNDS.get(dimension, OVERWORLD_BOUNDS)
         x_min, x_max, y_min, y_max, z_min, z_max = bounds
 
@@ -268,6 +274,7 @@ class InventorySummary:
         Returns:
             Array of shape (25,) with normalized inventory features.
         """
+        logger.debug("InventorySummary.to_array called")
         counts = np.array(
             [
                 self.blaze_rods,
@@ -312,6 +319,7 @@ class InventorySummary:
             inventory_counts: Stack sizes for 36 slots.
         """
         # Build item ID to count mapping
+        logger.debug("InventorySummary.from_inventory: inventory=%s, inventory_counts=%s", inventory, inventory_counts)
         item_counts: dict[int, int] = {}
         for item_id, count in zip(inventory, inventory_counts, strict=True):
             if item_id > 0:
@@ -359,6 +367,7 @@ class VoxelGrid:
         Returns:
             Array of shape (4096,) with block IDs.
         """
+        logger.debug("VoxelGrid.to_array_ids called")
         return self.blocks.astype(np.int32)
 
     def to_array_onehot(self, num_classes: int = 32) -> NDArray[np.float32]:
@@ -374,6 +383,7 @@ class VoxelGrid:
             Array of shape (4096, num_classes) with one-hot vectors.
         """
         # Clamp block IDs to [0, num_classes-1]
+        logger.debug("VoxelGrid.to_array_onehot: num_classes=%s", num_classes)
         clamped = np.clip(self.blocks, 0, num_classes - 1)
         onehot = np.zeros((VOXEL_GRID_TOTAL, num_classes), dtype=np.float32)
         onehot[np.arange(VOXEL_GRID_TOTAL), clamped] = 1.0
@@ -386,6 +396,7 @@ class VoxelGrid:
             Array of shape (4096,) with 1.0 for solid blocks.
         """
         # Air is 0, most other blocks are solid
+        logger.debug("VoxelGrid.to_array_binary called")
         return (self.blocks > 0).astype(np.float32)
 
     @classmethod
@@ -401,6 +412,7 @@ class VoxelGrid:
             player_pos: Player block coordinates (x, y, z).
         """
         # This would be implemented by the C++ encoder for efficiency
+        logger.debug("VoxelGrid.from_world: world_blocks=%s, player_pos=%s", world_blocks, player_pos)
         grid = cls()
         # Placeholder: actual extraction happens in C++
         return grid
@@ -431,6 +443,7 @@ class RayCastDistances:
         Returns:
             Array of shape (16,) with distances normalized to [0, 1].
         """
+        logger.debug("RayCastDistances.to_array called")
         return self.distances / MAX_RAYCAST_DIST
 
 
@@ -453,6 +466,7 @@ class EntityObservation:
         Returns:
             Array of shape (8,).
         """
+        logger.debug("EntityObservation.to_array called")
         return np.array(
             [
                 float(self.entity_type) / 100.0,  # Normalize mob type ID
@@ -486,6 +500,7 @@ class EntityAwareness:
             Array of shape (96,) = 8 mobs * 8 features + 4 items * 8 features.
         """
         # Pad mobs to MAX_NEARBY_MOBS
+        logger.debug("EntityAwareness.to_array called")
         mob_arrays = [m.to_array() for m in self.nearby_mobs[:MAX_NEARBY_MOBS]]
         while len(mob_arrays) < MAX_NEARBY_MOBS:
             mob_arrays.append(np.zeros(8, dtype=np.float32))
@@ -523,6 +538,7 @@ class DragonState:
         Returns:
             Array of shape (10,).
         """
+        logger.debug("DragonState.to_array called")
         return np.array(
             [
                 float(self.is_active),
@@ -579,6 +595,7 @@ class MinecraftObservation:
         Returns:
             Flat array suitable for MLP input.
         """
+        logger.debug("MinecraftObservation.to_flat_array: include_voxels=%s", include_voxels)
         components = [
             self.player.to_array(),  # 22
             self.inventory.to_array(),  # 25
@@ -610,6 +627,7 @@ class MinecraftObservation:
             - 'voxels': Block IDs for embedding lookup
             - 'hotbar': Hotbar item IDs
         """
+        logger.debug("MinecraftObservation.to_dict called")
         return {
             "continuous": np.concatenate(
                 [
@@ -654,6 +672,7 @@ class ObservationSpace:
             voxel_encoding: How to encode voxels ('binary', 'ids', 'onehot').
             num_block_types: Number of block types for one-hot encoding.
         """
+        logger.info("ObservationSpace.__init__: include_voxels=%s, voxel_encoding=%s, num_block_types=%s", include_voxels, voxel_encoding, num_block_types)
         self.include_voxels = include_voxels
         self.voxel_encoding = voxel_encoding
         self.num_block_types = num_block_types
@@ -661,6 +680,7 @@ class ObservationSpace:
     @property
     def shape(self) -> tuple[int, ...]:
         """Return shape for flat observations."""
+        logger.debug("ObservationSpace.shape called")
         if not self.include_voxels:
             return (self.CONTINUOUS_DIM,)
         if self.voxel_encoding == "binary":
@@ -673,14 +693,17 @@ class ObservationSpace:
     @property
     def dtype(self) -> np.dtype[np.float32]:
         """Return dtype for observations."""
+        logger.debug("ObservationSpace.dtype called")
         return np.dtype(np.float32)
 
     def sample(self) -> NDArray[np.float32]:
         """Sample random observation (for testing)."""
+        logger.debug("ObservationSpace.sample called")
         return np.random.randn(self.shape[0]).astype(np.float32)
 
     def contains(self, obs: NDArray[np.floating]) -> bool:
         """Check if observation is valid."""
+        logger.debug("ObservationSpace.contains: obs=%s", obs)
         if obs.shape != self.shape:
             return False
         return not (np.isnan(obs).any() or np.isinf(obs).any())
@@ -706,6 +729,7 @@ class DictObservationSpace:
             num_block_types: Vocabulary size for block embeddings.
             block_embedding_dim: Dimension of learned block embeddings.
         """
+        logger.info("DictObservationSpace.__init__: num_block_types=%s, block_embedding_dim=%s", num_block_types, block_embedding_dim)
         self.num_block_types = num_block_types
         self.block_embedding_dim = block_embedding_dim
 
@@ -719,10 +743,12 @@ class DictObservationSpace:
     @property
     def shape(self) -> dict[str, tuple[int, ...]]:
         """Return shapes for all sub-spaces."""
+        logger.debug("DictObservationSpace.shape called")
         return self.spaces
 
     def sample(self) -> dict[str, NDArray]:
         """Sample random observation."""
+        logger.debug("DictObservationSpace.sample called")
         return {
             "continuous": np.random.randn(172).astype(np.float32),
             "voxels": np.random.randint(0, self.num_block_types, VOXEL_GRID_TOTAL, dtype=np.int32),
@@ -747,6 +773,7 @@ class ObservationEncoder:
         voxel_encoding: str = "binary",
         num_block_types: int = 32,
     ) -> None:
+        logger.info("ObservationEncoder.__init__: include_voxels=%s, voxel_encoding=%s, num_block_types=%s", include_voxels, voxel_encoding, num_block_types)
         self.include_voxels = include_voxels
         self.voxel_encoding = voxel_encoding
         self.num_block_types = num_block_types
@@ -754,6 +781,7 @@ class ObservationEncoder:
 
     def encode(self, obs: MinecraftObservation) -> NDArray[np.float32]:
         """Encode single observation."""
+        logger.debug("ObservationEncoder.encode: obs=%s", obs)
         return obs.to_flat_array(include_voxels=self.include_voxels)
 
     def encode_batch(
@@ -768,6 +796,7 @@ class ObservationEncoder:
         Returns:
             Array of shape (batch_size, obs_dim).
         """
+        logger.debug("ObservationEncoder.encode_batch: observations=%s", observations)
         return np.stack([self.encode(obs) for obs in observations])
 
     def encode_batch_dict(
@@ -782,6 +811,7 @@ class ObservationEncoder:
         Returns:
             Dictionary with batched arrays for each observation component.
         """
+        logger.debug("ObservationEncoder.encode_batch_dict: observations=%s", observations)
         dicts = [obs.to_dict() for obs in observations]
         return {key: np.stack([d[key] for d in dicts]) for key in dicts[0]}
 
@@ -856,6 +886,7 @@ class CompactObservationDecoder:
         Raises:
             AssertionError: If observation shape is not (256,).
         """
+        logger.info("CompactObservationDecoder.__init__: obs=%s", obs)
         assert obs.shape == (256,), f"Expected (256,), got {obs.shape}"
         self.obs = obs
 
@@ -865,6 +896,7 @@ class CompactObservationDecoder:
         Returns:
             CompactPlayerState with denormalized values.
         """
+        logger.debug("CompactObservationDecoder.get_player_state called")
         o = self.obs[0:32]
         return CompactPlayerState(
             position=o[0:3] * 1000,  # Denormalize position
@@ -890,6 +922,7 @@ class CompactObservationDecoder:
         Returns:
             CompactInventoryState with denormalized counts.
         """
+        logger.debug("CompactObservationDecoder.get_inventory called")
         o = self.obs[32:64]
         return CompactInventoryState(
             hotbar_items=[int(o[i] * 512) for i in range(9)],
@@ -910,6 +943,7 @@ class CompactObservationDecoder:
         Returns:
             Stage number 1-6.
         """
+        logger.debug("CompactObservationDecoder.get_current_stage called")
         stage_onehot = self.obs[128:134]
         return int(np.argmax(stage_onehot)) + 1
 
@@ -919,6 +953,7 @@ class CompactObservationDecoder:
         Returns:
             Dictionary with dragon info, or None if no dragon active.
         """
+        logger.debug("CompactObservationDecoder.get_dragon_state called")
         o = self.obs[192:224]
         if o[0] < 0.5:  # dragon_exists flag
             return None
@@ -935,6 +970,7 @@ class CompactObservationDecoder:
         Returns:
             0=Overworld, 1=Nether, 2=End.
         """
+        logger.debug("CompactObservationDecoder.get_dimension called")
         dim_onehot = self.obs[224:227]
         return int(np.argmax(dim_onehot))
 
@@ -944,6 +980,7 @@ class CompactObservationDecoder:
         Returns:
             Dictionary with portal proximity and status.
         """
+        logger.debug("CompactObservationDecoder.get_portal_state called")
         o = self.obs[227:256]
         return {
             "near_nether_portal": bool(o[0] > 0.5),
@@ -973,6 +1010,7 @@ class CompactObservationEncoder:
         Returns:
             Compact observation of shape (256,).
         """
+        logger.debug("CompactObservationEncoder.encode: obs=%s, stage=%s", obs, stage)
         result = np.zeros(256, dtype=np.float32)
 
         # Player state (0-31)
@@ -1038,6 +1076,7 @@ def create_observation_from_c_struct(raw_obs: dict) -> MinecraftObservation:
     Returns:
         MinecraftObservation instance.
     """
+    logger.info("create_observation_from_c_struct: raw_obs=%s", raw_obs)
     player_raw = raw_obs["player"]
 
     player = PlayerState.from_raw(
@@ -1153,6 +1192,7 @@ def decode_flat_observation(stage_id: int, vector: np.ndarray) -> dict[str, Any]
     Raises:
         ValueError: If vector shape is not (256,) or stage_id not in [1, 6].
     """
+    logger.debug("decode_flat_observation: stage_id=%s, vector=%s", stage_id, vector)
     vec = np.asarray(vector, dtype=np.float32)
     if vec.shape != (256,):
         raise ValueError(f"Expected observation vector of shape (256,), got {vec.shape}")

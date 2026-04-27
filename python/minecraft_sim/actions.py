@@ -27,6 +27,10 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class Movement(IntEnum):
     """Movement direction options."""
@@ -73,6 +77,7 @@ class MinecraftAction:
 
     def to_dict(self) -> dict[str, float | int | bool]:
         """Convert to dictionary for serialization."""
+        logger.debug("MinecraftAction.to_dict called")
         return {
             "movement": int(self.movement),
             "jump": self.jump,
@@ -89,6 +94,7 @@ class MinecraftAction:
     @classmethod
     def from_dict(cls, d: dict[str, float | int | bool]) -> MinecraftAction:
         """Create from dictionary."""
+        logger.debug("MinecraftAction.from_dict: d=%s", d)
         return cls(
             movement=Movement(int(d["movement"])),
             jump=bool(d["jump"]),
@@ -124,16 +130,19 @@ class ActionSpace:
     @property
     def shape(self) -> tuple[int, ...]:
         """Shape of the action space."""
+        logger.debug("ActionSpace.shape called")
         return (len(self.nvec),)
 
     @property
     def num_components(self) -> int:
         """Number of action components."""
+        logger.debug("ActionSpace.num_components called")
         return len(self.nvec)
 
     @property
     def total_combinations(self) -> int:
         """Total number of possible action combinations."""
+        logger.debug("ActionSpace.total_combinations called")
         return int(np.prod(self.nvec))
 
     def sample(self, rng: np.random.Generator | None = None) -> NDArray[np.int32]:
@@ -146,12 +155,14 @@ class ActionSpace:
         Returns:
             Array of action indices, one per component.
         """
+        logger.debug("ActionSpace.sample: rng=%s", rng)
         if rng is None:
             rng = np.random.default_rng()
         return np.array([rng.integers(0, n) for n in self.nvec], dtype=np.int32)
 
     def contains(self, action: NDArray[np.int32]) -> bool:
         """Check if action is valid."""
+        logger.debug("ActionSpace.contains: action=%s", action)
         if len(action) != len(self.nvec):
             return False
         return all(0 <= a < n for a, n in zip(action, self.nvec, strict=True))
@@ -166,6 +177,7 @@ class ActionSpace:
         Returns:
             Decoded MinecraftAction object.
         """
+        logger.debug("ActionSpace.decode: action=%s", action)
         return decode_action(action)
 
     def encode(self, action: MinecraftAction) -> NDArray[np.int32]:
@@ -178,6 +190,7 @@ class ActionSpace:
         Returns:
             Array of 10 integers representing action indices.
         """
+        logger.debug("ActionSpace.encode: action=%s", action)
         return encode_action(action)
 
 
@@ -192,6 +205,7 @@ def decode_action(action: NDArray[np.int32]) -> MinecraftAction:
     Returns:
         Decoded MinecraftAction with actual values.
     """
+    logger.debug("decode_action: action=%s", action)
     return MinecraftAction(
         movement=Movement(action[0]),
         jump=bool(action[1]),
@@ -217,6 +231,7 @@ def encode_action(action: MinecraftAction) -> NDArray[np.int32]:
         Array of 10 integers representing action indices.
     """
     # Find closest yaw/pitch indices
+    logger.debug("encode_action: action=%s", action)
     yaw_idx = int(np.argmin(np.abs(YAW_DELTAS - action.yaw_delta)))
     pitch_idx = int(np.argmin(np.abs(PITCH_DELTAS - action.pitch_delta)))
 
@@ -249,6 +264,7 @@ def action_to_keyboard_mouse(action: MinecraftAction) -> dict[str, bool | float]
     Returns:
         Dictionary with key/button states and mouse deltas.
     """
+    logger.debug("action_to_keyboard_mouse: action=%s", action)
     keys: dict[str, bool | float] = {
         # Movement keys
         "key_w": action.movement
@@ -303,6 +319,7 @@ class HierarchicalActionSpace:
     @property
     def nvec(self) -> NDArray[np.int32]:
         """Combined nvec for all groups."""
+        logger.debug("HierarchicalActionSpace.nvec called")
         return np.concatenate(
             [
                 self.locomotion_nvec,
@@ -314,6 +331,7 @@ class HierarchicalActionSpace:
 
     def sample(self, rng: np.random.Generator | None = None) -> NDArray[np.int32]:
         """Sample action from hierarchical space."""
+        logger.debug("HierarchicalActionSpace.sample: rng=%s", rng)
         if rng is None:
             rng = np.random.default_rng()
         return np.array([rng.integers(0, n) for n in self.nvec], dtype=np.int32)
@@ -321,6 +339,7 @@ class HierarchicalActionSpace:
     def decode(self, action: NDArray[np.int32]) -> MinecraftAction:
         """Decode hierarchical action to MinecraftAction."""
         # Reorder to match flat action space format
+        logger.debug("HierarchicalActionSpace.decode: action=%s", action)
         flat = np.array(
             [
                 action[0],  # movement
@@ -357,21 +376,25 @@ class ActionMask:
     @classmethod
     def create(cls, nvec: NDArray[np.int32]) -> ActionMask:
         """Create action mask with all actions enabled."""
+        logger.info("ActionMask.create: nvec=%s", nvec)
         component_masks = [np.ones(n, dtype=np.bool_) for n in nvec]
         return cls(mask=np.ones(len(nvec), dtype=np.bool_), component_masks=component_masks)
 
     def disable_sprint_while_sneaking(self, action: NDArray[np.int32]) -> None:
         """Disable sprint if sneak is active."""
+        logger.debug("ActionMask.disable_sprint_while_sneaking: action=%s", action)
         if action[3]:  # sneak active
             self.component_masks[2][1] = False  # disable sprint=yes
 
     def disable_attack_while_inventory(self, action: NDArray[np.int32]) -> None:
         """Disable attack if inventory is open."""
+        logger.debug("ActionMask.disable_attack_while_inventory: action=%s", action)
         if action[9] == SpecialAction.OPEN_INVENTORY:
             self.component_masks[4][1] = False  # disable attack=yes
 
     def apply_pitch_limits(self, current_pitch: float) -> None:
         """Limit pitch deltas near -90/+90."""
+        logger.debug("ActionMask.apply_pitch_limits: current_pitch=%s", current_pitch)
         if current_pitch <= -75:
             # Near looking straight down, disable further down
             for i, delta in enumerate(PITCH_DELTAS):
@@ -391,6 +414,7 @@ def get_action_embedding_dims() -> dict[str, int]:
 
     Smaller embeddings for binary actions, larger for categorical.
     """
+    logger.debug("get_action_embedding_dims called")
     return {
         "movement": 8,  # 9 categories -> 8-dim embedding
         "jump": 2,  # binary -> 2-dim
@@ -407,4 +431,5 @@ def get_action_embedding_dims() -> dict[str, int]:
 
 def get_total_embedding_dim() -> int:
     """Total dimension of action embedding."""
+    logger.debug("get_total_embedding_dim called")
     return sum(get_action_embedding_dims().values())  # = 44

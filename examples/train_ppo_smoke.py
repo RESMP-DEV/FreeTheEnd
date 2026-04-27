@@ -15,6 +15,10 @@ except ImportError:
 from minecraft_sim.backend import VulkanBackend
 from minecraft_sim.wrappers import NormalizedObsWrapper
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def simple_ppo_update(
     obs_batch,
@@ -26,12 +30,14 @@ def simple_ppo_update(
     optimizer,
 ):
     """Minimal PPO update - just for smoke test."""
+    logger.debug("simple_ppo_update: obs_batch=%s, action_batch=%s, reward_batch=%s, done_batch=%s", obs_batch, action_batch, reward_batch, done_batch)
     assert obs_batch.shape[1] == 32
     assert action_batch.shape[1] == 7
     return {"loss": 0.0}
 
 
 def main():
+    logger.debug("main called")
     num_envs = 1024 if HAS_GPU else 64
     backend = VulkanBackend(num_envs=num_envs)
     env = NormalizedObsWrapper(backend)

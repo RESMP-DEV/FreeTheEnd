@@ -36,6 +36,10 @@ import numpy as np
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class Demonstration:
@@ -73,25 +77,30 @@ class Demonstration:
     @property
     def length(self) -> int:
         """Number of timesteps in trajectory."""
+        logger.debug("Demonstration.length called")
         return len(self.observations)
 
     @property
     def total_reward(self) -> float:
         """Sum of all rewards."""
+        logger.debug("Demonstration.total_reward called")
         return float(np.sum(self.rewards))
 
     @property
     def obs_dim(self) -> int:
         """Observation dimensionality."""
+        logger.debug("Demonstration.obs_dim called")
         return self.observations.shape[1] if self.observations.ndim > 1 else 1
 
     @property
     def action_dim(self) -> int:
         """Action dimensionality (1 for discrete)."""
+        logger.debug("Demonstration.action_dim called")
         return self.actions.shape[1] if self.actions.ndim > 1 else 1
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dictionary."""
+        logger.debug("Demonstration.to_dict called")
         return {
             "observations": self.observations.tolist(),
             "actions": self.actions.tolist(),
@@ -104,6 +113,7 @@ class Demonstration:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Demonstration:
         """Create from dictionary."""
+        logger.debug("Demonstration.from_dict: data=%s", data)
         return cls(
             observations=np.array(data["observations"], dtype=np.float32),
             actions=np.array(data["actions"]),
@@ -118,6 +128,7 @@ class Demonstration:
 
         Supports .json (human-readable) and .pkl (efficient).
         """
+        logger.debug("Demonstration.save: path=%s", path)
         path = Path(path)
         if path.suffix == ".json":
             with open(path, "w") as f:
@@ -129,6 +140,7 @@ class Demonstration:
     @classmethod
     def load(cls, path: str | Path) -> Demonstration:
         """Load demonstration from file."""
+        logger.info("Demonstration.load: path=%s", path)
         path = Path(path)
         if path.suffix == ".json":
             with open(path) as f:
@@ -155,16 +167,19 @@ class DemonstrationDataset:
 
     def add(self, demo: Demonstration) -> None:
         """Add a demonstration to the dataset."""
+        logger.debug("DemonstrationDataset.add: demo=%s", demo)
         self.demonstrations.append(demo)
 
     @property
     def total_transitions(self) -> int:
         """Total number of (obs, action, reward) tuples."""
+        logger.debug("DemonstrationDataset.total_transitions called")
         return sum(d.length for d in self.demonstrations)
 
     @property
     def mean_reward(self) -> float:
         """Mean total reward across demonstrations."""
+        logger.debug("DemonstrationDataset.mean_reward called")
         if not self.demonstrations:
             return 0.0
         return float(np.mean([d.total_reward for d in self.demonstrations]))
@@ -172,6 +187,7 @@ class DemonstrationDataset:
     @property
     def mean_length(self) -> float:
         """Mean episode length."""
+        logger.debug("DemonstrationDataset.mean_length called")
         if not self.demonstrations:
             return 0.0
         return float(np.mean([d.length for d in self.demonstrations]))
@@ -184,6 +200,7 @@ class DemonstrationDataset:
         Returns:
             (observations, actions, rewards) arrays.
         """
+        logger.debug("DemonstrationDataset.get_all_transitions called")
         if not self.demonstrations:
             raise ValueError("Dataset is empty")
 
@@ -207,6 +224,7 @@ class DemonstrationDataset:
         Returns:
             (observations, actions, rewards) batch.
         """
+        logger.debug("DemonstrationDataset.sample_batch: batch_size=%s, rng=%s", batch_size, rng)
         if rng is None:
             rng = np.random.default_rng()
 
@@ -217,6 +235,7 @@ class DemonstrationDataset:
 
     def save(self, path: str | Path) -> None:
         """Save dataset to file."""
+        logger.debug("DemonstrationDataset.save: path=%s", path)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
@@ -225,6 +244,7 @@ class DemonstrationDataset:
     @classmethod
     def load(cls, path: str | Path) -> DemonstrationDataset:
         """Load dataset from file."""
+        logger.info("DemonstrationDataset.load: path=%s", path)
         with open(path, "rb") as f:
             demonstrations = pickle.load(f)
         return cls(demonstrations=demonstrations)
@@ -240,10 +260,12 @@ class Environment(Protocol):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]: ...
+logger.debug("Environment.reset called")
 
     def step(
         self, action: int | np.ndarray
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]: ...
+logger.debug("Environment.step: action=%s", action)
 
 
 @runtime_checkable
@@ -251,6 +273,7 @@ class ActionProvider(Protocol):
     """Protocol for action providers (policies, human input, etc.)."""
 
     def get_action(self, observation: np.ndarray) -> int | np.ndarray: ...
+logger.debug("ActionProvider.get_action: observation=%s", observation)
 
 
 class DemonstrationRecorder:
@@ -286,6 +309,7 @@ class DemonstrationRecorder:
             env: Environment being recorded.
             expert_id: Identifier for the demonstrator.
         """
+        logger.info("DemonstrationRecorder.__init__: env=%s, expert_id=%s", env, expert_id)
         self.env = env
         self.expert_id = expert_id
 
@@ -306,6 +330,7 @@ class DemonstrationRecorder:
         Returns:
             Initial observation and info from env.reset().
         """
+        logger.info("DemonstrationRecorder.start_episode: seed=%s", seed)
         if self._recording:
             raise RuntimeError("Already recording an episode. Call end_episode() first.")
 
@@ -331,6 +356,7 @@ class DemonstrationRecorder:
             action: Action taken.
             reward: Reward received.
         """
+        logger.debug("DemonstrationRecorder.record_step: observation=%s, action=%s, reward=%s", observation, action, reward)
         if not self._recording:
             raise RuntimeError("Not recording. Call start_episode() first.")
 
@@ -350,6 +376,7 @@ class DemonstrationRecorder:
         Returns:
             Recorded demonstration.
         """
+        logger.debug("DemonstrationRecorder.end_episode: extra_metadata=%s", extra_metadata)
         if not self._recording:
             raise RuntimeError("Not recording. Call start_episode() first.")
 
@@ -383,10 +410,12 @@ class DemonstrationRecorder:
 
     def is_recording(self) -> bool:
         """Check if currently recording."""
+        logger.debug("DemonstrationRecorder.is_recording called")
         return self._recording
 
     def current_length(self) -> int:
         """Number of steps recorded so far."""
+        logger.debug("DemonstrationRecorder.current_length called")
         return len(self._observations)
 
 
@@ -409,6 +438,7 @@ class AutomaticRecorder:
             policy: Policy that provides actions.
             expert_id: Identifier for demonstrations.
         """
+        logger.info("AutomaticRecorder.__init__: env=%s, policy=%s, expert_id=%s", env, policy, expert_id)
         self.env = env
         self.policy = policy
         self.recorder = DemonstrationRecorder(env, expert_id=expert_id)
@@ -427,6 +457,7 @@ class AutomaticRecorder:
         Returns:
             Recorded demonstration.
         """
+        logger.debug("AutomaticRecorder.collect_episode: seed=%s, max_steps=%s", seed, max_steps)
         if seed is None:
             seed = int(np.random.default_rng().integers(0, 2**31))
 
@@ -461,6 +492,7 @@ class AutomaticRecorder:
         Returns:
             Dataset of demonstrations.
         """
+        logger.debug("AutomaticRecorder.collect_dataset: num_episodes=%s, seeds=%s, max_steps=%s, progress_callback=%s", num_episodes, seeds, max_steps, progress_callback)
         if seeds is None:
             rng = np.random.default_rng()
             seeds = [int(rng.integers(0, 2**31)) for _ in range(num_episodes)]
@@ -503,6 +535,7 @@ class BehavioralCloning:
             action_dim: Action dimensionality (num actions if discrete).
             discrete_actions: Whether actions are discrete.
         """
+        logger.info("BehavioralCloning.__init__: obs_dim=%s, action_dim=%s, discrete_actions=%s", obs_dim, action_dim, discrete_actions)
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.discrete_actions = discrete_actions
@@ -535,6 +568,7 @@ class BehavioralCloning:
         Returns:
             Training metrics (loss, accuracy, etc.).
         """
+        logger.debug("BehavioralCloning.train: dataset=%s, epochs=%s, batch_size=%s, learning_rate=%s", dataset, epochs, batch_size, learning_rate)
         if isinstance(dataset, DemonstrationDataset):
             obs, actions, _ = dataset.get_all_transitions()
         else:
@@ -568,6 +602,7 @@ class BehavioralCloning:
         Returns:
             Predicted action.
         """
+        logger.debug("BehavioralCloning.predict: observation=%s, deterministic=%s", observation, deterministic)
         if not self._trained or self._train_obs is None:
             raise RuntimeError("Model not trained. Call train() first.")
 
@@ -602,14 +637,17 @@ class BehavioralCloning:
         Returns:
             Predicted actions (N,) or (N, action_dim).
         """
+        logger.debug("BehavioralCloning.predict_batch: observations=%s, deterministic=%s", observations, deterministic)
         return np.array([self.predict(obs, deterministic=deterministic) for obs in observations])
 
     def get_action(self, observation: np.ndarray) -> int | np.ndarray:
         """ActionProvider protocol implementation."""
+        logger.debug("BehavioralCloning.get_action: observation=%s", observation)
         return self.predict(observation, deterministic=True)
 
     def save(self, path: str | Path) -> None:
         """Save trained model."""
+        logger.debug("BehavioralCloning.save: path=%s", path)
         path = Path(path)
         data = {
             "obs_dim": self.obs_dim,
@@ -626,6 +664,7 @@ class BehavioralCloning:
     @classmethod
     def load(cls, path: str | Path) -> BehavioralCloning:
         """Load trained model."""
+        logger.info("BehavioralCloning.load: path=%s", path)
         with open(path, "rb") as f:
             data = pickle.load(f)
 
@@ -684,6 +723,7 @@ class DAgger:
             action_dim: Action dimensionality.
             discrete_actions: Whether actions are discrete.
         """
+        logger.info("DAgger.__init__: env=%s, expert=%s, obs_dim=%s, action_dim=%s", env, expert, obs_dim, action_dim)
         self.env = env
         self.expert = expert
 
@@ -721,6 +761,7 @@ class DAgger:
         Returns:
             Iteration metrics.
         """
+        logger.debug("DAgger.iterate: num_episodes=%s, beta=%s, max_steps=%s, epochs=%s", num_episodes, beta, max_steps, epochs)
         self.iteration += 1
         rng = np.random.default_rng()
 
@@ -821,6 +862,7 @@ class DAgger:
         Returns:
             List of per-iteration metrics.
         """
+        logger.debug("DAgger.train_full: num_iterations=%s, episodes_per_iter=%s, initial_beta=%s, final_beta=%s", num_iterations, episodes_per_iter, initial_beta, final_beta)
         all_metrics: list[dict[str, float]] = []
 
         for i in range(num_iterations):
@@ -844,6 +886,7 @@ class DAgger:
 
     def get_policy(self) -> BehavioralCloning:
         """Get the trained policy."""
+        logger.debug("DAgger.get_policy called")
         return self.policy
 
 
@@ -864,6 +907,7 @@ def filter_demonstrations(
     Returns:
         Filtered dataset.
     """
+    logger.debug("filter_demonstrations: dataset=%s, min_reward=%s, max_length=%s, min_length=%s", dataset, min_reward, max_length, min_length)
     filtered = DemonstrationDataset()
 
     for demo in dataset:
@@ -895,6 +939,7 @@ def augment_demonstrations(
     Returns:
         Dataset with original + augmented demonstrations.
     """
+    logger.debug("augment_demonstrations: dataset=%s, noise_std=%s, num_augmented=%s, rng=%s", dataset, noise_std, num_augmented, rng)
     if rng is None:
         rng = np.random.default_rng()
 

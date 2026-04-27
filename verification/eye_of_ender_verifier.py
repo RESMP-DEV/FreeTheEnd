@@ -333,6 +333,10 @@ class EyeShatterVerifier:
         # Use time-based seed for variety
         import time
 
+import logging
+
+logger = logging.getLogger(__name__)
+
         base_seed = int(time.time() * 1000) % 1000000
 
         for i in range(n_trials):

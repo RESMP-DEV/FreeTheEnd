@@ -2,6 +2,10 @@ import numpy as np
 
 from .backend import VulkanBackend
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class NormalizedObsWrapper:
     """Normalize observations for RL training."""
@@ -84,18 +88,22 @@ class NormalizedObsWrapper:
     )
 
     def __init__(self, backend: VulkanBackend):
+        logger.info("NormalizedObsWrapper.__init__: backend=%s", backend)
         self.backend = backend
         self.obs_range = self.OBS_HIGH - self.OBS_LOW
         self.obs_range[self.obs_range == 0] = 1  # Avoid division by zero
 
     def normalize(self, obs: np.ndarray) -> np.ndarray:
         """Normalize to [-1, 1] range."""
+        logger.debug("NormalizedObsWrapper.normalize: obs=%s", obs)
         return 2 * (obs - self.OBS_LOW) / self.obs_range - 1
 
     def step(self, actions):
+        logger.debug("NormalizedObsWrapper.step: actions=%s", actions)
         obs, rewards, dones, infos = self.backend.step(actions)
         return self.normalize(obs), rewards, dones, infos
 
     def reset(self, **kwargs):
+        logger.debug("NormalizedObsWrapper.reset called")
         obs = self.backend.reset(**kwargs)
         return self.normalize(obs)

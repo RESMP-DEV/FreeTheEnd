@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class ItemCategory(Enum):
     """Item categories affecting stack behavior."""
@@ -54,6 +58,7 @@ class ItemStack:
     durability: int | None = None
 
     def copy(self) -> ItemStack:
+        logger.debug("ItemStack.copy called")
         return ItemStack(self.item_id, self.count, self.durability)
 
 
@@ -77,9 +82,11 @@ class TestSuite:
     test_cases: list[TestCase] = field(default_factory=list)
 
     def add_test(self, test: TestCase) -> None:
+        logger.debug("TestSuite.add_test: test=%s", test)
         self.test_cases.append(test)
 
     def to_dict(self) -> dict[str, Any]:
+        logger.debug("TestSuite.to_dict called")
         return {
             "name": self.name,
             "test_count": len(self.test_cases),
@@ -195,6 +202,7 @@ class InventoryTestGenerator:
             hotbar_size: Number of hotbar slots (subset of inventory).
             seed: Random seed for reproducible tests.
         """
+        logger.info("InventoryTestGenerator.__init__: items=%s, inventory_size=%s, hotbar_size=%s, seed=%s", items, inventory_size, hotbar_size, seed)
         self.items = items or SPEEDRUN_ITEMS
         self.inventory_size = inventory_size
         self.hotbar_size = hotbar_size
@@ -202,6 +210,7 @@ class InventoryTestGenerator:
 
     def generate_add_remove_tests(self) -> TestSuite:
         """Generate tests for item add/remove operations."""
+        logger.debug("InventoryTestGenerator.generate_add_remove_tests called")
         suite = TestSuite("Item Add/Remove Operations")
 
         # Test 1: Add single item to empty slot
@@ -480,6 +489,7 @@ class InventoryTestGenerator:
 
     def generate_slot_movement_tests(self) -> TestSuite:
         """Generate tests for slot movement and swapping."""
+        logger.debug("InventoryTestGenerator.generate_slot_movement_tests called")
         suite = TestSuite("Slot Movement and Swapping")
 
         # Test 1: Move item to empty slot
@@ -739,6 +749,7 @@ class InventoryTestGenerator:
 
     def generate_stack_limit_tests(self) -> TestSuite:
         """Generate tests for stack size limit enforcement."""
+        logger.debug("InventoryTestGenerator.generate_stack_limit_tests called")
         suite = TestSuite("Stack Size Limits")
 
         # Test standard 64-stack items
@@ -869,6 +880,7 @@ class InventoryTestGenerator:
 
     def generate_durability_tests(self) -> TestSuite:
         """Generate tests for durability tracking."""
+        logger.debug("InventoryTestGenerator.generate_durability_tests called")
         suite = TestSuite("Durability Tracking")
 
         # Test 1: New tool has full durability
@@ -1043,6 +1055,7 @@ class InventoryTestGenerator:
 
     def generate_all_tests(self) -> dict[str, TestSuite]:
         """Generate all test suites."""
+        logger.debug("InventoryTestGenerator.generate_all_tests called")
         return {
             "add_remove": self.generate_add_remove_tests(),
             "slot_movement": self.generate_slot_movement_tests(),
@@ -1052,6 +1065,7 @@ class InventoryTestGenerator:
 
     def export_tests(self, filepath: str) -> None:
         """Export all tests to JSON file."""
+        logger.debug("InventoryTestGenerator.export_tests: filepath=%s", filepath)
         all_suites = self.generate_all_tests()
         export_data = {suite_name: suite.to_dict() for suite_name, suite in all_suites.items()}
         with open(filepath, "w") as f:
@@ -1059,12 +1073,14 @@ class InventoryTestGenerator:
 
     def get_test_count(self) -> dict[str, int]:
         """Get count of tests per suite."""
+        logger.debug("InventoryTestGenerator.get_test_count called")
         all_suites = self.generate_all_tests()
         return {name: len(suite.test_cases) for name, suite in all_suites.items()}
 
 
 def main() -> None:
     """Run test generation and display summary."""
+    logger.debug("main called")
     generator = InventoryTestGenerator(seed=42)
 
     print("Inventory Test Generator")
