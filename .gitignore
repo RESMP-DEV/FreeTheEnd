@@ -4,3 +4,6 @@ AGENTS.md
 # Compiled extensions (keep in cpp/build/ or python/minecraft_sim/)
 *.so
 *.dylib
+
+# Local semantic-search index
+.sindexer/
